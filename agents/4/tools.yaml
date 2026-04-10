@@ -1,0 +1,7 @@
+tools:
+  - name: template_library
+    provider: local_prompts
+    timeout: 3
+  - name: memory_context
+    provider: internal_memory
+    timeout: 5

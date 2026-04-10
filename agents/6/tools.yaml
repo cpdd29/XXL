@@ -1,0 +1,7 @@
+tools:
+  - name: channel_formatter
+    provider: adapter_registry
+    timeout: 5
+  - name: webhook_sender
+    provider: outbound
+    timeout: 8

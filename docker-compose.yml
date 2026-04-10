@@ -1,0 +1,121 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: workbot-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-workbot}
+      POSTGRES_USER: ${POSTGRES_USER:-workbot}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-workbot}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-workbot} -d ${POSTGRES_DB:-workbot}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: workbot-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  nats:
+    image: nats:2.10-alpine
+    container_name: workbot-nats
+    restart: unless-stopped
+    command: ["-js", "-m", "8222"]
+    ports:
+      - "${NATS_PORT:-4222}:4222"
+      - "${NATS_MONITOR_PORT:-8222}:8222"
+    volumes:
+      - nats_data:/data
+
+  chromadb:
+    image: chromadb/chroma:0.5.23
+    container_name: workbot-chromadb
+    restart: unless-stopped
+    environment:
+      IS_PERSISTENT: "TRUE"
+      ALLOW_RESET: "TRUE"
+    ports:
+      - "${CHROMA_PORT:-8000}:8000"
+    volumes:
+      - chroma_data:/chroma/chroma
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: workbot-backend
+    restart: unless-stopped
+    working_dir: /app
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080", "--reload"]
+    environment:
+      WORKBOT_ENVIRONMENT: ${WORKBOT_ENVIRONMENT:-docker-compose}
+      WORKBOT_DATABASE_URL: postgresql://${POSTGRES_USER:-workbot}:${POSTGRES_PASSWORD:-workbot}@postgres:5432/${POSTGRES_DB:-workbot}
+      WORKBOT_REDIS_URL: redis://redis:6379/0
+      WORKBOT_MEMORY_SQLITE_PATH: ${WORKBOT_MEMORY_SQLITE_PATH:-data/memory-midterm.sqlite3}
+      WORKBOT_NATS_URL: nats://nats:4222
+      WORKBOT_CHROMA_URL: http://chromadb:8000
+      WORKBOT_CHROMA_CLIENT_MODE: http
+      WORKBOT_CHROMA_COLLECTION_NAME: ${WORKBOT_CHROMA_COLLECTION_NAME:-workbot_long_term_memory}
+      WORKBOT_CORS_ORIGINS: '${WORKBOT_CORS_ORIGINS:-["http://localhost:3000","http://127.0.0.1:3000"]}'
+      WORKBOT_MESSAGE_RATE_LIMIT_PER_MINUTE: ${WORKBOT_MESSAGE_RATE_LIMIT_PER_MINUTE:-5}
+      WORKBOT_MESSAGE_DEBOUNCE_SECONDS: ${WORKBOT_MESSAGE_DEBOUNCE_SECONDS:-3}
+      WORKBOT_MEMORY_RETRIEVE_LIMIT: ${WORKBOT_MEMORY_RETRIEVE_LIMIT:-5}
+    ports:
+      - "${BACKEND_PORT:-8080}:8080"
+    volumes:
+      - ./backend:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      nats:
+        condition: service_started
+      chromadb:
+        condition: service_started
+
+  frontend:
+    build:
+      context: ./样式文件
+      dockerfile: Dockerfile
+    container_name: workbot-frontend
+    restart: unless-stopped
+    working_dir: /app
+    command: ["npm", "run", "dev", "--", "--hostname", "0.0.0.0", "--port", "3000"]
+    environment:
+      NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://localhost:8080}
+      NEXT_PUBLIC_WS_BASE_URL: ${NEXT_PUBLIC_WS_BASE_URL:-ws://localhost:8080}
+      NEXT_TELEMETRY_DISABLED: "1"
+    ports:
+      - "${FRONTEND_PORT:-3000}:3000"
+    volumes:
+      - ./样式文件:/app
+      - frontend_node_modules:/app/node_modules
+      - frontend_next:/app/.next
+    depends_on:
+      backend:
+        condition: service_started
+
+volumes:
+  postgres_data:
+  redis_data:
+  nats_data:
+  chroma_data:
+  frontend_node_modules:
+  frontend_next:

@@ -1,0 +1,7 @@
+tools:
+  - name: transcript_reader
+    provider: raw_conversation
+    timeout: 5
+  - name: memory_distiller
+    provider: internal_memory
+    timeout: 8

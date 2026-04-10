@@ -1,0 +1,10 @@
+tools:
+  - name: project_docs_search
+    provider: local_docs
+    timeout: 5
+  - name: web_search
+    provider: tavily
+    timeout: 10
+  - name: url_fetcher
+    provider: http
+    timeout: 10

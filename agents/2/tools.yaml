@@ -1,0 +1,7 @@
+tools:
+  - name: regex_guard
+    provider: local_rules
+    timeout: 2
+  - name: moderation_rewriter
+    provider: internal_policy
+    timeout: 5

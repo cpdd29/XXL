@@ -1,0 +1,14 @@
+.env
+.env.*
+!.env.example
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+backend/.env
+backend/.pytest_cache/
+data/
+backend/data/
+样式文件/.next/
+样式文件/node_modules/
