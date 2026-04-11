@@ -82,6 +82,7 @@ const failureStageLabels: Record<string, string> = {
 
 function getTaskMetaLine(task: Task) {
   if (task.statusReason) return task.statusReason
+  if (task.dispatchState === "scheduled") return "已进入计划调度队列，等待到点触发"
   if (task.failureStage) {
     return failureStageLabels[task.failureStage] ?? task.failureStage
   }
@@ -126,6 +127,26 @@ function TaskCard({
               <Badge variant="secondary" className="text-xs">
                 {task.agent}
               </Badge>
+              {task.routeDecision?.workflowMode ? (
+                <Badge variant="secondary" className="text-xs">
+                  {task.routeDecision.workflowMode}
+                </Badge>
+              ) : null}
+              {task.routeDecision?.routingStrategy ? (
+                <Badge variant="secondary" className="text-xs">
+                  route: {task.routeDecision.routingStrategy}
+                </Badge>
+              ) : null}
+              {task.routeDecision?.confirmationStatus ? (
+                <Badge variant="secondary" className="bg-warning/20 text-xs text-warning-foreground">
+                  确认状态: {task.routeDecision.confirmationStatus}
+                </Badge>
+              ) : null}
+              {task.dispatchState === "scheduled" ? (
+                <Badge variant="secondary" className="bg-primary/15 text-xs text-primary">
+                  定时任务
+                </Badge>
+              ) : null}
               {task.tokens > 0 && (
                 <Badge variant="secondary" className="bg-accent/20 text-accent text-xs">
                   {task.tokens} tokens

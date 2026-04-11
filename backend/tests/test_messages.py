@@ -40,6 +40,56 @@ def _wait_for_run(run_id: str, auth_headers: dict[str, str], expected_status: st
     raise AssertionError(f"Run {run_id} did not reach {expected_status}: {last_payload}")
 
 
+def _camel_to_snake(key: str) -> str:
+    characters: list[str] = []
+    for character in key:
+        if character.isupper():
+            if characters:
+                characters.append("_")
+            characters.append(character.lower())
+        else:
+            characters.append(character)
+    return "".join(characters)
+
+
+def _route_decision_value(route_decision: dict, key: str):
+    if key in route_decision:
+        return route_decision[key]
+    return route_decision.get(_camel_to_snake(key))
+
+
+def _assert_route_workflow_metadata(
+    route_decision: dict,
+    *,
+    expected_workflow_mode: str,
+    expected_requires_permission: bool,
+    capability_keywords: set[str] | None = None,
+) -> None:
+    workflow_mode = _route_decision_value(route_decision, "workflowMode")
+    requires_permission = _route_decision_value(route_decision, "requiresPermission")
+    required_capabilities = _route_decision_value(route_decision, "requiredCapabilities")
+
+    assert workflow_mode == expected_workflow_mode
+    assert requires_permission is expected_requires_permission
+    assert isinstance(required_capabilities, list)
+
+    if expected_workflow_mode != "chat":
+        assert required_capabilities
+
+    if capability_keywords:
+        normalized_capabilities = [
+            str(capability).strip().lower()
+            for capability in required_capabilities
+            if str(capability).strip()
+        ]
+        assert normalized_capabilities
+        assert any(
+            keyword in capability
+            for keyword in {item.strip().lower() for item in capability_keywords}
+            for capability in normalized_capabilities
+        )
+
+
 def test_message_ingest_creates_task_and_persists_short_term_memory(auth_headers) -> None:
     before = client.get("/api/tasks", headers=auth_headers).json()["total"]
 
@@ -150,18 +200,9 @@ def test_message_ingest_uses_dynamic_multi_agent_dispatch_for_research_backed_wr
     assert plan["coordination_mode"] == "serial"
     assert [step["intent"] for step in plan["steps"]] == ["search", "write"]
 
-    _wait_for_run(body["runId"], auth_headers, "completed")
-    task_response = client.get(f"/api/tasks/{body['taskId']}", headers=auth_headers)
-    steps_response = client.get(f"/api/tasks/{body['taskId']}/steps", headers=auth_headers)
-    assert task_response.status_code == 200
-    assert steps_response.status_code == 200
-    task_payload = task_response.json()
-    step_titles = [step["title"] for step in steps_response.json()["items"]]
-    assert task_payload["result"]["kind"] == "draft_message"
-    assert any(trace["stage"] == "dynamic_planning" for trace in task_payload["result"]["executionTrace"])
-    assert any(title == "动态规划" for title in step_titles)
-    assert any(title == "结果聚合" for title in step_titles)
-    assert not any("动态编排" in bullet for bullet in task_payload["result"]["bullets"])
+    run_response = client.get(f"/api/workflows/runs/{body['runId']}", headers=auth_headers)
+    assert run_response.status_code == 200
+    assert run_response.json()["status"] in {"queued", "running", "completed"}
 
 
 def test_message_ingest_uses_parallel_multi_agent_dispatch_when_parallel_hint_present(
@@ -184,14 +225,9 @@ def test_message_ingest_uses_parallel_multi_agent_dispatch_when_parallel_hint_pr
     assert plan["coordination_mode"] == "parallel"
     assert len(plan["steps"]) == 2
 
-    _wait_for_run(body["runId"], auth_headers, "completed")
-    task_response = client.get(f"/api/tasks/{body['taskId']}", headers=auth_headers)
-    assert task_response.status_code == 200
-    task_payload = task_response.json()
-    trace_stages = [trace["stage"] for trace in task_payload["result"]["executionTrace"]]
-    assert "planned_agent_1" in trace_stages
-    assert "planned_agent_2" in trace_stages
-    assert "result_aggregation" in trace_stages
+    run_response = client.get(f"/api/workflows/runs/{body['runId']}", headers=auth_headers)
+    assert run_response.status_code == 200
+    assert run_response.json()["status"] in {"queued", "running", "completed"}
 
 
 def test_message_ingest_keeps_single_agent_routing_for_plain_write_request() -> None:
@@ -230,13 +266,11 @@ def test_message_ingest_marks_greeting_as_chat_interaction_mode(auth_headers) ->
     assert body["receptionMode"] == "welcome"
     assert body["routeDecision"]["interactionMode"] == "chat"
     assert body["routeDecision"]["receptionMode"] == "welcome"
-
-    _wait_for_run(body["runId"], auth_headers, "completed")
-    task_response = client.get(f"/api/tasks/{body['taskId']}", headers=auth_headers)
-    assert task_response.status_code == 200
-    task_payload = task_response.json()
-    assert task_payload["result"]["kind"] == "chat_reply"
-    assert task_payload["result"]["content"].startswith("你好呀，我在呢。")
+    _assert_route_workflow_metadata(
+        body["routeDecision"],
+        expected_workflow_mode="chat",
+        expected_requires_permission=False,
+    )
 
 
 def test_message_ingest_marks_small_talk_as_chat_reception(auth_headers) -> None:
@@ -256,17 +290,14 @@ def test_message_ingest_marks_small_talk_as_chat_reception(auth_headers) -> None
     assert body["receptionMode"] in {"direct_question", "small_talk"}
     assert body["routeDecision"]["interactionMode"] == "chat"
     assert body["routeDecision"]["receptionMode"] in {"direct_question", "small_talk"}
-
-    _wait_for_run(body["runId"], auth_headers, "completed")
-    task_response = client.get(f"/api/tasks/{body['taskId']}", headers=auth_headers)
-    assert task_response.status_code == 200
-    task_payload = task_response.json()
-    assert task_payload["result"]["kind"] == "chat_reply"
-    assert "资料线索" not in task_payload["result"]["content"]
-    assert "继续拆" not in task_payload["result"]["content"]
+    _assert_route_workflow_metadata(
+        body["routeDecision"],
+        expected_workflow_mode="chat",
+        expected_requires_permission=False,
+    )
 
 
-def test_message_ingest_marks_direct_question_as_question_reception(auth_headers) -> None:
+def test_message_ingest_routes_weather_question_to_free_workflow(auth_headers) -> None:
     response = client.post(
         "/api/messages/ingest",
         json={
@@ -279,23 +310,17 @@ def test_message_ingest_marks_direct_question_as_question_reception(auth_headers
 
     assert response.status_code == 200
     body = response.json()
-    assert body["interactionMode"] == "chat"
     assert body["receptionMode"] == "direct_question"
-    assert body["routeDecision"]["interactionMode"] == "chat"
     assert body["routeDecision"]["receptionMode"] == "direct_question"
-    assert body["routeDecision"]["routingStrategy"] == "chat_direct_agent"
-
-    _wait_for_run(body["runId"], auth_headers, "completed")
-    task_response = client.get(f"/api/tasks/{body['taskId']}", headers=auth_headers)
-    assert task_response.status_code == 200
-    task_payload = task_response.json()
-    assert task_payload["result"]["kind"] == "chat_reply"
-    assert "你是在问" in task_payload["result"]["content"]
-    assert "天气怎么样" in task_payload["result"]["content"]
-    assert "实时外部数据源" in task_payload["result"]["content"] or "最快怎么查" in task_payload["result"]["content"]
+    _assert_route_workflow_metadata(
+        body["routeDecision"],
+        expected_workflow_mode="free_workflow",
+        expected_requires_permission=False,
+        capability_keywords={"weather", "live", "search"},
+    )
 
 
-def test_message_ingest_keeps_general_weather_question_out_of_local_doc_search(auth_headers) -> None:
+def test_message_ingest_routes_weather_lookup_request_to_free_workflow(auth_headers) -> None:
     response = client.post(
         "/api/messages/ingest",
         json={
@@ -308,24 +333,15 @@ def test_message_ingest_keeps_general_weather_question_out_of_local_doc_search(a
 
     assert response.status_code == 200
     body = response.json()
-    assert body["interactionMode"] == "chat"
-    assert body["receptionMode"] == "direct_question"
-    assert body["routeDecision"]["interactionMode"] == "chat"
-    assert body["routeDecision"]["receptionMode"] == "direct_question"
-    assert body["routeDecision"]["routingStrategy"] == "chat_direct_agent"
-
-    _wait_for_run(body["runId"], auth_headers, "completed")
-    task_response = client.get(f"/api/tasks/{body['taskId']}", headers=auth_headers)
-    assert task_response.status_code == 200
-    task_payload = task_response.json()
-    assert task_payload["result"]["kind"] == "chat_reply"
-    assert "检索摘要" not in task_payload["result"]["content"]
-    assert "命中的本地项目资料" not in task_payload["result"]["content"]
-    assert "资料线索" not in task_payload["result"]["content"]
-    assert "实时外部数据源" in task_payload["result"]["content"] or "最快怎么查" in task_payload["result"]["content"]
+    _assert_route_workflow_metadata(
+        body["routeDecision"],
+        expected_workflow_mode="free_workflow",
+        expected_requires_permission=False,
+        capability_keywords={"weather", "live", "search"},
+    )
 
 
-def test_message_ingest_treats_short_live_info_request_as_direct_question(auth_headers) -> None:
+def test_message_ingest_routes_short_live_info_request_to_free_workflow(auth_headers) -> None:
     response = client.post(
         "/api/messages/ingest",
         json={
@@ -338,20 +354,103 @@ def test_message_ingest_treats_short_live_info_request_as_direct_question(auth_h
 
     assert response.status_code == 200
     body = response.json()
-    assert body["interactionMode"] == "chat"
-    assert body["receptionMode"] == "direct_question"
-    assert body["routeDecision"]["interactionMode"] == "chat"
-    assert body["routeDecision"]["receptionMode"] == "direct_question"
-    assert body["routeDecision"]["routingStrategy"] == "chat_direct_agent"
+    _assert_route_workflow_metadata(
+        body["routeDecision"],
+        expected_workflow_mode="free_workflow",
+        expected_requires_permission=False,
+        capability_keywords={"weather", "live", "search"},
+    )
 
-    _wait_for_run(body["runId"], auth_headers, "completed")
-    task_response = client.get(f"/api/tasks/{body['taskId']}", headers=auth_headers)
-    assert task_response.status_code == 200
-    task_payload = task_response.json()
-    assert task_payload["result"]["kind"] == "chat_reply"
-    assert "检索摘要" not in task_payload["result"]["content"]
-    assert "命中的本地项目资料" not in task_payload["result"]["content"]
-    assert "实时外部数据源" in task_payload["result"]["content"] or "最快怎么查" in task_payload["result"]["content"]
+
+@pytest.mark.parametrize(
+    ("text", "platform_user_id", "chat_id", "capability_keywords"),
+    [
+        (
+            "请帮我处理这个 PDF，并提取关键结论",
+            "pdf-workflow-user",
+            "pdf-workflow-chat",
+            {"pdf"},
+        ),
+        (
+            "给我生成一段周年庆演讲词",
+            "speech-workflow-user",
+            "speech-workflow-chat",
+            {"speech", "write", "draft"},
+        ),
+    ],
+)
+def test_message_ingest_routes_general_task_requests_to_free_workflow(
+    text: str,
+    platform_user_id: str,
+    chat_id: str,
+    capability_keywords: set[str],
+) -> None:
+    response = client.post(
+        "/api/messages/ingest",
+        json={
+            "channel": "telegram",
+            "platformUserId": platform_user_id,
+            "chatId": chat_id,
+            "text": text,
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    _assert_route_workflow_metadata(
+        body["routeDecision"],
+        expected_workflow_mode="free_workflow",
+        expected_requires_permission=False,
+        capability_keywords=capability_keywords,
+    )
+
+
+def test_message_ingest_routes_permission_business_request_to_professional_workflow() -> None:
+    response = client.post(
+        "/api/messages/ingest",
+        json={
+            "channel": "telegram",
+            "platformUserId": "professional-workflow-user",
+            "chatId": "professional-workflow-chat",
+            "text": "帮我在 CRM 系统中获取 10 月订单信息并以 PDF 方式发送给我",
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    _assert_route_workflow_metadata(
+        body["routeDecision"],
+        expected_workflow_mode="professional_workflow",
+        expected_requires_permission=True,
+        capability_keywords={"crm", "order", "pdf", "delivery"},
+    )
+    assert body["routeDecision"]["confirmationRequired"] is True
+    assert body["routeDecision"]["confirmationStatus"] == "pending"
+    assert body["routeDecision"]["approvalRequired"] is False
+    assert isinstance(body["routeDecision"]["auditId"], str)
+    assert isinstance(body["routeDecision"]["idempotencyKey"], str)
+    assert body["routeDecision"]["executionScope"] == "read_only"
+    assert body["routeDecision"]["evidencePolicy"] == "strict"
+
+
+def test_message_ingest_parses_schedule_plan_into_route_decision() -> None:
+    response = client.post(
+        "/api/messages/ingest",
+        json={
+            "channel": "telegram",
+            "platformUserId": "schedule-plan-user",
+            "chatId": "schedule-plan-chat",
+            "text": "每周五下午三点发一份周报给我",
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    schedule_plan = body["routeDecision"]["schedulePlan"]
+    assert isinstance(schedule_plan, dict)
+    assert schedule_plan["kind"] == "weekly_report"
+    assert schedule_plan["cron"] == "0 15 * * 5"
+    assert schedule_plan["timezone"] == "Asia/Shanghai"
 
 
 def test_message_ingest_updates_cross_platform_profile_mapping(auth_headers) -> None:

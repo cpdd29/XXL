@@ -96,16 +96,20 @@ class IngestUnifiedMessageRequest(APIModel):
 
 
 class MessageRouteDecision(APIModel):
-    intent: str
-    workflow_id: str
-    workflow_name: str
+    intent: str | None = None
+    workflow_id: str | None = None
+    workflow_name: str | None = None
     execution_agent_id: str | None = None
-    execution_agent: str
+    execution_agent: str | None = None
     interaction_mode: str | None = None
     reception_mode: str | None = None
+    workflow_mode: str | None = None
+    requires_permission: bool | None = None
+    required_capabilities: list[str] = Field(default_factory=list)
+    user_visible_workflow_mode: str | None = None
     execution_plan: dict[str, Any] | None = None
     selected_by_message_trigger: bool = False
-    route_message: str
+    route_message: str | None = None
     intent_confidence: float | None = None
     intent_scores: dict[str, int] = Field(default_factory=dict)
     intent_reasons: dict[str, list[str]] = Field(default_factory=dict)
@@ -113,6 +117,18 @@ class MessageRouteDecision(APIModel):
     skipped_workflows: list[dict[str, str]] = Field(default_factory=list)
     routing_strategy: str | None = None
     execution_support: dict[str, Any] | None = None
+    route_version: str | None = None
+    confirmation_required: bool | None = None
+    confirmation_status: str | None = None
+    confirmation_deadline_at: str | None = None
+    requires_approval: bool | None = None
+    approval_required: bool | None = None
+    approval_status: str | None = None
+    audit_id: str | None = None
+    idempotency_key: str | None = None
+    execution_scope: str | None = None
+    evidence_policy: str | None = None
+    schedule_plan: dict[str, Any] | None = None
 
 
 class IngestMessageResponse(APIModel):

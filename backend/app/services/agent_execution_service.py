@@ -10,6 +10,7 @@ import httpx
 from app.services.agent_config_service import agent_config_service, build_agent_config_summary
 from app.services.document_search_service import document_search_service
 from app.services.language_service import detect_language
+from app.services.professional_workflow_service import professional_workflow_service
 from app.services.settings_service import get_agent_api_runtime_settings
 from app.services.store import store
 
@@ -370,6 +371,86 @@ def _resolve_reception_mode(task: dict, run: dict) -> str | None:
     return None
 
 
+def _resolve_route_decision(task: dict, run: dict) -> dict[str, Any] | None:
+    payload_candidates: list[dict[str, Any]] = []
+    dispatch_context = run.get("dispatch_context")
+    if isinstance(dispatch_context, dict):
+        route_decision = dispatch_context.get("route_decision") or dispatch_context.get("routeDecision")
+        if isinstance(route_decision, dict):
+            payload_candidates.append(route_decision)
+    task_route_decision = task.get("route_decision") or task.get("routeDecision")
+    if isinstance(task_route_decision, dict):
+        payload_candidates.append(task_route_decision)
+    return payload_candidates[0] if payload_candidates else None
+
+
+def _normalize_workflow_mode(value: Any) -> str | None:
+    normalized = str(value or "").strip().lower()
+    if normalized in {"chat", "free_workflow", "professional_workflow"}:
+        return normalized
+    return None
+
+
+def _resolve_workflow_mode(task: dict, run: dict) -> str | None:
+    route_decision = _resolve_route_decision(task, run)
+    if not isinstance(route_decision, dict):
+        return None
+    return _normalize_workflow_mode(
+        route_decision.get("workflow_mode") or route_decision.get("workflowMode")
+    )
+
+
+def _resolve_required_capabilities(task: dict, run: dict) -> list[str]:
+    route_decision = _resolve_route_decision(task, run)
+    if not isinstance(route_decision, dict):
+        return []
+    raw = route_decision.get("required_capabilities") or route_decision.get("requiredCapabilities")
+    if not isinstance(raw, list):
+        return []
+    return [str(item).strip() for item in raw if str(item).strip()]
+
+
+def _resolve_requires_permission(task: dict, run: dict) -> bool:
+    route_decision = _resolve_route_decision(task, run)
+    if not isinstance(route_decision, dict):
+        return False
+    value = route_decision.get("requires_permission")
+    if isinstance(value, bool):
+        return value
+    value = route_decision.get("requiresPermission")
+    return bool(value) if isinstance(value, bool) else False
+
+
+def _free_workflow_payload(task: dict, run: dict) -> dict[str, Any]:
+    return {
+        "task_id": str(task.get("id") or ""),
+        "request_text": _primary_request_text(task),
+        "user_key": str(task.get("user_key") or "").strip() or None,
+        "session_id": str(task.get("session_id") or "").strip() or None,
+        "preferred_language": _output_language(task),
+        "metadata": store.clone(task.get("metadata") or {}),
+        "route_decision": store.clone(_resolve_route_decision(task, run) or {}),
+        "requires_permission": _resolve_requires_permission(task, run),
+        "required_capabilities": _resolve_required_capabilities(task, run),
+        "file_path": task.get("file_path") or task.get("filePath"),
+        "document_text": task.get("document_text") or task.get("documentText"),
+    }
+
+
+def _should_use_free_workflow_runtime(task: dict, run: dict) -> bool:
+    capabilities = set(_resolve_required_capabilities(task, run))
+    if capabilities & {"task_status_lookup", "task_listing", "weather_lookup"}:
+        return True
+    if capabilities & {"pdf_processing", "document_conversion"}:
+        return bool(
+            task.get("file_path")
+            or task.get("filePath")
+            or task.get("document_text")
+            or task.get("documentText")
+        )
+    return False
+
+
 def _is_capability_question(text: str) -> bool:
     normalized = " ".join(str(text or "").strip().lower().split())
     if not normalized:
@@ -395,6 +476,10 @@ def _looks_like_chat_message(text: str) -> bool:
     ):
         return True
     if any(hint in normalized for hint in TASK_DIRECTIVE_HINTS):
+        return False
+    # Keep project/domain questions in the structured task/help branch
+    # so they continue to use executor-oriented handling instead of casual chat fallback.
+    if any(hint in normalized for hint in PROJECT_DOMAIN_HINTS):
         return False
     return len(normalized) <= 24
 
@@ -1704,6 +1789,146 @@ class AgentExecutionService:
             agent_results=agent_results,
         )
 
+    def _execute_free_workflow(
+        self,
+        *,
+        task: dict,
+        run: dict,
+        execution_agent: dict | None,
+    ) -> dict[str, Any]:
+        capabilities = _resolve_required_capabilities(task, run)
+        payload = _free_workflow_payload(task, run)
+        request_text = _primary_request_text(task)
+        trace_context = {
+            "task_id": str(task.get("id") or ""),
+            "run_id": str(run.get("id") or ""),
+            "workflow_mode": "free_workflow",
+        }
+        try:
+            from app.services.free_workflow_service import free_workflow_service
+
+            result = free_workflow_service.run(
+                text=request_text,
+                required_capabilities=capabilities,
+                payload=payload,
+                context=trace_context,
+            )
+        except Exception as exc:
+            return {
+                "kind": "help_note",
+                "title": "自由工作流执行失败",
+                "summary": "自由工作流技能执行失败",
+                "content": f"自由工作流已命中，但执行失败：{exc}",
+                "bullets": [
+                    "路由层已正确识别为自由工作流。",
+                    "当前失败已被统一收敛到 Free Workflow 异常语义。",
+                ],
+                "references": [],
+                "execution_trace": [
+                    {
+                        "stage": "free_workflow_runtime",
+                        "title": "自由工作流运行时",
+                        "status": "failed",
+                        "detail": str(exc),
+                        "metadata": {"required_capabilities": capabilities},
+                    }
+                ],
+            }
+
+        selected_skill = str(result.get("selected_skill") or "unknown_skill")
+        if not bool(result.get("ok", False)):
+            error_message = str((result.get("error") or {}).get("message") or "free_workflow_failed")
+            return {
+                "kind": "help_note",
+                "title": "自由工作流执行失败",
+                "summary": "自由工作流技能执行失败",
+                "content": f"自由工作流已命中，但技能执行失败：{error_message}",
+                "bullets": [
+                    f"selected_skill: {selected_skill}",
+                    "路由层已正确识别为自由工作流。",
+                ],
+                "references": [],
+                "execution_trace": [
+                    {
+                        "stage": "free_workflow_runtime",
+                        "title": "自由工作流运行时",
+                        "status": "failed",
+                        "detail": error_message,
+                        "metadata": {
+                            "required_capabilities": capabilities,
+                            "selected_skill": selected_skill,
+                        },
+                    }
+                ],
+            }
+
+        execution_trace = [
+            {
+                "stage": "free_workflow_runtime",
+                "title": "自由工作流运行时",
+                "status": "completed",
+                "detail": f"已调用 {selected_skill} 处理自由工作流请求。",
+                "metadata": {
+                    "skill_id": selected_skill,
+                    "required_capabilities": capabilities,
+                },
+            },
+            *[
+                entry
+                for entry in result.get("execution_trace") or []
+                if isinstance(entry, dict)
+            ],
+        ]
+        wrapped_result = store.clone(result.get("wrapped_result") or {})
+        wrapped_result.setdefault(
+            "kind",
+            {
+                "web_search_skill": "search_report",
+                "general_writer_skill": "draft_message",
+                "speech_writer_skill": "draft_message",
+            }.get(selected_skill, "help_note"),
+        )
+        wrapped_result.setdefault("title", selected_skill or "自由工作流结果")
+        wrapped_result.setdefault("summary", str(result.get("result_summary") or "自由工作流已执行"))
+        wrapped_result.setdefault("content", str(result.get("result_summary") or "自由工作流已执行"))
+        wrapped_result.setdefault("bullets", [])
+        wrapped_result.setdefault("references", [])
+        wrapped_result["execution_trace"] = execution_trace
+        migration_runtime = result.get("migration_runtime")
+        if isinstance(migration_runtime, dict):
+            wrapped_result["bullets"] = [
+                *wrapped_result.get("bullets", []),
+                f"runtime mode: {migration_runtime.get('mode') or 'builtin_primary'}",
+            ]
+        return wrapped_result
+
+    def _execute_professional_workflow(
+        self,
+        *,
+        task: dict,
+        run: dict,
+        execution_agent: dict | None,
+    ) -> dict[str, Any]:
+        result = professional_workflow_service.execute(task=task, run=run, execution_agent=execution_agent)
+        result["execution_trace"] = [
+            {
+                "stage": "professional_workflow_runtime",
+                "title": "专业工作流运行时",
+                "status": "completed",
+                "detail": "已进入专业工作流准入与角色拆解。",
+                "metadata": {
+                    "required_capabilities": _resolve_required_capabilities(task, run),
+                    "requires_permission": _resolve_requires_permission(task, run),
+                },
+            },
+            *[
+                entry
+                for entry in result.get("execution_trace") or []
+                if isinstance(entry, dict)
+            ],
+        ]
+        return result
+
     def execute_task(
         self,
         *,
@@ -1718,6 +1943,19 @@ class AgentExecutionService:
                 run=run,
                 execution_agent=execution_agent,
                 execution_plan=execution_plan,
+            )
+        workflow_mode = _resolve_workflow_mode(task, run)
+        if workflow_mode == "free_workflow" and _should_use_free_workflow_runtime(task, run):
+            return self._execute_free_workflow(
+                task=task,
+                run=run,
+                execution_agent=execution_agent,
+            )
+        if workflow_mode == "professional_workflow":
+            return self._execute_professional_workflow(
+                task=task,
+                run=run,
+                execution_agent=execution_agent,
             )
         profile = _safe_execution_profile(execution_agent, run)
         execution_mode = _resolve_execution_mode(task, execution_agent, run, profile)

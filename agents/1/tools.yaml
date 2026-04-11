@@ -1,7 +1,0 @@
-tools:
-  - name: intent_classifier
-    provider: local_rules
-    timeout: 3
-  - name: workflow_selector
-    provider: control_plane
-    timeout: 5

@@ -1,0 +1,19 @@
+"""Execution gateway layer.
+
+This layer is the only execution entrance for tentacle invocations.
+"""
+
+from app.execution_gateway.contracts import ExecutionAttempt, ExecutionRequest, ExecutionResult
+from app.execution_gateway.policy import TrafficPolicy, resolve_effective_mode, should_use_runtime
+from app.execution_gateway.runtime_router import RuntimeRouter
+
+__all__ = [
+    "ExecutionAttempt",
+    "ExecutionRequest",
+    "ExecutionResult",
+    "TrafficPolicy",
+    "RuntimeRouter",
+    "resolve_effective_mode",
+    "should_use_runtime",
+]
+

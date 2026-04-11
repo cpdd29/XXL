@@ -196,3 +196,44 @@ def test_list_tasks_enriches_dispatch_failure_reason(auth_headers) -> None:
     assert item["failureStage"] == "dispatch"
     assert item["failureMessage"] == "Dispatcher 发布执行任务失败"
     assert "调度" in item["statusReason"]
+
+
+def test_get_task_exposes_governance_fields_from_route_decision(auth_headers) -> None:
+    created_at = store.now_string()
+    task_id = "task-governance-from-route-decision"
+    route_decision = {
+        "confirmation_status": "pending",
+        "approval_status": "not_required",
+        "approval_required": False,
+        "audit_id": "audit-task-governance-1",
+        "idempotency_key": "route:task-governance-1",
+        "execution_scope": "read_only",
+        "schedule_plan": {"kind": "weekly_report", "cron": "0 15 * * 5", "timezone": "Asia/Shanghai"},
+    }
+    store.tasks.append(
+        {
+            "id": task_id,
+            "title": "治理字段回传任务",
+            "description": "验证任务详情从 route_decision 回填治理字段",
+            "status": "pending",
+            "priority": "medium",
+            "created_at": created_at,
+            "completed_at": None,
+            "agent": "Dispatcher Agent",
+            "tokens": 0,
+            "duration": None,
+            "route_decision": route_decision,
+        }
+    )
+
+    response = client.get(f"/api/tasks/{task_id}", headers=auth_headers)
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["confirmationStatus"] == "pending"
+    assert payload["approvalStatus"] == "not_required"
+    assert payload["approvalRequired"] is False
+    assert payload["auditId"] == "audit-task-governance-1"
+    assert payload["idempotencyKey"] == "route:task-governance-1"
+    assert payload["executionScope"] == "read_only"
+    assert payload["schedulePlan"]["cron"] == "0 15 * * 5"

@@ -18,6 +18,15 @@ export const queryKeys = {
     list: ['agents'] as const,
     status: (agentId: string) => ['agents', agentId, 'status'] as const,
   },
+  tools: {
+    list: ['tools'] as const,
+    sources: ['tools', 'sources'] as const,
+    detail: (toolId: string | null) => ['tools', 'detail', toolId ?? null] as const,
+    sourceDetail: (sourceId: string | null) => ['tools', 'source-detail', sourceId ?? null] as const,
+  },
+  schedules: {
+    list: ['schedules'] as const,
+  },
   users: {
     list: ['users'] as const,
     profile: (userId: string) => ['users', userId, 'profile'] as const,

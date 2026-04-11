@@ -12,6 +12,9 @@ export interface TaskExecutionTraceEntry {
   title: string
   status: string
   detail?: string
+  timestamp?: string
+  startedAt?: string
+  finishedAt?: string
   metadata?: Record<string, string | number | boolean | null>
 }
 
@@ -27,13 +30,32 @@ export interface TaskResult {
 
 export interface TaskRouteDecision {
   intent: string
-  workflowId: string
-  workflowName: string
+  workflowId?: string
+  workflowName?: string
   executionAgentId?: string
   executionAgent: string
+  interactionMode?: string | null
+  receptionMode?: string | null
+  workflowMode?: string | null
+  requiresPermission?: boolean | null
+  requiredCapabilities?: string[]
+  userVisibleWorkflowMode?: string | null
   executionPlan?: Record<string, unknown>
   selectedByMessageTrigger: boolean
   routeMessage: string
+  intentConfidence?: number | null
+  intentScores?: Record<string, number>
+  intentReasons?: Record<string, string[]>
+  candidateWorkflows?: Array<Record<string, unknown>>
+  skippedWorkflows?: Array<Record<string, string>>
+  routingStrategy?: string | null
+  executionSupport?: Record<string, unknown> | null
+  confirmationStatus?: string | null
+  confirmationDeadlineAt?: string | null
+  approvalRequired?: boolean | null
+  auditId?: string | null
+  idempotencyKey?: string | null
+  executionScope?: string | null
 }
 
 export interface Task {

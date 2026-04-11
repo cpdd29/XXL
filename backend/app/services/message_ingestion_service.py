@@ -134,6 +134,9 @@ CONTEXT_PATCH_NEW_REQUEST_MARKERS = (
 )
 CONTEXT_PATCH_MAX_FOLLOW_UP_LENGTH = 80
 INTERACTION_MODES = {"chat", "task", "workflow_or_direct"}
+PROFESSIONAL_CONFIRM_TIMEOUT_SECONDS = 1800
+PROFESSIONAL_CONFIRM_MARKERS = ("确认", "开始", "同意", "继续", "执行", "ok", "yes", "confirm", "proceed")
+PROFESSIONAL_CANCEL_MARKERS = ("取消", "不用了", "停止", "驳回", "不执行", "cancel", "stop", "reject", "no")
 
 
 def _next_task_id() -> str:
@@ -919,6 +922,59 @@ def _resolve_interaction_mode(route_decision: dict | None) -> str:
     return "workflow_or_direct"
 
 
+def _route_decision_field(route_decision: dict | None, *keys: str) -> str | None:
+    if not isinstance(route_decision, dict):
+        return None
+    for key in keys:
+        value = str(route_decision.get(key) or "").strip()
+        if value:
+            return value
+    return None
+
+
+def _route_decision_bool(route_decision: dict | None, *keys: str) -> bool:
+    if not isinstance(route_decision, dict):
+        return False
+    for key in keys:
+        value = route_decision.get(key)
+        if isinstance(value, bool):
+            return value
+    return False
+
+
+def _route_decision_payload(route_decision: dict | None, *keys: str):
+    if not isinstance(route_decision, dict):
+        return None
+    for key in keys:
+        if key in route_decision:
+            return route_decision.get(key)
+    return None
+
+
+def _is_professional_confirmation_pending(task: dict) -> bool:
+    route_decision = task.get("route_decision") or task.get("routeDecision")
+    workflow_mode = _route_decision_field(route_decision, "workflow_mode", "workflowMode")
+    confirmation_required = _route_decision_bool(route_decision, "confirmation_required", "confirmationRequired")
+    confirmation_status = _route_decision_field(route_decision, "confirmation_status", "confirmationStatus")
+    return (
+        str(workflow_mode or "").strip().lower() == "professional_workflow"
+        and confirmation_required
+        and str(confirmation_status or "").strip().lower() == "pending"
+        and str(task.get("status") or "").strip().lower() == "pending"
+    )
+
+
+def _confirmation_action(message_text: str) -> str | None:
+    normalized = _normalize_message_text(message_text)
+    if not normalized:
+        return None
+    if any(marker in normalized for marker in PROFESSIONAL_CONFIRM_MARKERS):
+        return "confirm"
+    if any(marker in normalized for marker in PROFESSIONAL_CANCEL_MARKERS):
+        return "cancel"
+    return None
+
+
 def _task_route_intent(task: dict | None) -> str | None:
     if not isinstance(task, dict):
         return None
@@ -1280,6 +1336,13 @@ def ingest_unified_message(
         "trace_id": security_result["trace_id"],
         "preferred_language": preferred_language,
         "detected_lang": message.detected_lang,
+        "confirmation_status": _route_decision_field(route_decision, "confirmation_status", "confirmationStatus"),
+        "approval_status": _route_decision_field(route_decision, "approval_status", "approvalStatus"),
+        "approval_required": _route_decision_bool(route_decision, "approval_required", "approvalRequired"),
+        "audit_id": _route_decision_field(route_decision, "audit_id", "auditId"),
+        "idempotency_key": _route_decision_field(route_decision, "idempotency_key", "idempotencyKey"),
+        "execution_scope": _route_decision_field(route_decision, "execution_scope", "executionScope"),
+        "schedule_plan": _route_decision_payload(route_decision, "schedule_plan", "schedulePlan"),
         "route_decision": route_decision,
         "result": None,
     }

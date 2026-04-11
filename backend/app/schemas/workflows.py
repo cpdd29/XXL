@@ -28,6 +28,8 @@ class WorkflowTrigger(APIModel):
     max_dispatch_retry: int | None = None
     dispatch_retry_backoff_seconds: float | None = None
     execution_timeout_seconds: float | None = None
+    natural_language_rule: str | None = None
+    schedule_plan: dict[str, object] | None = None
 
 
 class WorkflowNode(APIModel):
@@ -80,6 +82,10 @@ class UpsertWorkflowRequest(APIModel):
 class RunWorkflowRequest(APIModel):
     trigger: str = "manual"
     intent: str | None = None
+    audit_id: str | None = None
+    idempotency_key: str | None = None
+    execution_scope: str | None = None
+    requires_approval: bool | None = None
 
 
 class InternalWorkflowTriggerRequest(APIModel):

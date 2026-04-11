@@ -1,3 +1,5 @@
+from typing import Any
+
 from app.schemas.base import APIModel
 from app.schemas.messages import MessageRouteDecision
 
@@ -12,7 +14,7 @@ class TaskExecutionTraceEntry(APIModel):
     title: str
     status: str = "completed"
     detail: str | None = None
-    metadata: dict[str, str | int | float | bool | None] | None = None
+    metadata: dict[str, Any] | None = None
 
 
 class TaskResult(APIModel):
@@ -50,6 +52,13 @@ class Task(APIModel):
     delivery_status: str | None = None
     delivery_message: str | None = None
     status_reason: str | None = None
+    confirmation_status: str | None = None
+    approval_status: str | None = None
+    approval_required: bool | None = None
+    audit_id: str | None = None
+    idempotency_key: str | None = None
+    execution_scope: str | None = None
+    schedule_plan: dict[str, Any] | None = None
     route_decision: MessageRouteDecision | None = None
     result: TaskResult | None = None
 

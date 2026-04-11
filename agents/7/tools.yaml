@@ -1,7 +1,0 @@
-tools:
-  - name: language_detector
-    provider: internal_router
-    timeout: 2
-  - name: terminology_memory
-    provider: internal_memory
-    timeout: 5

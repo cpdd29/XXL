@@ -10,6 +10,8 @@ from app.api.routes import (
     settings,
     security,
     tasks,
+    tools,
+    tool_sources,
     users,
     webhooks,
     workflows,
@@ -27,4 +29,6 @@ api_router.include_router(security.router, prefix="/security", tags=["security"]
 api_router.include_router(settings.router, prefix="/settings", tags=["settings"])
 api_router.include_router(messages.router, prefix="/messages", tags=["messages"])
 api_router.include_router(memory.router, prefix="/memory", tags=["memory"])
+api_router.include_router(tools.router, prefix="/tools", tags=["tools"])
+api_router.include_router(tool_sources.router, prefix="/tool-sources", tags=["tool-sources"])
 api_router.include_router(webhooks.router, prefix="/webhooks", tags=["webhooks"])

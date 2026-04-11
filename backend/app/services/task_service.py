@@ -239,6 +239,37 @@ def enrich_task_payload(
     steps: list[dict] | None = None,
 ) -> dict:
     payload = store.clone(task)
+    route_decision = payload.get("route_decision") or payload.get("routeDecision")
+    if isinstance(route_decision, dict):
+        if "confirmation_status" in route_decision or "confirmationStatus" in route_decision:
+            payload.setdefault(
+                "confirmation_status",
+                route_decision.get("confirmation_status", route_decision.get("confirmationStatus")),
+            )
+        if "approval_status" in route_decision or "approvalStatus" in route_decision:
+            payload.setdefault(
+                "approval_status",
+                route_decision.get("approval_status", route_decision.get("approvalStatus")),
+            )
+        if "approval_required" in route_decision or "approvalRequired" in route_decision:
+            payload.setdefault(
+                "approval_required",
+                route_decision.get("approval_required", route_decision.get("approvalRequired")),
+            )
+        if "audit_id" in route_decision or "auditId" in route_decision:
+            payload.setdefault("audit_id", route_decision.get("audit_id", route_decision.get("auditId")))
+        if "idempotency_key" in route_decision or "idempotencyKey" in route_decision:
+            payload.setdefault(
+                "idempotency_key",
+                route_decision.get("idempotency_key", route_decision.get("idempotencyKey")),
+            )
+        if "execution_scope" in route_decision or "executionScope" in route_decision:
+            payload.setdefault(
+                "execution_scope",
+                route_decision.get("execution_scope", route_decision.get("executionScope")),
+            )
+        if "schedule_plan" in route_decision or "schedulePlan" in route_decision:
+            payload.setdefault("schedule_plan", route_decision.get("schedule_plan", route_decision.get("schedulePlan")))
     workflow_run = run if isinstance(run, dict) else _find_loaded_run(payload.get("workflow_run_id"))
     step_items = steps if isinstance(steps, list) else _safe_load_task_steps(str(payload.get("id") or ""))
     dispatch_context = _task_dispatch_context(workflow_run)

@@ -11,6 +11,7 @@ import {
   Shield,
   Settings,
   ChevronDown,
+  Wrench,
 } from "lucide-react"
 import { cn } from "@/lib/utils"
 import {
@@ -45,6 +46,11 @@ const navItems = [
     title: "Agent 管理",
     href: "/agents",
     icon: Bot,
+  },
+  {
+    title: "工具库",
+    href: "/tools",
+    icon: Wrench,
   },
   {
     title: "用户管理",
