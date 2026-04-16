@@ -1,19 +1,22 @@
 from datetime import UTC, datetime, timedelta
 import time
+import warnings
 
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
+from pydantic.warnings import UnsupportedFieldAttributeWarning
 import pytest
 
 from app.main import app
 from app.schemas.messages import ChannelType, UnifiedMessage
+from app.services.agent_execution_service import AgentExecutionService, _resolve_execution_mode
 from app.services.memory_service import memory_service
 from app.services.message_ingestion_service import (
     ACTIVE_TASKS_BY_USER,
     LAST_MESSAGE_AT_BY_USER,
     bootstrap_message_ingestion_state,
 )
-from app.services import settings_service
+from app.services import settings_service, workflow_execution_service
 from app.services.security_gateway_service import SecurityGatewayService
 from app.services.store import store
 
@@ -25,6 +28,95 @@ class _NoRedisProvider:
     @staticmethod
     def get_client():
         return None
+
+
+def test_agent_execution_mode_respects_manager_delivery_mode() -> None:
+    task = {
+        "description": "请给我一个客户回访邮件",
+        "manager_packet": {"delivery_mode": "conversational"},
+    }
+    run = {"intent": "write", "dispatch_context": {"manager_packet": {"delivery_mode": "conversational"}}}
+
+    assert _resolve_execution_mode(task, None, run, profile={}) == "chat"
+
+
+def test_agent_execution_chat_result_prefers_manager_clarify_question() -> None:
+    service = AgentExecutionService()
+    clarify_question = "你先告诉我最想推进的目标是什么，我先按那个来接。"
+    task = {
+        "description": "帮我弄一下这个",
+        "preferred_language": "zh",
+        "manager_packet": {
+            "response_contract": "clarify_first",
+            "clarify_question": clarify_question,
+        },
+    }
+    run = {
+        "intent": "help",
+        "dispatch_context": {
+            "manager_packet": {
+                "response_contract": "clarify_first",
+                "clarify_question": clarify_question,
+            }
+        },
+    }
+
+    result = service.build_chat_result(task=task, run=run, profile={})
+
+    assert result["kind"] == "chat_reply"
+    assert result["text"] == clarify_question
+
+
+def test_message_ingest_response_exposes_manager_summary_after_projection_refactor() -> None:
+    response = client.post(
+        "/api/messages/ingest",
+        json={
+            "channel": "telegram",
+            "platformUserId": "projection-user",
+            "chatId": "projection-chat",
+            "text": "请帮我写一封客户回访邮件",
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["managerSummary"]["managerRole"] == "reception_project_manager"
+    assert body["managerSummary"]["managerAction"]
+    assert body["brainDispatchSummary"]["summaryLine"]
+
+
+def test_message_ingest_does_not_emit_pydantic_alias_warnings() -> None:
+    with warnings.catch_warnings(record=True) as captured:
+        warnings.simplefilter("always")
+        response = client.post(
+            "/api/messages/ingest",
+            json={
+                "channel": "telegram",
+                "platformUserId": "warning-user",
+                "chatId": "warning-chat",
+                "text": "hi",
+            },
+        )
+
+    assert response.status_code == 200
+    assert not [
+        item
+        for item in captured
+        if issubclass(item.category, UnsupportedFieldAttributeWarning)
+    ]
+
+
+def test_message_ingest_returns_422_for_invalid_payload_after_manual_validation() -> None:
+    response = client.post(
+        "/api/messages/ingest",
+        json={
+            "channel": "telegram",
+            "platformUserId": "invalid-user",
+            "chatId": "invalid-chat",
+        },
+    )
+
+    assert response.status_code == 422
 
 
 def _wait_for_run(run_id: str, auth_headers: dict[str, str], expected_status: str, timeout: float = 6.0) -> dict:
@@ -122,10 +214,16 @@ def test_message_ingest_creates_task_and_persists_short_term_memory(auth_headers
     assert body["routeDecision"]["intentConfidence"] > 0
     assert body["routeDecision"]["candidateWorkflows"]
     assert body["unifiedMessage"]["userKey"] == "telegram:90001"
+    assert body["managerSummary"]["managerRole"] == "reception_project_manager"
+    assert body["managerSummary"]["managerAction"]
+    assert body["managerSummary"]["nextOwner"]
+    assert body["managerSummary"]["deliveryMode"] == "structured_result"
 
     task_detail = client.get(f"/api/tasks/{body['taskId']}", headers=auth_headers)
     assert task_detail.status_code == 200
     assert task_detail.json()["routeDecision"]["executionAgent"] == "搜索 Agent"
+    assert task_detail.json()["managerPacket"]["managerRole"] == "reception_project_manager"
+    assert task_detail.json()["managerPacket"]["nextOwner"]
 
     after = client.get("/api/tasks", headers=auth_headers).json()["total"]
     assert after == before + 1
@@ -173,11 +271,11 @@ def test_message_ingest_falls_back_to_direct_agent_when_selected_workflow_is_not
 
     assert response.status_code == 200
     body = response.json()
-    assert body["routeDecision"]["routingStrategy"] == "workflow_or_direct_agent_fallback"
+    assert body["routeDecision"]["routingStrategy"] == "workflow_or_agent_dispatch_fallback"
     assert body["routeDecision"]["executionAgent"] == "搜索 Agent Fallback"
     assert len(store.tasks) == task_total_before + 1
     assert len(store.workflow_runs) == run_total_before + 1
-    assert store.workflow_runs[0]["workflow_id"] == "__direct_agent_fallback__"
+    assert store.workflow_runs[0]["workflow_id"] == workflow_execution_service.AGENT_DISPATCH_WORKFLOW_ID
 
 
 def test_message_ingest_uses_dynamic_multi_agent_dispatch_for_research_backed_write_request(
@@ -199,10 +297,22 @@ def test_message_ingest_uses_dynamic_multi_agent_dispatch_for_research_backed_wr
     plan = body["routeDecision"]["executionPlan"]
     assert plan["coordination_mode"] == "serial"
     assert [step["intent"] for step in plan["steps"]] == ["search", "write"]
+    brain_dispatch_summary = body["brainDispatchSummary"]
+    assert brain_dispatch_summary["dispatchType"] == "agent_dispatch"
+    assert brain_dispatch_summary["workflowMode"] == "free_workflow"
+    assert brain_dispatch_summary["executionAgent"] == body["routeDecision"]["executionAgent"]
+    assert brain_dispatch_summary["interactionMode"] == body["routeDecision"]["interactionMode"]
+    assert brain_dispatch_summary["deliveryMode"] == "structured_result"
+    assert brain_dispatch_summary["responseContract"] == "task_handoff"
+    assert brain_dispatch_summary["routingStrategy"] == body["routeDecision"]["routingStrategy"]
+    assert brain_dispatch_summary["executionTopology"] == plan["plan_type"]
+    assert brain_dispatch_summary["fallbackMode"] == body["routeDecision"]["fallbackPolicy"]["mode"]
+    assert brain_dispatch_summary["routeReasonSummary"] == body["routeDecision"]["routeRationale"]["route_reason_summary"]
 
     run_response = client.get(f"/api/workflows/runs/{body['runId']}", headers=auth_headers)
     assert run_response.status_code == 200
     assert run_response.json()["status"] in {"queued", "running", "completed"}
+    assert run_response.json()["dispatchContext"]["managerPacket"]["taskShape"] == "multi_step"
 
 
 def test_message_ingest_uses_parallel_multi_agent_dispatch_when_parallel_hint_present(
@@ -246,7 +356,11 @@ def test_message_ingest_keeps_single_agent_routing_for_plain_write_request() -> 
     assert body["interactionMode"] == "task"
     assert body["routeDecision"]["interactionMode"] == "task"
     assert body["routeDecision"]["routingStrategy"] != "dynamic_multi_agent_dispatch"
-    assert body["routeDecision"].get("executionPlan") is None
+    execution_plan = body["routeDecision"].get("executionPlan")
+    assert isinstance(execution_plan, dict)
+    assert execution_plan["mode"] == "free_workflow"
+    assert execution_plan["step_count"] == 1
+    assert "content_generation" in execution_plan["required_capabilities"]
 
 
 def test_message_ingest_marks_greeting_as_chat_interaction_mode(auth_headers) -> None:
@@ -431,6 +545,75 @@ def test_message_ingest_routes_permission_business_request_to_professional_workf
     assert isinstance(body["routeDecision"]["idempotencyKey"], str)
     assert body["routeDecision"]["executionScope"] == "read_only"
     assert body["routeDecision"]["evidencePolicy"] == "strict"
+    brain_dispatch_summary = body["brainDispatchSummary"]
+    assert brain_dispatch_summary["dispatchType"] == "workflow_run"
+    assert brain_dispatch_summary["workflowMode"] == "professional_workflow"
+    assert brain_dispatch_summary["executionAgent"] == body["routeDecision"]["executionAgent"]
+    assert brain_dispatch_summary["deliveryMode"] == "workflow_execution"
+    assert brain_dispatch_summary["approvalRequired"] == body["routeDecision"]["approvalRequired"]
+    assert brain_dispatch_summary["executionScope"] == body["routeDecision"]["executionScope"]
+    assert brain_dispatch_summary["routingStrategy"] == body["routeDecision"]["routingStrategy"]
+    assert brain_dispatch_summary["fallbackMode"] == body["routeDecision"]["fallbackPolicy"]["mode"]
+    assert brain_dispatch_summary["routeReasonSummary"] == body["routeDecision"]["routeRationale"]["route_reason_summary"]
+
+
+def test_message_ingest_professional_workflow_waits_for_confirmation() -> None:
+    response = client.post(
+        "/api/messages/ingest",
+        json={
+            "channel": "telegram",
+            "platformUserId": "professional-confirm-user",
+            "chatId": "professional-confirm-chat",
+            "text": "帮我在 CRM 系统中获取 10 月订单信息并以 PDF 方式发送给我",
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    task_id = body["taskId"]
+    run_id = body["runId"]
+
+    task = next(item for item in store.tasks if item["id"] == task_id)
+    run = next(item for item in store.workflow_runs if item["id"] == run_id)
+
+    assert task["status"] == "pending"
+    assert task["route_decision"]["confirmation_status"] == "pending"
+    assert run["dispatch_context"]["state"] == "awaiting_confirmation"
+
+
+def test_message_ingest_confirm_message_releases_professional_workflow() -> None:
+    first_response = client.post(
+        "/api/messages/ingest",
+        json={
+            "channel": "telegram",
+            "platformUserId": "professional-confirm-release-user",
+            "chatId": "professional-confirm-release-chat",
+            "text": "帮我在 CRM 系统中获取 10 月订单信息并以 PDF 方式发送给我",
+        },
+    )
+    assert first_response.status_code == 200
+    initial_body = first_response.json()
+
+    confirm_response = client.post(
+        "/api/messages/ingest",
+        json={
+            "channel": "telegram",
+            "platformUserId": "professional-confirm-release-user",
+            "chatId": "professional-confirm-release-chat",
+            "text": "确认，开始执行",
+        },
+    )
+
+    assert confirm_response.status_code == 200
+    confirm_body = confirm_response.json()
+    task = next(item for item in store.tasks if item["id"] == initial_body["taskId"])
+    run = next(item for item in store.workflow_runs if item["id"] == initial_body["runId"])
+
+    assert confirm_body["entrypoint"] == "master_bot.confirmation"
+    assert confirm_body["taskId"] == initial_body["taskId"]
+    assert task["route_decision"]["confirmation_status"] == "confirm"
+    assert task["status"] == "running"
+    assert run["dispatch_context"]["state"] in {"dispatched", "executing", "agent_queued", "completed"}
 
 
 def test_message_ingest_parses_schedule_plan_into_route_decision() -> None:
@@ -668,6 +851,8 @@ def test_message_ingest_starts_new_task_when_explicit_new_task_marker_is_present
 
 
 def test_prompt_injection_message_is_blocked() -> None:
+    task_total_before = len(store.tasks)
+    run_total_before = len(store.workflow_runs)
     response = client.post(
         "/api/messages/ingest",
         json={
@@ -680,6 +865,48 @@ def test_prompt_injection_message_is_blocked() -> None:
 
     assert response.status_code == 403
     assert response.json()["detail"] == "Prompt injection risk detected"
+    assert len(store.tasks) == task_total_before
+    assert len(store.workflow_runs) == run_total_before
+    assert memory_service.list_messages("telegram:blocked-user")["total"] == 0
+    assert "telegram:blocked-user" not in ACTIVE_TASKS_BY_USER
+
+
+def test_message_ingest_persists_sanitized_content_to_task_and_memory(auth_headers) -> None:
+    response = client.post(
+        "/api/messages/ingest",
+        json={
+            "channel": "telegram",
+            "platformUserId": "redacted-route-user",
+            "chatId": "redacted-route-chat",
+            "text": "请记录邮箱 admin@example.com、手机号 13800138000 和验证码 123456 后继续处理",
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    task_response = client.get(f"/api/tasks/{body['taskId']}", headers=auth_headers)
+    assert task_response.status_code == 200
+    task_body = task_response.json()
+    assert "[REDACTED_EMAIL]" in task_body["description"]
+    assert "[REDACTED_PHONE]" in task_body["description"]
+    assert "[REDACTED_OTP]" in task_body["description"]
+    assert "admin@example.com" not in task_body["description"]
+    assert "13800138000" not in task_body["description"]
+    assert "123456" not in task_body["description"]
+
+    memory_messages = memory_service.list_messages("telegram:redacted-route-user")
+    assert memory_messages["total"] == 1
+    memory_content = memory_messages["items"][0]["content"]
+    assert "[REDACTED_EMAIL]" in memory_content
+    assert "[REDACTED_PHONE]" in memory_content
+    assert "[REDACTED_OTP]" in memory_content
+    assert "admin@example.com" not in memory_content
+    assert "13800138000" not in memory_content
+    assert "123456" not in memory_content
+
+    latest_audit_log = store.audit_logs[0]
+    assert latest_audit_log["action"] == "安全网关改写放行"
+    assert latest_audit_log["metadata"]["trace"]["outcome"] == "allowed"
 
 
 def test_security_gateway_returns_structured_assessment_and_trace_for_allowed_message() -> None:
@@ -947,12 +1174,12 @@ def test_message_ingest_falls_back_to_direct_agent_when_all_route_candidates_are
         ]
 
     monkeypatch.setattr(
-        "app.services.master_bot_service.select_workflow_candidates_for_message",
+        "app.services.workflow_execution_service.select_workflow_candidates_for_message",
         select_workflow_candidates_for_message,
     )
     monkeypatch.setattr(
         "app.services.workflow_execution_service.resolve_workflow_execution_agent",
-        lambda workflow, intent: None,
+        lambda workflow, intent, route_seed=None: None,
     )
 
     response = client.post(
@@ -967,13 +1194,250 @@ def test_message_ingest_falls_back_to_direct_agent_when_all_route_candidates_are
 
     assert response.status_code == 200
     body = response.json()
-    assert body["routeDecision"]["routingStrategy"] == "workflow_or_direct_agent_fallback"
+    assert body["routeDecision"]["routingStrategy"] == "workflow_or_agent_dispatch_fallback"
+    assert body["routeDecision"]["workflowId"] == workflow_execution_service.AGENT_DISPATCH_WORKFLOW_ID
+    assert body["routeDecision"]["executionAgent"]
     assert body["routeDecision"]["executionAgentId"]
+    brain_dispatch_summary = body["brainDispatchSummary"]
+    assert brain_dispatch_summary["dispatchType"] == "agent_dispatch"
+    assert brain_dispatch_summary["workflowMode"] == "free_workflow"
+    assert brain_dispatch_summary["executionAgent"] == body["routeDecision"]["executionAgent"]
+    assert brain_dispatch_summary["deliveryMode"] == "structured_result"
+    assert brain_dispatch_summary["responseContract"] == "task_handoff"
+    assert brain_dispatch_summary["routingStrategy"] == body["routeDecision"]["routingStrategy"]
+    assert brain_dispatch_summary["fallbackMode"] == body["routeDecision"]["fallbackPolicy"]["mode"]
+    assert brain_dispatch_summary["routeReasonSummary"] == body["routeDecision"]["routeRationale"]["route_reason_summary"]
+
+
+def test_agent_execution_free_workflow_failure_records_dispatch_and_fallback_contract(monkeypatch) -> None:
+    service = AgentExecutionService()
+    task = {
+        "id": "task-free-failure",
+        "description": "帮我查一下广州天气",
+        "preferred_language": "zh",
+        "brain_dispatch_summary": {
+            "routing_strategy": "workflow_trigger+execution_agent_support",
+            "execution_topology": "single_agent",
+            "fallback_mode": "none",
+            "route_reason_summary": "自由工作流处理天气查询",
+        },
+    }
+    run = {
+        "id": "run-free-failure",
+        "intent": "search",
+        "dispatch_context": {
+            "route_decision": {
+                "workflow_mode": "free_workflow",
+                "interaction_mode": "task",
+                "routing_strategy": "workflow_trigger+execution_agent_support",
+                "required_capabilities": ["weather_lookup"],
+                "execution_scope": "read_only",
+                "fallback_policy": {"mode": "none", "target": None, "on_failure": "direct_fail"},
+                "route_rationale": {"route_reason_summary": "自由工作流处理天气查询"},
+            },
+            "manager_packet": {
+                "delivery_mode": "structured_result",
+                "response_contract": "task_handoff",
+                "session_state": "executing",
+                "state_label": "执行中",
+            },
+            "brain_dispatch_summary": {
+                "routing_strategy": "workflow_trigger+execution_agent_support",
+                "execution_topology": "single_agent",
+                "fallback_mode": "none",
+                "route_reason_summary": "自由工作流处理天气查询",
+            },
+        },
+    }
+
+    monkeypatch.setattr(
+        "app.services.free_workflow_service.free_workflow_service.run",
+        lambda **kwargs: {
+            "ok": False,
+            "selected_skill": "weather_lookup_skill",
+            "error": {"message": "weather_provider_unavailable"},
+        },
+    )
+
+    result = service.execute_task(task=task, run=run, execution_agent={"name": "搜索 Agent"})
+
+    assert result["dispatch_contract"]["routing_strategy"] == "workflow_trigger+execution_agent_support"
+    assert result["dispatch_contract"]["execution_topology"] == "single_agent"
+    assert result["fallback_contract"]["stage"] == "free_workflow_runtime"
+    assert result["fallback_contract"]["activated"] is True
+    assert result["fallback_contract"]["resolution"] == "skill_failure"
+    assert result["fallback_contract"]["detail"] == "weather_provider_unavailable"
+
+
+def test_agent_execution_dispatch_contract_canonicalizes_legacy_routing_strategy_alias() -> None:
+    service = AgentExecutionService()
+    task = {"id": "task-legacy-routing-strategy", "description": "legacy alias compatibility"}
+    run = {
+        "id": "run-legacy-routing-strategy",
+        "dispatch_context": {
+            "route_decision": {
+                "workflow_mode": "free_workflow",
+                "interaction_mode": "workflow_or_direct_agent_fallback",
+                "routing_strategy": "workflow_or_direct_agent_fallback",
+            }
+        },
+    }
+
+    contract = service._dispatch_contract(task=task, run=run, execution_agent=None, result={})
+
+    assert contract["interaction_mode"] == "task"
+    assert contract["routing_strategy"] == "workflow_or_agent_dispatch_fallback"
+
+
+def test_agent_execution_multi_agent_records_dispatch_and_aggregation_contracts() -> None:
+    service = AgentExecutionService()
+    task = {
+        "id": "task-multi-agent",
+        "description": "请先检索安全网关设计文档，再写一封客户说明邮件",
+        "preferred_language": "zh",
+        "brain_dispatch_summary": {
+            "routing_strategy": "dynamic_multi_agent_dispatch",
+            "execution_topology": "multi_agent",
+            "fallback_mode": "planner_recovery",
+            "route_reason_summary": "先检索再写作，适合多 Agent 串行编排",
+        },
+    }
+    run = {
+        "id": "run-multi-agent",
+        "intent": "write",
+        "dispatch_context": {
+            "route_decision": {
+                "workflow_mode": "free_workflow",
+                "interaction_mode": "task",
+                "routing_strategy": "dynamic_multi_agent_dispatch",
+                "execution_scope": "read_only",
+                "fallback_policy": {
+                    "mode": "planner_recovery",
+                    "target": "master_bot_planner",
+                    "on_failure": "retry_or_fail_terminal",
+                },
+                "route_rationale": {"route_reason_summary": "先检索再写作，适合多 Agent 串行编排"},
+                "execution_plan": {
+                    "plan_type": "multi_agent",
+                    "coordination_mode": "serial",
+                    "planner": "master_bot_planner",
+                    "aggregator": "master_bot_planner",
+                    "fan_in": {"strategy": "ordered_synthesis", "aggregator": "master_bot_planner"},
+                    "merge_strategy": "append_bullets_and_references",
+                    "quorum": {"min_success_count": 2},
+                    "step_count": 2,
+                    "steps": [
+                        {"intent": "search", "execution_agent": "搜索 Agent", "execution_agent_id": "1"},
+                        {"intent": "write", "execution_agent": "写作 Agent", "execution_agent_id": "2"},
+                    ],
+                    "summary": "先搜索后写作",
+                },
+            },
+            "manager_packet": {
+                "delivery_mode": "structured_result",
+                "response_contract": "task_handoff",
+                "session_state": "executing",
+                "state_label": "执行中",
+            },
+            "brain_dispatch_summary": {
+                "routing_strategy": "dynamic_multi_agent_dispatch",
+                "execution_topology": "multi_agent",
+                "fallback_mode": "planner_recovery",
+                "route_reason_summary": "先检索再写作，适合多 Agent 串行编排",
+            },
+            "execution_plan": {
+                "plan_type": "multi_agent",
+                "coordination_mode": "serial",
+                "planner": "master_bot_planner",
+                "aggregator": "master_bot_planner",
+                "fan_in": {"strategy": "ordered_synthesis", "aggregator": "master_bot_planner"},
+                "merge_strategy": "append_bullets_and_references",
+                "quorum": {"min_success_count": 2},
+                "step_count": 2,
+                "steps": [
+                    {"intent": "search", "execution_agent": "搜索 Agent", "execution_agent_id": "1"},
+                    {"intent": "write", "execution_agent": "写作 Agent", "execution_agent_id": "2"},
+                ],
+                "summary": "先搜索后写作",
+            },
+        },
+    }
+
+    result = service.execute_task(task=task, run=run, execution_agent={"name": "写作 Agent"})
+
+    assert result["dispatch_contract"]["routing_strategy"] == "dynamic_multi_agent_dispatch"
+    assert result["dispatch_contract"]["execution_topology"] == "multi_agent"
+    assert result["dispatch_contract"]["planned_step_count"] == 2
+    assert result["fallback_contract"]["mode"] == "planner_recovery"
+    assert result["fallback_contract"]["activated"] is False
+    assert result["aggregation_contract"]["mode"] == "serial"
+    assert result["aggregation_contract"]["step_count"] == 2
+    assert result["aggregation_contract"]["completed_agents"] == 2
+    assert result["aggregation_contract"]["fan_in"]["strategy"] == "ordered_synthesis"
+    assert result["aggregation_contract"]["merge_strategy"] == "append_bullets_and_references"
+    assert len(result["aggregation_contract"]["branch_results"]) == 2
+
+
+def test_agent_execution_multi_agent_race_mode_cancels_remaining_branches_after_winner() -> None:
+    service = AgentExecutionService()
+    task = {
+        "id": "task-multi-agent-race",
+        "description": "同时给我两个方案，谁先合格就采用谁",
+        "preferred_language": "zh",
+    }
+    run = {
+        "id": "run-multi-agent-race",
+        "intent": "help",
+        "dispatch_context": {
+            "route_decision": {
+                "workflow_mode": "free_workflow",
+                "interaction_mode": "task",
+                "routing_strategy": "dynamic_multi_agent_dispatch",
+                "execution_scope": "read_only",
+                "execution_plan": {
+                    "plan_type": "multi_agent",
+                    "coordination_mode": "race",
+                    "planner": "master_bot_planner",
+                    "aggregator": "master_bot_planner",
+                    "winner_strategy": "first_acceptable",
+                    "cancel_policy": {"cancel_remaining_on_winner": True},
+                    "step_count": 2,
+                    "steps": [
+                        {
+                            "id": "candidate-a",
+                            "branch_id": "branch-a",
+                            "intent": "search",
+                            "execution_agent": "搜索 Agent",
+                            "execution_agent_id": "1",
+                        },
+                        {
+                            "id": "candidate-b",
+                            "branch_id": "branch-b",
+                            "intent": "write",
+                            "execution_agent": "写作 Agent",
+                            "execution_agent_id": "2",
+                        },
+                    ],
+                    "summary": "竞速选择首个合格结果",
+                },
+            },
+        },
+    }
+
+    result = service.execute_task(task=task, run=run, execution_agent={"name": "搜索 Agent"})
+
+    assert result["aggregation_contract"]["mode"] == "race"
+    assert result["aggregation_contract"]["completed_agents"] == 1
+    assert result["aggregation_contract"]["cancelled_agents"] == 1
+    branch_results = result["aggregation_contract"]["branch_results"]
+    assert sorted(item["status"] for item in branch_results) == ["cancelled", "completed"]
+    winner = next(item for item in branch_results if item["status"] == "completed")
+    assert result["aggregation_notes"]["selected_branch_id"] == winner["branch_id"]
 
 
 def test_message_ingest_falls_back_to_direct_agent_when_no_workflow_exists(monkeypatch) -> None:
     monkeypatch.setattr(
-        "app.services.master_bot_service.select_workflow_candidates_for_message",
+        "app.services.workflow_execution_service.select_workflow_candidates_for_message",
         lambda *args, **kwargs: (_ for _ in ()).throw(
             HTTPException(status_code=404, detail="Workflow not found")
         ),
@@ -991,8 +1455,8 @@ def test_message_ingest_falls_back_to_direct_agent_when_no_workflow_exists(monke
 
     assert response.status_code == 200
     body = response.json()
-    assert body["routeDecision"]["routingStrategy"] == "workflow_or_direct_agent_fallback"
-    assert body["routeDecision"]["workflowId"] == "__direct_agent_fallback__"
+    assert body["routeDecision"]["routingStrategy"] == "workflow_or_agent_dispatch_fallback"
+    assert body["routeDecision"]["workflowId"] == workflow_execution_service.AGENT_DISPATCH_WORKFLOW_ID
     assert body["routeDecision"]["executionAgentId"]
 
 

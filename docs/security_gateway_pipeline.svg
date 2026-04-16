@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="720" viewBox="0 0 1200 720">
+  <rect width="1200" height="720" fill="#f7f5ef"/>
+  <text x="60" y="70" font-size="32" font-family="Arial">Security gateway 5-layer pipeline</text>
+  <text x="60" y="120" font-size="22" font-family="Arial">Master Bot — trusted input</text>
+
+  <text x="80" y="190" font-size="24" font-family="Arial">① Rate limit</text>
+  <text x="120" y="225" font-size="18" font-family="Arial">per-user quotas</text>
+  <text x="120" y="255" font-size="18" font-family="Arial">burst protection</text>
+
+  <text x="80" y="320" font-size="24" font-family="Arial">② Auth / RBAC</text>
+  <text x="120" y="355" font-size="18" font-family="Arial">tenant boundary</text>
+  <text x="120" y="385" font-size="18" font-family="Arial">role policy</text>
+
+  <text x="80" y="450" font-size="24" font-family="Arial">③ Prompt injection dual check</text>
+  <text x="120" y="485" font-size="18" font-family="Arial">trusted input scan</text>
+  <text x="120" y="515" font-size="18" font-family="Arial">payload sanitization</text>
+
+  <text x="650" y="190" font-size="24" font-family="Arial">④ Desensitization</text>
+  <text x="690" y="225" font-size="18" font-family="Arial">PII masking</text>
+  <text x="690" y="255" font-size="18" font-family="Arial">safe payload rewrite</text>
+
+  <text x="650" y="320" font-size="24" font-family="Arial">⑤ Audit &amp; telemetry</text>
+  <text x="690" y="355" font-size="18" font-family="Arial">append only log</text>
+  <text x="690" y="385" font-size="18" font-family="Arial">trace event export</text>
+</svg>

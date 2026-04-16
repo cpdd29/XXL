@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="720" viewBox="0 0 1200 720">
+  <rect width="1200" height="720" fill="#eef6f5"/>
+  <text x="60" y="70" font-size="32" font-family="Arial">Memory distillation lifecycle</text>
+
+  <text x="80" y="170" font-size="24" font-family="Arial">① Short-term memory</text>
+  <text x="120" y="205" font-size="18" font-family="Arial">Redis sliding window</text>
+  <text x="120" y="235" font-size="18" font-family="Arial">recent messages</text>
+  <text x="120" y="265" font-size="18" font-family="Arial">conversation heat</text>
+
+  <text x="80" y="360" font-size="24" font-family="Arial">② Mid-term memory</text>
+  <text x="120" y="395" font-size="18" font-family="Arial">SQLite session summary</text>
+  <text x="120" y="425" font-size="18" font-family="Arial">preferences and decisions</text>
+  <text x="120" y="455" font-size="18" font-family="Arial">distilled milestones</text>
+
+  <text x="650" y="170" font-size="24" font-family="Arial">③ Long-term memory</text>
+  <text x="690" y="205" font-size="18" font-family="Arial">ChromaDB semantic retrieval</text>
+  <text x="690" y="235" font-size="18" font-family="Arial">task results and facts</text>
+  <text x="690" y="265" font-size="18" font-family="Arial">embedding based recall</text>
+</svg>

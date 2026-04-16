@@ -8,6 +8,15 @@ from app.services.internal_event_delivery_poller_service import (
 from app.services.store import store
 
 
+class FakeEventBus:
+    def __init__(self) -> None:
+        self.published: list[tuple[str, dict]] = []
+
+    def publish_json(self, subject: str, payload: dict) -> bool:
+        self.published.append((subject, payload))
+        return True
+
+
 class FakePersistence:
     def __init__(self, claimed_deliveries: list[dict] | None = None) -> None:
         self.claimed_deliveries = claimed_deliveries
@@ -67,6 +76,7 @@ def _delivery(
 
 def test_internal_event_delivery_poller_retries_claimed_failed_delivery(monkeypatch) -> None:
     fixed_now = datetime(2026, 4, 4, 12, 0, 0, tzinfo=UTC)
+    event_bus = FakeEventBus()
     persistence = FakePersistence(
         [
             _delivery(
@@ -90,6 +100,7 @@ def test_internal_event_delivery_poller_retries_claimed_failed_delivery(monkeypa
 
     service = InternalEventDeliveryPollerService(
         persistence=persistence,
+        event_bus=event_bus,
         poll_interval_seconds=0.1,
         retry_backoff_seconds=15,
         retry_lease_seconds=60,
@@ -104,6 +115,8 @@ def test_internal_event_delivery_poller_retries_claimed_failed_delivery(monkeypa
         "failed": 0,
     }
     assert retried_ids == ["evt-poller-1"]
+    assert event_bus.published[0][0] == "brain.internal_event.delivery.claimed"
+    assert event_bus.published[0][1]["payload"]["internal_event_id"] == "evt-poller-1"
     assert persistence.claim_calls[0]["claimed_at"] == fixed_now.isoformat()
     assert persistence.claim_calls[0]["retry_before"] == (
         fixed_now - timedelta(seconds=15)
@@ -115,6 +128,7 @@ def test_internal_event_delivery_poller_retries_claimed_failed_delivery(monkeypa
 
 def test_internal_event_delivery_poller_counts_retry_failures(monkeypatch) -> None:
     fixed_now = datetime(2026, 4, 4, 12, 0, 0, tzinfo=UTC)
+    event_bus = FakeEventBus()
     persistence = FakePersistence(
         [
             _delivery(
@@ -140,6 +154,7 @@ def test_internal_event_delivery_poller_counts_retry_failures(monkeypatch) -> No
 
     service = InternalEventDeliveryPollerService(
         persistence=persistence,
+        event_bus=event_bus,
         poll_interval_seconds=0.1,
         retry_backoff_seconds=15,
         retry_lease_seconds=60,
@@ -153,10 +168,12 @@ def test_internal_event_delivery_poller_counts_retry_failures(monkeypatch) -> No
         "retried": 0,
         "failed": 1,
     }
+    assert event_bus.published[0][0] == "brain.internal_event.delivery.claimed"
 
 
 def test_internal_event_delivery_poller_treats_ignored_delivery_as_closed(monkeypatch) -> None:
     fixed_now = datetime(2026, 4, 4, 12, 0, 0, tzinfo=UTC)
+    event_bus = FakeEventBus()
     persistence = FakePersistence(
         [
             _delivery(
@@ -181,6 +198,7 @@ def test_internal_event_delivery_poller_treats_ignored_delivery_as_closed(monkey
 
     service = InternalEventDeliveryPollerService(
         persistence=persistence,
+        event_bus=event_bus,
         poll_interval_seconds=0.1,
         retry_backoff_seconds=15,
         retry_lease_seconds=60,
@@ -194,12 +212,14 @@ def test_internal_event_delivery_poller_treats_ignored_delivery_as_closed(monkey
         "retried": 1,
         "failed": 0,
     }
+    assert event_bus.published[0][0] == "brain.internal_event.delivery.claimed"
 
 
 def test_internal_event_delivery_poller_falls_back_to_failed_delivery_listing(
     monkeypatch,
 ) -> None:
     fixed_now = datetime(2026, 4, 4, 12, 0, 0, tzinfo=UTC)
+    event_bus = FakeEventBus()
     persistence = FakePersistence(claimed_deliveries=None)
     listed_calls: list[dict[str, object]] = []
     retried_ids: list[str] = []
@@ -230,6 +250,7 @@ def test_internal_event_delivery_poller_falls_back_to_failed_delivery_listing(
 
     service = InternalEventDeliveryPollerService(
         persistence=persistence,
+        event_bus=event_bus,
         poll_interval_seconds=0.1,
         retry_backoff_seconds=15,
         retry_lease_seconds=60,
@@ -245,3 +266,4 @@ def test_internal_event_delivery_poller_falls_back_to_failed_delivery_listing(
     }
     assert listed_calls == [{"status_filter": "failed", "limit": 10, "offset": 0}]
     assert retried_ids == ["evt-poller-fallback"]
+    assert event_bus.published[0][0] == "brain.internal_event.delivery.claimed"

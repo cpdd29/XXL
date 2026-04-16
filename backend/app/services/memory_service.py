@@ -11,9 +11,11 @@ from uuid import uuid4
 from fastapi import HTTPException
 
 from app.config import get_settings
+from app.core.content_policy import apply_content_policy
 from app.core.chroma_memory_store import chroma_long_term_memory_store
 from app.core.redis_client import redis_provider
 from app.core.sqlite_memory_store import sqlite_mid_term_memory_store
+from app.services.tenancy_service import attach_scope, default_scope
 from app.services.persistence_service import persistence_service
 
 
@@ -53,7 +55,62 @@ STOPWORDS = {
     "一下",
     "需要",
     "希望",
+    "脱敏",
 }
+MEMORY_REDACTED_PLACEHOLDER_PATTERN = re.compile(r"\[REDACTED_[A-Z_]+\]")
+MEMORY_REDACTED_SECRET_ASSIGNMENT_PATTERN = re.compile(
+    r"\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|session[_-]?token|secret|token)\s*[:=]\s*脱敏\b",
+    re.IGNORECASE,
+)
+MEMORY_REDACTED_BEARER_PATTERN = re.compile(r"\bBearer\s+脱敏\b", re.IGNORECASE)
+MEMORY_REDACTED_OTP_PATTERN = re.compile(
+    r"(?:(?:验证码|校验码|动态码|otp|one[- ]time password|verification code))(\s*[:：]?\s*)脱敏",
+    re.IGNORECASE,
+)
+MEMORY_LOCAL_ONLY_PASSWORD_PATTERN = re.compile(
+    r"\b(?:password|passwd|passcode|pin)\b\s*[:=：]\s*[^\s,;，；]{4,}",
+    re.IGNORECASE,
+)
+MEMORY_LOCAL_ONLY_PASSWORD_CN_PATTERN = re.compile(
+    r"(?:密码|口令|口令码)\s*[:=：]\s*[^\s,;，；]{4,}",
+    re.IGNORECASE,
+)
+MEMORY_LOCAL_ONLY_PRIVATE_KEY_PATTERN = re.compile(
+    r"(?:-----BEGIN [A-Z ]*PRIVATE KEY-----|私钥|private key)",
+    re.IGNORECASE,
+)
+MEMORY_LOCAL_ONLY_MNEMONIC_PATTERN = re.compile(
+    r"(?:助记词|mnemonic|seed phrase)",
+    re.IGNORECASE,
+)
+MEMORY_LOCAL_ONLY_SESSION_SECRET_PATTERN = re.compile(
+    r"(?:session[_ -]?(?:key|token)|会话(?:密钥|令牌)|授权码|authorization code|auth code)\s*[:=：]?\s*[A-Za-z0-9._-]{6,}",
+    re.IGNORECASE,
+)
+MEMORY_LOCAL_ONLY_DEBUG_CONTEXT_PATTERN = re.compile(
+    r"(?:Traceback \(most recent call last\)|stack trace|Exception:|错误堆栈|调试日志|日志片段|临时调试密钥|仅本地排障(?:使用|日志片段)?|local-debug-secret|trace-debug-token|debug secret|debug token|DEBUG\s+\d{4}-\d{2}-\d{2}|ERROR\s+\d{4}-\d{2}-\d{2})",
+    re.IGNORECASE,
+)
+MEMORY_GOVERNANCE_FRAGMENT_SPLIT_PATTERN = re.compile(r"[。！？!?；;\n]+")
+RETENTION_POLICY_DISTILLABLE = "distillable"
+RETENTION_POLICY_LOCAL_ONLY = "local_only"
+LOCAL_ONLY_REWRITE_RULE_REASONS = {
+    "credential_openai_key": "credential_api_key",
+    "credential_telegram_bot_token": "credential_bot_token",
+    "credential_bearer_token": "credential_bearer_token",
+    "credential_secret_assignment": "credential_secret_assignment",
+    "otp_code": "credential_otp",
+    "pii_cn_id_card": "pii_cn_id_card",
+    "financial_bank_card": "financial_bank_card",
+}
+LOCAL_ONLY_CONTENT_REASON_PATTERNS = (
+    ("credential_password", MEMORY_LOCAL_ONLY_PASSWORD_PATTERN),
+    ("credential_password", MEMORY_LOCAL_ONLY_PASSWORD_CN_PATTERN),
+    ("credential_session_secret", MEMORY_LOCAL_ONLY_SESSION_SECRET_PATTERN),
+    ("secret_private_key", MEMORY_LOCAL_ONLY_PRIVATE_KEY_PATTERN),
+    ("secret_mnemonic", MEMORY_LOCAL_ONLY_MNEMONIC_PATTERN),
+    ("debug_log_fragment", MEMORY_LOCAL_ONLY_DEBUG_CONTEXT_PATTERN),
+)
 QUERY_TOKEN_EXPANSIONS: dict[str, tuple[str, ...]] = {
     "周报": ("weekly report", "weekly update", "weekly"),
     "weekly": ("周报", "每周", "周一"),
@@ -113,6 +170,85 @@ TASK_RESULT_HINTS = (
     "draft",
     "send",
 )
+
+MEMORY_SCOPE_TENANT = "tenant"
+MEMORY_SCOPE_GLOBAL = "global"
+MEMORY_LAYER_CONVERSATION = "conversation"
+MEMORY_LAYER_WORKING = "working"
+MEMORY_LAYER_FACT = "fact"
+WRITE_SOURCE_BRAIN_INTERNAL = "brain_internal"
+WRITE_SOURCE_USER_MESSAGE = "user_message"
+WRITE_SOURCE_EXTERNAL_SKILL = "external_skill"
+WRITE_SOURCE_EXTERNAL_AGENT = "external_agent"
+WRITE_SOURCE_DISTILLATION = "distillation"
+TRUST_LEVEL_TRUSTED = "trusted"
+TRUST_LEVEL_REVIEWABLE = "reviewable"
+TRUST_LEVEL_UNTRUSTED = "untrusted"
+MEMORY_STATUS_ACTIVE = "active"
+MEMORY_STATUS_ARCHIVED = "archived"
+MEMORY_STATUS_DELETED = "deleted"
+REVIEW_STATUS_PENDING = "pending"
+REVIEW_STATUS_APPROVED = "approved"
+REVIEW_STATUS_REJECTED = "rejected"
+EXTERNAL_WRITE_SOURCES = {WRITE_SOURCE_EXTERNAL_SKILL, WRITE_SOURCE_EXTERNAL_AGENT}
+FACT_MEMORY_TYPES = {"user_preference", "task_result"}
+WORKING_MEMORY_TYPES = {"agent_decision"}
+CONVERSATION_MEMORY_TYPES = {"session_summary", "event_digest"}
+MEMORY_LAYER_RETENTION_DAYS = {
+    MEMORY_LAYER_CONVERSATION: 7,
+    MEMORY_LAYER_WORKING: 30,
+}
+LONG_TERM_MEMORY_TYPE_POLICY = {
+    "session_summary": {
+        "label": "会话摘要",
+        "memory_layer_kind": MEMORY_LAYER_CONVERSATION,
+        "retention_days": MEMORY_LAYER_RETENTION_DAYS.get(MEMORY_LAYER_CONVERSATION),
+        "allowed_scopes": (MEMORY_SCOPE_TENANT, MEMORY_SCOPE_GLOBAL),
+        "allowed_write_sources": (WRITE_SOURCE_DISTILLATION,),
+    },
+    "user_preference": {
+        "label": "用户偏好",
+        "memory_layer_kind": MEMORY_LAYER_FACT,
+        "retention_days": None,
+        "allowed_scopes": (MEMORY_SCOPE_TENANT, MEMORY_SCOPE_GLOBAL),
+        "allowed_write_sources": (WRITE_SOURCE_DISTILLATION,),
+    },
+    "agent_decision": {
+        "label": "执行决策",
+        "memory_layer_kind": MEMORY_LAYER_WORKING,
+        "retention_days": MEMORY_LAYER_RETENTION_DAYS.get(MEMORY_LAYER_WORKING),
+        "allowed_scopes": (MEMORY_SCOPE_TENANT, MEMORY_SCOPE_GLOBAL),
+        "allowed_write_sources": (WRITE_SOURCE_DISTILLATION,),
+    },
+    "task_result": {
+        "label": "任务结果",
+        "memory_layer_kind": MEMORY_LAYER_FACT,
+        "retention_days": None,
+        "allowed_scopes": (MEMORY_SCOPE_TENANT, MEMORY_SCOPE_GLOBAL),
+        "allowed_write_sources": (WRITE_SOURCE_DISTILLATION,),
+    },
+    "event_digest": {
+        "label": "关键事件",
+        "memory_layer_kind": MEMORY_LAYER_CONVERSATION,
+        "retention_days": MEMORY_LAYER_RETENTION_DAYS.get(MEMORY_LAYER_CONVERSATION),
+        "allowed_scopes": (MEMORY_SCOPE_TENANT, MEMORY_SCOPE_GLOBAL),
+        "allowed_write_sources": (WRITE_SOURCE_DISTILLATION,),
+    },
+}
+LOCAL_ONLY_REASON_DESCRIPTIONS = {
+    "credential_api_key": "命中 API Key 等凭据脱敏规则，不允许进入中长期记忆。",
+    "credential_bot_token": "命中 Bot Token 脱敏规则，不允许进入中长期记忆。",
+    "credential_bearer_token": "命中 Bearer Token 脱敏规则，不允许进入中长期记忆。",
+    "credential_secret_assignment": "命中 secret/token 赋值规则，不允许进入中长期记忆。",
+    "credential_otp": "命中一次性验证码规则，不允许进入中长期记忆。",
+    "pii_cn_id_card": "命中身份证类敏感标识规则，不允许进入中长期记忆。",
+    "financial_bank_card": "命中银行卡类敏感标识规则，不允许进入中长期记忆。",
+    "credential_password": "命中密码/口令模式，不允许进入中长期记忆。",
+    "credential_session_secret": "命中会话密钥/授权码模式，不允许进入中长期记忆。",
+    "secret_private_key": "命中私钥内容模式，不允许进入中长期记忆。",
+    "secret_mnemonic": "命中助记词/seed phrase 模式，不允许进入中长期记忆。",
+    "debug_log_fragment": "命中临时调试日志/排障片段模式，不允许进入中长期记忆。",
+}
 
 
 logger = logging.getLogger(__name__)
@@ -183,33 +319,29 @@ class MemoryService:
         return authoritative_items
 
     def _load_long_term_bucket(self, user_id: str) -> list[dict]:
-        cached_items = list(self._long_term.get(user_id, []))
+        runtime_items = list(self._long_term.get(user_id, []))
         stored_items = (
             self._long_term_store.list_memories(user_id)
             if self._long_term_store is not None
             else None
         )
         if stored_items is None:
-            return cached_items
-
-        merged_items: dict[str, dict] = {}
-        for item in cached_items:
-            memory_id = str(item.get("id") or "").strip()
-            if memory_id:
-                merged_items[memory_id] = deepcopy(item)
-        for item in stored_items:
-            memory_id = str(item.get("id") or "").strip()
-            if memory_id:
-                merged_items[memory_id] = deepcopy(item)
+            return runtime_items
 
         authoritative_items = sorted(
-            merged_items.values(),
+            [
+                deepcopy(item)
+                for item in stored_items
+                if str(item.get("id") or "").strip()
+            ],
             key=lambda item: (item.get("created_at", ""), item["id"]),
         )
         if authoritative_items:
             self._long_term[user_id] = deepcopy(authoritative_items)
-        else:
-            self._long_term.pop(user_id, None)
+            return authoritative_items
+        if runtime_items:
+            return deepcopy(runtime_items)
+        self._long_term.pop(user_id, None)
         return authoritative_items
 
     @staticmethod
@@ -573,6 +705,264 @@ class MemoryService:
                 continue
         return parsed_items
 
+    @staticmethod
+    def _normalize_scope(scope: dict | None) -> dict[str, str]:
+        resolved = default_scope()
+        if not isinstance(scope, dict):
+            return resolved
+        for key in ("tenant_id", "project_id", "environment"):
+            value = str(scope.get(key) or "").strip()
+            if value:
+                resolved[key] = value
+        return resolved
+
+    @staticmethod
+    def _normalize_memory_scope(value: str | None) -> str:
+        normalized = str(value or "").strip().lower()
+        if normalized == MEMORY_SCOPE_GLOBAL:
+            return MEMORY_SCOPE_GLOBAL
+        return MEMORY_SCOPE_TENANT
+
+    @staticmethod
+    def _normalize_write_source(value: str | None, *, default: str = WRITE_SOURCE_BRAIN_INTERNAL) -> str:
+        normalized = str(value or "").strip().lower()
+        if normalized in {
+            WRITE_SOURCE_BRAIN_INTERNAL,
+            WRITE_SOURCE_USER_MESSAGE,
+            WRITE_SOURCE_EXTERNAL_SKILL,
+            WRITE_SOURCE_EXTERNAL_AGENT,
+            WRITE_SOURCE_DISTILLATION,
+        }:
+            return normalized
+        return default
+
+    @staticmethod
+    def _normalize_trust_level(value: str | None, *, default: str = TRUST_LEVEL_TRUSTED) -> str:
+        normalized = str(value or "").strip().lower()
+        if normalized in {TRUST_LEVEL_TRUSTED, TRUST_LEVEL_REVIEWABLE, TRUST_LEVEL_UNTRUSTED}:
+            return normalized
+        return default
+
+    @classmethod
+    def _long_term_memory_type_policy(cls, memory_type: str) -> dict[str, object]:
+        normalized = str(memory_type or "").strip().lower()
+        policy = LONG_TERM_MEMORY_TYPE_POLICY.get(normalized)
+        if policy is None:
+            raise HTTPException(status_code=422, detail=f"Unsupported long-term memory type: {memory_type}")
+        return dict(policy)
+
+    @classmethod
+    def _memory_layer_kind_for_long_term_type(cls, memory_type: str) -> str:
+        policy = cls._long_term_memory_type_policy(memory_type)
+        return str(policy["memory_layer_kind"])
+
+    @classmethod
+    def governance_snapshot(cls) -> dict[str, object]:
+        long_term_whitelist = [
+            {
+                "memory_type": memory_type,
+                "label": str(policy.get("label") or memory_type),
+                "memory_layer_kind": str(policy.get("memory_layer_kind") or MEMORY_LAYER_CONVERSATION),
+                "retention_days": policy.get("retention_days"),
+                "allowed_scopes": list(policy.get("allowed_scopes") or (MEMORY_SCOPE_TENANT,)),
+                "allowed_write_sources": list(policy.get("allowed_write_sources") or (WRITE_SOURCE_DISTILLATION,)),
+            }
+            for memory_type, policy in sorted(LONG_TERM_MEMORY_TYPE_POLICY.items())
+        ]
+        return {
+            "long_term_whitelist": long_term_whitelist,
+            "local_only_reason_codes": [
+                {
+                    "code": code,
+                    "description": LOCAL_ONLY_REASON_DESCRIPTIONS.get(code, ""),
+                }
+                for code in sorted(
+                    {
+                        *LOCAL_ONLY_REWRITE_RULE_REASONS.values(),
+                        *(reason for reason, _pattern in LOCAL_ONLY_CONTENT_REASON_PATTERNS),
+                    }
+                )
+            ],
+            "supported_memory_scopes": [MEMORY_SCOPE_TENANT, MEMORY_SCOPE_GLOBAL],
+            "restricted_external_write_sources": sorted(EXTERNAL_WRITE_SOURCES),
+            "retention_days": dict(MEMORY_LAYER_RETENTION_DAYS),
+            "review_flow": [REVIEW_STATUS_PENDING, REVIEW_STATUS_APPROVED, REVIEW_STATUS_REJECTED],
+            "lifecycle_statuses": [MEMORY_STATUS_ACTIVE, MEMORY_STATUS_ARCHIVED, MEMORY_STATUS_DELETED],
+        }
+
+    def _memory_expiry(self, memory_layer_kind: str, *, created_at: str) -> str | None:
+        retention_days = MEMORY_LAYER_RETENTION_DAYS.get(memory_layer_kind)
+        if retention_days is None:
+            return None
+        try:
+            created_dt = self._from_iso(created_at)
+        except ValueError:
+            return None
+        return self._to_iso(created_dt + timedelta(days=retention_days))
+
+    def _governance_defaults(
+        self,
+        *,
+        scope: dict | None,
+        memory_scope: str,
+        memory_layer_kind: str,
+        write_source: str,
+        trust_level: str,
+        created_at: str,
+    ) -> dict:
+        normalized_scope = self._normalize_scope(scope)
+        normalized_memory_scope = self._normalize_memory_scope(memory_scope)
+        normalized_write_source = self._normalize_write_source(write_source)
+        normalized_trust = self._normalize_trust_level(trust_level)
+        return {
+            **normalized_scope,
+            "memory_scope": normalized_memory_scope,
+            "memory_layer_kind": memory_layer_kind,
+            "write_source": normalized_write_source,
+            "trust_level": normalized_trust,
+            "retention_policy": RETENTION_POLICY_DISTILLABLE,
+            "local_only_reasons": [],
+            "local_only_filtered_count": 0,
+            "memory_status": MEMORY_STATUS_ACTIVE,
+            "review_status": (
+                REVIEW_STATUS_PENDING
+                if normalized_trust in {TRUST_LEVEL_REVIEWABLE, TRUST_LEVEL_UNTRUSTED}
+                else REVIEW_STATUS_APPROVED
+            ),
+            "reviewed_by": None,
+            "reviewed_at": None,
+            "review_note": None,
+            "expires_at": self._memory_expiry(memory_layer_kind, created_at=created_at),
+            "archived_at": None,
+            "deleted_at": None,
+            "corrected_at": None,
+        }
+
+    def _apply_governance_defaults(
+        self,
+        item: dict,
+        *,
+        scope: dict | None,
+        memory_scope: str,
+        memory_layer_kind: str,
+        write_source: str,
+        trust_level: str,
+    ) -> dict:
+        payload = attach_scope(item, scope=self._normalize_scope(scope))
+        payload.update(
+            self._governance_defaults(
+                scope=scope,
+                memory_scope=memory_scope,
+                memory_layer_kind=memory_layer_kind,
+                write_source=write_source,
+                trust_level=trust_level,
+                created_at=str(payload.get("created_at") or self._to_iso(self._now())),
+            )
+        )
+        return payload
+
+    def _enforce_memory_write_policy(
+        self,
+        *,
+        target_layer: str,
+        write_source: str,
+        trust_level: str,
+        memory_scope: str,
+    ) -> None:
+        normalized_source = self._normalize_write_source(write_source)
+        normalized_trust = self._normalize_trust_level(trust_level)
+        normalized_scope = self._normalize_memory_scope(memory_scope)
+        if target_layer in {"mid_term", "long_term"} and normalized_source in EXTERNAL_WRITE_SOURCES:
+            raise HTTPException(
+                status_code=403,
+                detail="External skills/agents cannot write governed mid/long-term memory",
+            )
+        if normalized_source in EXTERNAL_WRITE_SOURCES and normalized_trust == TRUST_LEVEL_TRUSTED:
+            raise HTTPException(
+                status_code=403,
+                detail="External skills/agents cannot create trusted memory directly",
+            )
+        if normalized_scope == MEMORY_SCOPE_GLOBAL and normalized_source != WRITE_SOURCE_BRAIN_INTERNAL:
+            raise HTTPException(
+                status_code=403,
+                detail="Global memory is reserved for brain-internal governance paths",
+            )
+
+    @staticmethod
+    def _memory_visible_in_scope(item: dict, scope: dict) -> bool:
+        normalized_scope = MemoryService._normalize_scope(scope)
+        memory_scope = str(item.get("memory_scope") or MEMORY_SCOPE_TENANT).strip().lower()
+        has_explicit_scope = any(
+            str(item.get(key) or "").strip()
+            for key in ("tenant_id", "project_id", "environment")
+        )
+        if not has_explicit_scope:
+            return True
+        item_environment = str(item.get("environment") or normalized_scope["environment"]).strip()
+        if item_environment and item_environment != normalized_scope["environment"]:
+            return False
+        if memory_scope == MEMORY_SCOPE_GLOBAL:
+            return True
+        return (
+            str(item.get("tenant_id") or "").strip() == normalized_scope["tenant_id"]
+            and str(item.get("project_id") or "").strip() == normalized_scope["project_id"]
+            and item_environment == normalized_scope["environment"]
+        )
+
+    def _memory_active_for_retrieval(self, item: dict, *, include_untrusted: bool = False) -> bool:
+        status = str(item.get("memory_status") or MEMORY_STATUS_ACTIVE).strip().lower()
+        review_status = str(item.get("review_status") or REVIEW_STATUS_APPROVED).strip().lower()
+        trust_level = str(item.get("trust_level") or TRUST_LEVEL_TRUSTED).strip().lower()
+        if status != MEMORY_STATUS_ACTIVE:
+            return False
+        if review_status == REVIEW_STATUS_REJECTED:
+            return False
+        if not include_untrusted and trust_level != TRUST_LEVEL_TRUSTED:
+            return False
+        return True
+
+    def _filter_memory_items(
+        self,
+        items: list[dict],
+        *,
+        scope: dict | None,
+        memory_scope: str | None = None,
+        include_inactive: bool = False,
+        include_untrusted: bool = False,
+    ) -> list[dict]:
+        normalized_scope = self._normalize_scope(scope)
+        requested_memory_scope = self._normalize_memory_scope(memory_scope) if memory_scope else None
+        filtered: list[dict] = []
+        for item in items:
+            if not self._memory_visible_in_scope(item, normalized_scope):
+                continue
+            item_memory_scope = str(item.get("memory_scope") or MEMORY_SCOPE_TENANT).strip().lower()
+            if requested_memory_scope is not None and item_memory_scope != requested_memory_scope:
+                continue
+            if not include_inactive and not self._memory_active_for_retrieval(
+                item,
+                include_untrusted=include_untrusted,
+            ):
+                continue
+            filtered.append(item)
+        return filtered
+
+    @staticmethod
+    def _scope_breakdown(items: list[dict]) -> dict[str, int]:
+        tenant_count = 0
+        global_count = 0
+        for item in items:
+            memory_scope = str(item.get("memory_scope") or MEMORY_SCOPE_TENANT).strip().lower()
+            if memory_scope == MEMORY_SCOPE_GLOBAL:
+                global_count += 1
+            else:
+                tenant_count += 1
+        return {
+            "tenant": tenant_count,
+            "global": global_count,
+            "total": tenant_count + global_count,
+        }
+
     def _tokenize(self, text: str) -> list[str]:
         tokens = TOKEN_PATTERN.findall(text.lower())
         filtered: list[str] = []
@@ -699,6 +1089,120 @@ class MemoryService:
             "events": self._ordered_unique(events),
         }
 
+    @staticmethod
+    def _sanitize_memory_text(value: str) -> str:
+        cleaned = str(value or "").strip()
+        if not cleaned:
+            return ""
+        rewritten, _, _, rewrite_diffs = apply_content_policy(cleaned)
+        if not rewrite_diffs:
+            return cleaned
+        sanitized = MEMORY_REDACTED_PLACEHOLDER_PATTERN.sub("脱敏", rewritten)
+        sanitized = MEMORY_REDACTED_BEARER_PATTERN.sub("脱敏", sanitized)
+        sanitized = MEMORY_REDACTED_SECRET_ASSIGNMENT_PATTERN.sub("脱敏", sanitized)
+        sanitized = MEMORY_REDACTED_OTP_PATTERN.sub(r"\1脱敏", sanitized)
+        sanitized = re.sub(r"\s+", " ", sanitized).strip()
+        return sanitized or "脱敏"
+
+    @staticmethod
+    def _memory_governance_fragments(value: str) -> list[str]:
+        raw_text = str(value or "").strip()
+        if not raw_text:
+            return []
+        fragments = [
+            fragment.strip()
+            for fragment in MEMORY_GOVERNANCE_FRAGMENT_SPLIT_PATTERN.split(raw_text)
+            if fragment.strip()
+        ]
+        return fragments or [raw_text]
+
+    def _memory_governance_subfragments(self, fragment: str) -> list[str]:
+        normalized_fragment = str(fragment or "").strip()
+        if not normalized_fragment:
+            return []
+        if "，" not in normalized_fragment and "," not in normalized_fragment:
+            return [normalized_fragment]
+        if not self._local_only_reasons_for_content(normalized_fragment):
+            return [normalized_fragment]
+        subfragments = [
+            part.strip()
+            for part in re.split(r"[，,]+", normalized_fragment)
+            if part.strip()
+        ]
+        return subfragments or [normalized_fragment]
+
+    def _local_only_reasons_for_content(self, value: str) -> list[str]:
+        raw_text = str(value or "").strip()
+        if not raw_text:
+            return []
+        _, _, _, rewrite_diffs = apply_content_policy(raw_text)
+        reasons: list[str] = []
+        for diff in rewrite_diffs:
+            rule = str(diff.get("rule") or "").strip()
+            reason = LOCAL_ONLY_REWRITE_RULE_REASONS.get(rule)
+            if reason:
+                reasons.append(reason)
+        for reason, pattern in LOCAL_ONLY_CONTENT_REASON_PATTERNS:
+            if pattern.search(raw_text):
+                reasons.append(reason)
+        return self._ordered_unique(reasons, limit=max(len(reasons), 1))
+
+    def _retention_policy_for_content(self, value: str) -> tuple[str, list[str]]:
+        reasons = self._local_only_reasons_for_content(value)
+        if reasons:
+            return RETENTION_POLICY_LOCAL_ONLY, reasons
+        return RETENTION_POLICY_DISTILLABLE, []
+
+    def _govern_source_items_for_distillation(
+        self,
+        source_items: list[dict],
+    ) -> tuple[list[dict], dict[str, object]]:
+        governed_items: list[dict] = []
+        filtered_items: list[dict[str, object]] = []
+        filtered_reason_counts: Counter[str] = Counter()
+        for item in source_items:
+            raw_content = str(item.get("content") or "")
+            retained_fragments: list[str] = []
+            item_filtered_count = 0
+            item_reason_counts: Counter[str] = Counter()
+
+            for fragment in self._memory_governance_fragments(raw_content):
+                for subfragment in self._memory_governance_subfragments(fragment):
+                    retention_policy, reasons = self._retention_policy_for_content(subfragment)
+                    if retention_policy == RETENTION_POLICY_LOCAL_ONLY:
+                        item_filtered_count += 1
+                        item_reason_counts.update(reasons)
+                        filtered_reason_counts.update(reasons)
+                        filtered_items.append(
+                            {
+                                "message_id": str(item.get("id") or ""),
+                                "session_id": str(item.get("session_id") or ""),
+                                "fragment": subfragment,
+                                "reasons": list(reasons),
+                            }
+                        )
+                        continue
+                    sanitized_fragment = self._sanitize_memory_text(subfragment)
+                    if sanitized_fragment:
+                        retained_fragments.append(sanitized_fragment)
+
+            if not retained_fragments:
+                continue
+
+            sanitized_item = dict(item)
+            sanitized_item["content"] = "。".join(retained_fragments)
+            sanitized_item["retention_policy"] = RETENTION_POLICY_DISTILLABLE
+            sanitized_item["local_only_reasons"] = sorted(item_reason_counts.keys())
+            sanitized_item["local_only_filtered_count"] = item_filtered_count
+            governed_items.append(sanitized_item)
+
+        return governed_items, {
+            "local_only_filtered_count": len(filtered_items),
+            "local_only_reasons": sorted(filtered_reason_counts.keys()),
+            "local_only_reason_counts": dict(filtered_reason_counts),
+            "local_only_filtered_items": filtered_items,
+        }
+
     def _build_hierarchical_summary(
         self,
         *,
@@ -733,6 +1237,9 @@ class MemoryService:
         keywords: list[str],
         highlights: dict[str, list[str]],
         created_at: str,
+        scope: dict | None,
+        memory_scope: str,
+        trust_level: str,
     ) -> list[dict]:
         session_sections = [summary_text]
         if highlights["preferences"]:
@@ -745,16 +1252,23 @@ class MemoryService:
             session_sections.append(f"关键事件：{'；'.join(highlights['events'][:3])}")
 
         memories: list[dict] = [
-            {
-                "id": f"lng-{uuid4().hex[:12]}",
-                "user_id": user_id,
-                "source_mid_term_id": source_mid_term_id,
-                "memory_type": "session_summary",
-                "summary": summary_text,
-                "memory_text": "\n".join(session_sections),
-                "keywords": keywords,
-                "created_at": created_at,
-            }
+            self._apply_governance_defaults(
+                {
+                    "id": f"lng-{uuid4().hex[:12]}",
+                    "user_id": user_id,
+                    "source_mid_term_id": source_mid_term_id,
+                    "memory_type": "session_summary",
+                    "summary": summary_text,
+                    "memory_text": "\n".join(session_sections),
+                    "keywords": keywords,
+                    "created_at": created_at,
+                },
+                scope=scope,
+                memory_scope=memory_scope,
+                memory_layer_kind=self._memory_layer_kind_for_long_term_type("session_summary"),
+                write_source=WRITE_SOURCE_DISTILLATION,
+                trust_level=trust_level,
+            )
         ]
 
         typed_sections = [
@@ -768,16 +1282,23 @@ class MemoryService:
                 continue
             section_keywords = self._extract_keywords([summary_text, *items])
             memories.append(
-                {
-                    "id": f"lng-{uuid4().hex[:12]}",
-                    "user_id": user_id,
-                    "source_mid_term_id": source_mid_term_id,
-                    "memory_type": memory_type,
-                    "summary": f"{label}：{'；'.join(items[:3])}",
-                    "memory_text": f"{label}（会话 {session_id}）：{'；'.join(items[:4])}",
-                    "keywords": section_keywords,
-                    "created_at": created_at,
-                }
+                self._apply_governance_defaults(
+                    {
+                        "id": f"lng-{uuid4().hex[:12]}",
+                        "user_id": user_id,
+                        "source_mid_term_id": source_mid_term_id,
+                        "memory_type": memory_type,
+                        "summary": f"{label}：{'；'.join(items[:3])}",
+                        "memory_text": f"{label}（会话 {session_id}）：{'；'.join(items[:4])}",
+                        "keywords": section_keywords,
+                        "created_at": created_at,
+                    },
+                    scope=scope,
+                    memory_scope=memory_scope,
+                    memory_layer_kind=self._memory_layer_kind_for_long_term_type(memory_type),
+                    write_source=WRITE_SOURCE_DISTILLATION,
+                    trust_level=trust_level,
+                )
             )
 
         return memories
@@ -1058,8 +1579,32 @@ class MemoryService:
         detected_lang: str = "zh",
         *,
         allow_session_rollover: bool = True,
+        scope: dict | None = None,
+        write_source: str = WRITE_SOURCE_USER_MESSAGE,
+        trust_level: str | None = None,
+        memory_scope: str = MEMORY_SCOPE_TENANT,
     ) -> dict:
         now = self._now()
+        normalized_scope = self._normalize_scope(scope)
+        normalized_source = self._normalize_write_source(
+            write_source,
+            default=WRITE_SOURCE_USER_MESSAGE,
+        )
+        normalized_trust = self._normalize_trust_level(
+            trust_level,
+            default=(
+                TRUST_LEVEL_REVIEWABLE
+                if normalized_source in EXTERNAL_WRITE_SOURCES
+                else TRUST_LEVEL_TRUSTED
+            ),
+        )
+        normalized_memory_scope = self._normalize_memory_scope(memory_scope)
+        self._enforce_memory_write_policy(
+            target_layer="short_term",
+            write_source=normalized_source,
+            trust_level=normalized_trust,
+            memory_scope=normalized_memory_scope,
+        )
         auto_distilled_sessions = (
             self._auto_distill_rollover_sessions(
                 user_id=user_id,
@@ -1078,15 +1623,26 @@ class MemoryService:
             if allow_session_rollover
             else False
         )
-        item = {
-            "id": f"msg-{uuid4().hex[:12]}",
-            "user_id": user_id,
-            "session_id": session_id,
-            "role": role,
-            "content": content.strip(),
-            "detected_lang": detected_lang,
-            "created_at": self._to_iso(now),
-        }
+        item = self._apply_governance_defaults(
+            {
+                "id": f"msg-{uuid4().hex[:12]}",
+                "user_id": user_id,
+                "session_id": session_id,
+                "role": role,
+                "content": content.strip(),
+                "detected_lang": detected_lang,
+                "created_at": self._to_iso(now),
+            },
+            scope=normalized_scope,
+            memory_scope=normalized_memory_scope,
+            memory_layer_kind=MEMORY_LAYER_CONVERSATION,
+            write_source=normalized_source,
+            trust_level=normalized_trust,
+        )
+        retention_policy, local_only_reasons = self._retention_policy_for_content(item["content"])
+        item["retention_policy"] = retention_policy
+        item["local_only_reasons"] = local_only_reasons
+        item["local_only_filtered_count"] = 0
         self._append_raw_message(item)
 
         client = self._get_redis_client()
@@ -1128,13 +1684,45 @@ class MemoryService:
         user_id: str,
         trigger: str = "daily",
         session_id: str | None = None,
+        *,
+        scope: dict | None = None,
+        write_source: str = WRITE_SOURCE_BRAIN_INTERNAL,
+        trust_level: str | None = None,
+        memory_scope: str = MEMORY_SCOPE_TENANT,
     ) -> dict:
-        short_bucket = self._get_short_term_bucket(user_id)
+        normalized_scope = self._normalize_scope(scope)
+        caller_source = self._normalize_write_source(write_source)
+        stored_trust = self._normalize_trust_level(trust_level, default=TRUST_LEVEL_TRUSTED)
+        normalized_memory_scope = self._normalize_memory_scope(memory_scope)
+        self._enforce_memory_write_policy(
+            target_layer="mid_term",
+            write_source=caller_source,
+            trust_level=stored_trust,
+            memory_scope=normalized_memory_scope,
+        )
+        self._enforce_memory_write_policy(
+            target_layer="long_term",
+            write_source=caller_source,
+            trust_level=stored_trust,
+            memory_scope=normalized_memory_scope,
+        )
+        short_bucket = self._filter_memory_items(
+            self._get_short_term_bucket(user_id),
+            scope=normalized_scope,
+            include_inactive=False,
+            include_untrusted=True,
+        )
         if session_id:
             source_items = [item for item in short_bucket if item["session_id"] == session_id]
             raw_session_items = self._load_raw_session_messages(
                 user_id=user_id,
                 session_id=session_id,
+            )
+            raw_session_items = self._filter_memory_items(
+                raw_session_items,
+                scope=normalized_scope,
+                include_inactive=False,
+                include_untrusted=True,
             )
             if len(raw_session_items) > len(source_items):
                 source_items = raw_session_items
@@ -1151,8 +1739,39 @@ class MemoryService:
                 "short_term_remaining": len(short_bucket),
             }
 
-        texts = [item["content"] for item in source_items]
-        highlights = self._extract_structured_highlights(source_items)
+        governed_source_items, distill_audit = self._govern_source_items_for_distillation(source_items)
+        effective_session = session_id or source_items[-1]["session_id"]
+        if not governed_source_items:
+            if session_id:
+                remaining_items = [
+                    item for item in short_bucket if item["session_id"] != session_id
+                ]
+            else:
+                remaining_items = []
+
+            updated_at = self._to_iso(self._now())
+            for state in self._build_session_state_updates(
+                user_id=user_id,
+                source_items=source_items,
+                updated_at=updated_at,
+            ):
+                self._set_memory_session_state(state)
+
+            if not self._write_redis_short_term(user_id, remaining_items):
+                self._short_term[user_id] = remaining_items
+
+            return {
+                "ok": True,
+                "message": "All source items were retained as local-only and excluded from distillation",
+                "created": False,
+                "mid_term": None,
+                "long_term": None,
+                "long_term_items": [],
+                "short_term_remaining": len(remaining_items),
+                "distill_audit": distill_audit,
+            }
+        texts = [item["content"] for item in governed_source_items]
+        highlights = self._extract_structured_highlights(governed_source_items)
         preferences = highlights["preferences"]
         decisions = highlights["decisions"]
         task_results = highlights["task_results"]
@@ -1160,10 +1779,9 @@ class MemoryService:
         keywords = self._extract_keywords(texts + preferences + decisions + task_results)
         entities = self._extract_entities(texts + preferences + decisions + task_results)
         now = self._to_iso(self._now())
-        effective_session = session_id or source_items[-1]["session_id"]
         summary_text = self._build_hierarchical_summary(
             session_id=effective_session,
-            source_count=len(source_items),
+            source_count=len(governed_source_items),
             entities=entities,
             keywords=keywords,
             highlights={
@@ -1174,21 +1792,34 @@ class MemoryService:
             },
         )
 
-        mid_term = {
-            "id": f"mid-{uuid4().hex[:12]}",
-            "user_id": user_id,
-            "session_id": effective_session,
-            "trigger": trigger,
-            "source_count": len(source_items),
-            "summary": summary_text,
-            "entities": entities,
-            "events": events,
-            "keywords": keywords,
-            "preferences": preferences,
-            "decisions": decisions,
-            "task_results": task_results,
-            "created_at": now,
-        }
+        mid_term = self._apply_governance_defaults(
+            {
+                "id": f"mid-{uuid4().hex[:12]}",
+                "user_id": user_id,
+                "session_id": effective_session,
+                "trigger": trigger,
+                "source_count": len(governed_source_items),
+                "summary": summary_text,
+                "entities": entities,
+                "events": events,
+                "keywords": keywords,
+                "preferences": preferences,
+                "decisions": decisions,
+                "task_results": task_results,
+                "created_at": now,
+                "retention_policy": RETENTION_POLICY_DISTILLABLE,
+                "local_only_reasons": list(distill_audit.get("local_only_reasons") or []),
+                "local_only_filtered_count": int(distill_audit.get("local_only_filtered_count") or 0),
+            },
+            scope=normalized_scope,
+            memory_scope=normalized_memory_scope,
+            memory_layer_kind=MEMORY_LAYER_WORKING,
+            write_source=WRITE_SOURCE_DISTILLATION,
+            trust_level=stored_trust,
+        )
+        mid_term["retention_policy"] = RETENTION_POLICY_DISTILLABLE
+        mid_term["local_only_reasons"] = list(distill_audit.get("local_only_reasons") or [])
+        mid_term["local_only_filtered_count"] = int(distill_audit.get("local_only_filtered_count") or 0)
         self._mid_term.setdefault(user_id, []).append(mid_term)
         if self._mid_term_store is not None:
             self._mid_term_store.save_summary(mid_term)
@@ -1206,7 +1837,14 @@ class MemoryService:
                 "events": events,
             },
             created_at=now,
+            scope=normalized_scope,
+            memory_scope=normalized_memory_scope,
+            trust_level=stored_trust,
         )
+        for item in long_term_items:
+            item["retention_policy"] = RETENTION_POLICY_DISTILLABLE
+            item["local_only_reasons"] = list(distill_audit.get("local_only_reasons") or [])
+            item["local_only_filtered_count"] = int(distill_audit.get("local_only_filtered_count") or 0)
         long_term = long_term_items[0]
         long_bucket = self._long_term.setdefault(user_id, [])
         long_bucket.extend(long_term_items)
@@ -1249,6 +1887,7 @@ class MemoryService:
             "long_term": long_term,
             "long_term_items": long_term_items,
             "short_term_remaining": len(remaining_items),
+            "distill_audit": distill_audit,
         }
 
     def _query_phrases(self, query: str, query_tokens: list[str]) -> list[str]:
@@ -1460,14 +2099,35 @@ class MemoryService:
             deduped.append(candidate)
         return deduped
 
-    def retrieve(self, user_id: str, query: str, limit: int = DEFAULT_RETRIEVE_LIMIT) -> dict:
+    def retrieve(
+        self,
+        user_id: str,
+        query: str,
+        limit: int = DEFAULT_RETRIEVE_LIMIT,
+        *,
+        scope: dict | None = None,
+        include_untrusted: bool = False,
+        memory_scope: str | None = None,
+    ) -> dict:
         token_weights, query_phrases, expanded_terms = self._query_token_weights(query)
         if not token_weights:
-            return {"items": [], "total": 0}
+            return {
+                "items": [],
+                "total": 0,
+                "query_expanded_terms": [],
+                "scope_breakdown": {"tenant": 0, "global": 0, "total": 0},
+            }
 
+        normalized_scope = self._normalize_scope(scope)
         retrieve_cap = self._retrieve_cap(limit)
         candidate_pool_limit = max(retrieve_cap * 2, retrieve_cap + 4)
-        local_entries = self._load_long_term_bucket(user_id)
+        local_entries = self._filter_memory_items(
+            self._load_long_term_bucket(user_id),
+            scope=normalized_scope,
+            memory_scope=memory_scope,
+            include_inactive=False,
+            include_untrusted=include_untrusted,
+        )
         local_by_id = {
             str(entry.get("id") or "").strip(): entry
             for entry in local_entries
@@ -1489,21 +2149,43 @@ class MemoryService:
                 "summary": entry.get("summary"),
                 "keywords": list(entry.get("keywords") or []),
                 "created_at": str(entry.get("created_at") or ""),
+                "tenant_id": str(entry.get("tenant_id") or normalized_scope["tenant_id"]),
+                "project_id": str(entry.get("project_id") or normalized_scope["project_id"]),
+                "environment": str(entry.get("environment") or normalized_scope["environment"]),
+                "memory_scope": str(entry.get("memory_scope") or MEMORY_SCOPE_TENANT),
+                "memory_layer_kind": str(
+                    entry.get("memory_layer_kind") or MEMORY_LAYER_CONVERSATION
+                ),
+                "write_source": str(entry.get("write_source") or WRITE_SOURCE_DISTILLATION),
+                "trust_level": str(entry.get("trust_level") or TRUST_LEVEL_TRUSTED),
+                "retention_policy": str(entry.get("retention_policy") or RETENTION_POLICY_DISTILLABLE),
+                "local_only_reasons": list(entry.get("local_only_reasons") or []),
+                "local_only_filtered_count": int(entry.get("local_only_filtered_count") or 0),
+                "memory_status": str(entry.get("memory_status") or MEMORY_STATUS_ACTIVE),
+                "review_status": str(entry.get("review_status") or REVIEW_STATUS_APPROVED),
                 "lexical_score": lexical_score,
                 "vector_score": None,
                 "phrase_hit_count": phrase_hit_count,
                 "matched_terms": matched_terms,
             }
 
-        chroma_items = (
-            self._long_term_store.query_memories(
-                user_id=user_id,
-                query=query,
-                limit=candidate_pool_limit,
-            )
-            if self._long_term_store is not None
-            else None
-        )
+        chroma_items = None
+        if self._long_term_store is not None:
+            query_memories = getattr(self._long_term_store, "query_memories", None)
+            if callable(query_memories):
+                try:
+                    chroma_items = query_memories(
+                        user_id=user_id,
+                        query=query,
+                        limit=candidate_pool_limit,
+                        filters={"memory_status": MEMORY_STATUS_ACTIVE},
+                    )
+                except TypeError:
+                    chroma_items = query_memories(
+                        user_id=user_id,
+                        query=query,
+                        limit=candidate_pool_limit,
+                    )
         if chroma_items is not None:
             for vector_item in chroma_items:
                 memory_id = str(vector_item.get("memory_id") or "").strip()
@@ -1520,6 +2202,28 @@ class MemoryService:
                         "summary": vector_item.get("summary"),
                         "keywords": list(vector_item.get("keywords") or []),
                         "created_at": str(vector_item.get("created_at") or ""),
+                        "tenant_id": str(vector_item.get("tenant_id") or normalized_scope["tenant_id"]),
+                        "project_id": str(vector_item.get("project_id") or normalized_scope["project_id"]),
+                        "environment": str(vector_item.get("environment") or normalized_scope["environment"]),
+                        "memory_scope": str(vector_item.get("memory_scope") or MEMORY_SCOPE_TENANT),
+                        "memory_layer_kind": str(
+                            vector_item.get("memory_layer_kind") or MEMORY_LAYER_CONVERSATION
+                        ),
+                        "write_source": str(
+                            vector_item.get("write_source") or WRITE_SOURCE_DISTILLATION
+                        ),
+                        "trust_level": str(vector_item.get("trust_level") or TRUST_LEVEL_TRUSTED),
+                        "retention_policy": str(
+                            vector_item.get("retention_policy") or RETENTION_POLICY_DISTILLABLE
+                        ),
+                        "local_only_reasons": list(vector_item.get("local_only_reasons") or []),
+                        "local_only_filtered_count": int(vector_item.get("local_only_filtered_count") or 0),
+                        "memory_status": str(
+                            vector_item.get("memory_status") or MEMORY_STATUS_ACTIVE
+                        ),
+                        "review_status": str(
+                            vector_item.get("review_status") or REVIEW_STATUS_APPROVED
+                        ),
                         "lexical_score": 0.0,
                         "vector_score": None,
                         "phrase_hit_count": 0,
@@ -1602,6 +2306,18 @@ class MemoryService:
         )
 
         for candidate in candidates.values():
+            if not self._memory_visible_in_scope(candidate, normalized_scope):
+                continue
+            if memory_scope is not None and (
+                str(candidate.get("memory_scope") or MEMORY_SCOPE_TENANT).strip().lower()
+                != self._normalize_memory_scope(memory_scope)
+            ):
+                continue
+            if not self._memory_active_for_retrieval(
+                candidate,
+                include_untrusted=include_untrusted,
+            ):
+                continue
             lexical_score = float(candidate.get("lexical_score") or 0.0)
             vector_score = self._safe_float(candidate.get("vector_score"))
             phrase_hit_count = int(candidate.get("phrase_hit_count") or 0)
@@ -1655,6 +2371,18 @@ class MemoryService:
                 "summary": candidate.get("summary"),
                 "keywords": candidate.get("keywords", []),
                 "created_at": candidate.get("created_at", ""),
+                "tenant_id": candidate.get("tenant_id", "default"),
+                "project_id": candidate.get("project_id", "default"),
+                "environment": candidate.get("environment", "development"),
+                "memory_scope": candidate.get("memory_scope", MEMORY_SCOPE_TENANT),
+                "memory_layer_kind": candidate.get("memory_layer_kind", MEMORY_LAYER_CONVERSATION),
+                "write_source": candidate.get("write_source", WRITE_SOURCE_DISTILLATION),
+                "trust_level": candidate.get("trust_level", TRUST_LEVEL_TRUSTED),
+                "retention_policy": candidate.get("retention_policy", RETENTION_POLICY_DISTILLABLE),
+                "local_only_reasons": candidate.get("local_only_reasons", []),
+                "local_only_filtered_count": int(candidate.get("local_only_filtered_count") or 0),
+                "memory_status": candidate.get("memory_status", MEMORY_STATUS_ACTIVE),
+                "review_status": candidate.get("review_status", REVIEW_STATUS_APPROVED),
                 "score": round(min(fused_score, 1.0), 4),
                 "lexical_score": round(lexical_score, 4),
                 "vector_score": round(vector_score, 4) if vector_score is not None else None,
@@ -1677,12 +2405,32 @@ class MemoryService:
             "items": reranked,
             "total": len(reranked),
             "query_expanded_terms": expanded_terms,
+            "scope_breakdown": self._scope_breakdown(reranked),
         }
 
-    def get_layers(self, user_id: str) -> dict:
-        short_term = self._get_short_term_bucket(user_id)
-        mid_term = self._load_mid_term_bucket(user_id)
-        long_term = self._load_long_term_bucket(user_id)
+    def get_layers(self, user_id: str, *, scope: dict | None = None, memory_scope: str | None = None) -> dict:
+        short_term = self._filter_memory_items(
+            self._get_short_term_bucket(user_id),
+            scope=scope,
+            memory_scope=memory_scope,
+            include_inactive=False,
+            include_untrusted=True,
+        )
+        mid_term = self._filter_memory_items(
+            self._load_mid_term_bucket(user_id),
+            scope=scope,
+            memory_scope=memory_scope,
+            include_inactive=False,
+            include_untrusted=True,
+        )
+        long_term = self._filter_memory_items(
+            self._load_long_term_bucket(user_id),
+            scope=scope,
+            memory_scope=memory_scope,
+            include_inactive=False,
+            include_untrusted=True,
+        )
+        all_items = [*short_term, *mid_term, *long_term]
         return {
             "user_id": user_id,
             "short_term": short_term,
@@ -1691,6 +2439,7 @@ class MemoryService:
             "short_term_count": len(short_term),
             "mid_term_count": len(mid_term),
             "long_term_count": len(long_term),
+            "scope_breakdown": self._scope_breakdown(all_items),
         }
 
     def list_messages(
@@ -1699,6 +2448,8 @@ class MemoryService:
         *,
         session_id: str | None = None,
         limit: int = SHORT_TERM_MAX_TURNS,
+        scope: dict | None = None,
+        memory_scope: str | None = None,
     ) -> dict:
         list_messages = getattr(self._raw_message_store, "list_conversation_messages", None)
         if list_messages is not None:
@@ -1712,14 +2463,28 @@ class MemoryService:
                 logger.warning("Raw conversation log list failed: %s", exc)
                 items = None
             if items is not None:
+                filtered_items = self._filter_memory_items(
+                    list(items),
+                    scope=scope,
+                    memory_scope=memory_scope,
+                    include_inactive=False,
+                    include_untrusted=True,
+                )
                 return {
                     "user_id": user_id,
                     "session_id": session_id,
-                    "items": list(items),
-                    "total": len(items),
+                    "items": filtered_items,
+                    "total": len(filtered_items),
+                    "scope_breakdown": self._scope_breakdown(filtered_items),
                 }
 
-        bucket = self._get_short_term_bucket(user_id)
+        bucket = self._filter_memory_items(
+            self._get_short_term_bucket(user_id),
+            scope=scope,
+            memory_scope=memory_scope,
+            include_inactive=False,
+            include_untrusted=True,
+        )
         if session_id is not None:
             bucket = [item for item in bucket if item.get("session_id") == session_id]
         items = bucket[-max(1, limit) :]
@@ -1728,6 +2493,172 @@ class MemoryService:
             "session_id": session_id,
             "items": items,
             "total": len(items),
+            "scope_breakdown": self._scope_breakdown(items),
+        }
+
+    def audit_memories(
+        self,
+        *,
+        user_id: str,
+        scope: dict | None = None,
+        include_inactive: bool = True,
+        memory_scope: str | None = None,
+    ) -> dict:
+        normalized_scope = self._normalize_scope(scope)
+        items: list[dict] = []
+        for layer_name, layer_items in (
+            ("short_term", self._get_short_term_bucket(user_id)),
+            ("mid_term", self._load_mid_term_bucket(user_id)),
+            ("long_term", self._load_long_term_bucket(user_id)),
+        ):
+            filtered = self._filter_memory_items(
+                layer_items,
+                scope=normalized_scope,
+                memory_scope=memory_scope,
+                include_inactive=include_inactive,
+                include_untrusted=True,
+            )
+            for item in filtered:
+                items.append(
+                    {
+                        "layer": layer_name,
+                        "id": str(item.get("id") or ""),
+                        "user_id": str(item.get("user_id") or user_id),
+                        "session_id": item.get("session_id"),
+                        "source_mid_term_id": item.get("source_mid_term_id"),
+                        "role": item.get("role"),
+                        "memory_type": item.get("memory_type"),
+                        "summary": item.get("summary"),
+                        "content": item.get("content") or item.get("memory_text"),
+                        "created_at": str(item.get("created_at") or ""),
+                        "tenant_id": str(item.get("tenant_id") or "default"),
+                        "project_id": str(item.get("project_id") or "default"),
+                        "environment": str(item.get("environment") or "development"),
+                        "memory_scope": str(item.get("memory_scope") or MEMORY_SCOPE_TENANT),
+                        "memory_layer_kind": str(
+                            item.get("memory_layer_kind") or MEMORY_LAYER_CONVERSATION
+                        ),
+                        "write_source": str(item.get("write_source") or WRITE_SOURCE_BRAIN_INTERNAL),
+                        "trust_level": str(item.get("trust_level") or TRUST_LEVEL_TRUSTED),
+                        "retention_policy": str(item.get("retention_policy") or RETENTION_POLICY_DISTILLABLE),
+                        "local_only_reasons": list(item.get("local_only_reasons") or []),
+                        "local_only_filtered_count": int(item.get("local_only_filtered_count") or 0),
+                        "memory_status": str(item.get("memory_status") or MEMORY_STATUS_ACTIVE),
+                        "review_status": str(item.get("review_status") or REVIEW_STATUS_APPROVED),
+                        "reviewed_by": item.get("reviewed_by"),
+                        "reviewed_at": item.get("reviewed_at"),
+                        "review_note": item.get("review_note"),
+                        "expires_at": item.get("expires_at"),
+                        "archived_at": item.get("archived_at"),
+                        "deleted_at": item.get("deleted_at"),
+                        "corrected_at": item.get("corrected_at"),
+                    }
+                )
+        items.sort(key=lambda item: (item.get("created_at", ""), item["id"]))
+        return {
+            "user_id": user_id,
+            "items": items,
+            "total": len(items),
+            "scope_breakdown": self._scope_breakdown(items),
+        }
+
+    def review_memory(
+        self,
+        *,
+        user_id: str,
+        memory_id: str,
+        action: str,
+        reviewed_by: str,
+        scope: dict | None = None,
+        note: str | None = None,
+        corrected_memory_text: str | None = None,
+        corrected_summary: str | None = None,
+    ) -> dict:
+        normalized_scope = self._normalize_scope(scope)
+        normalized_action = str(action or "").strip().lower()
+        authoritative = self._load_long_term_bucket(user_id)
+        long_bucket = self._long_term.setdefault(user_id, list(authoritative))
+        target_index = -1
+        target_item: dict | None = None
+        for index, item in enumerate(long_bucket):
+            if str(item.get("id") or "").strip() != str(memory_id or "").strip():
+                continue
+            if not self._memory_visible_in_scope(item, normalized_scope):
+                continue
+            target_index = index
+            target_item = deepcopy(item)
+            break
+        if target_item is None or target_index < 0:
+            raise HTTPException(status_code=404, detail="Memory not found")
+
+        now = self._to_iso(self._now())
+        target_item["reviewed_by"] = reviewed_by
+        target_item["reviewed_at"] = now
+        target_item["review_note"] = note
+        if normalized_action == "approve":
+            target_item["review_status"] = REVIEW_STATUS_APPROVED
+            target_item["trust_level"] = TRUST_LEVEL_TRUSTED
+            target_item["memory_status"] = MEMORY_STATUS_ACTIVE
+        elif normalized_action == "reject":
+            target_item["review_status"] = REVIEW_STATUS_REJECTED
+            target_item["trust_level"] = TRUST_LEVEL_UNTRUSTED
+            target_item["memory_status"] = MEMORY_STATUS_ARCHIVED
+            target_item["archived_at"] = now
+        elif normalized_action == "delete":
+            target_item["review_status"] = REVIEW_STATUS_REJECTED
+            target_item["memory_status"] = MEMORY_STATUS_DELETED
+            target_item["deleted_at"] = now
+        elif normalized_action == "correct":
+            if not corrected_memory_text and corrected_summary is None:
+                raise HTTPException(status_code=400, detail="Correct action requires corrected content")
+            target_item["review_status"] = REVIEW_STATUS_APPROVED
+            target_item["trust_level"] = TRUST_LEVEL_TRUSTED
+            target_item["memory_status"] = MEMORY_STATUS_ACTIVE
+            target_item["corrected_at"] = now
+            if corrected_memory_text:
+                target_item["memory_text"] = corrected_memory_text.strip()
+            if corrected_summary is not None:
+                target_item["summary"] = corrected_summary.strip()
+        else:
+            raise HTTPException(status_code=400, detail="Unsupported review action")
+
+        long_bucket[target_index] = target_item
+        if self._long_term_store is not None:
+            self._long_term_store.save_memory(target_item)
+        return {"ok": True, "message": f"Memory {normalized_action} completed", "item": target_item}
+
+    def apply_lifecycle(self, *, user_id: str, scope: dict | None = None) -> dict:
+        normalized_scope = self._normalize_scope(scope)
+        authoritative = self._load_long_term_bucket(user_id)
+        long_bucket = self._long_term.setdefault(user_id, list(authoritative))
+        archived_count = 0
+        now = self._now()
+        for index, item in enumerate(list(long_bucket)):
+            if not self._memory_visible_in_scope(item, normalized_scope):
+                continue
+            if str(item.get("memory_status") or MEMORY_STATUS_ACTIVE).strip().lower() != MEMORY_STATUS_ACTIVE:
+                continue
+            expires_at = str(item.get("expires_at") or "").strip()
+            if not expires_at:
+                continue
+            try:
+                expires_dt = self._from_iso(expires_at)
+            except ValueError:
+                continue
+            if expires_dt > now:
+                continue
+            updated = deepcopy(item)
+            updated["memory_status"] = MEMORY_STATUS_ARCHIVED
+            updated["archived_at"] = self._to_iso(now)
+            long_bucket[index] = updated
+            archived_count += 1
+            if self._long_term_store is not None:
+                self._long_term_store.save_memory(updated)
+        return {
+            "ok": True,
+            "archived_count": archived_count,
+            "deleted_count": 0,
+            "corrected_count": 0,
         }
 
     def clear(self) -> None:

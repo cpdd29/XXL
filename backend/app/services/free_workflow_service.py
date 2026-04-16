@@ -9,6 +9,8 @@ from typing import Any
 from urllib.parse import quote_plus
 from urllib.request import urlopen
 
+from app.execution_gateway import ExecutionRequest, SkillExecutionGateway
+from app.execution_gateway.skill_execution_gateway import skill_execution_gateway
 from app.services.mcp_runtime_service import MCPRuntimeService, mcp_runtime_service
 from app.services import task_service
 from app.services.skill_registry_service import SkillRegistryService, skill_registry_service
@@ -35,6 +37,12 @@ PDF_HINTS = {"pdf", "文档", "文件", "附件"}
 SUMMARY_HINTS = {"总结", "摘要", "要点", "summarize", "summary", "highlights"}
 SPEECH_HINTS = {"演讲", "发言稿", "演讲稿", "speech", "keynote"}
 WRITING_HINTS = {"写", "生成", "草稿", "文案", "稿子", "write", "draft", "copy"}
+WEATHER_LABELS = {
+    "sunny": "晴",
+    "cloudy": "多云",
+    "rainy": "下雨",
+    "windy": "有风",
+}
 RUNTIME_ELIGIBLE_SKILLS = {
     "web_search_skill",
     "pdf_read_skill",
@@ -91,6 +99,39 @@ def _normalize_lower(value: object) -> str:
 
 def _contains_any(text: str, hints: set[str]) -> bool:
     return any(hint in text for hint in hints)
+
+
+def _format_decimal(value: Any, *, suffix: str = "") -> str | None:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    if numeric.is_integer():
+        text = str(int(numeric))
+    else:
+        text = f"{numeric:.1f}".rstrip("0").rstrip(".")
+    return f"{text}{suffix}"
+
+
+def _normalize_weather_label(value: Any) -> str:
+    raw = _normalize_text(value)
+    if not raw:
+        return ""
+    return WEATHER_LABELS.get(raw.lower(), raw)
+
+
+def _forecast_day_label(offset: Any) -> str:
+    try:
+        numeric = int(offset)
+    except (TypeError, ValueError):
+        return ""
+    if numeric == 0:
+        return "今天"
+    if numeric == 1:
+        return "明天"
+    if numeric == 2:
+        return "后天"
+    return f"{numeric}天后"
 
 
 def _http_get_json(url: str, *, timeout_seconds: float) -> dict[str, Any] | None:
@@ -155,12 +196,14 @@ class FreeWorkflowService:
         registry: SkillRegistryService | None = None,
         runtime: SkillRuntimeService | None = None,
         mcp_runtime: MCPRuntimeService | None = None,
+        execution_gateway: SkillExecutionGateway | None = None,
     ) -> None:
         self._registry = registry or skill_registry_service
         self._runtime = runtime or (
             skill_runtime_service if self._registry is skill_registry_service else SkillRuntimeService(registry=self._registry)
         )
         self._mcp_runtime = mcp_runtime or mcp_runtime_service
+        self._execution_gateway = execution_gateway or skill_execution_gateway
         self._register_builtin_skills()
 
     def list_skills(
@@ -210,51 +253,67 @@ class FreeWorkflowService:
                 "policy_source": "strict_external_runtime",
             }
 
-        runtime_result: dict[str, Any] | None = None
         selected_result: dict[str, Any] | None = None
-        selected_path = "builtin"
-        fallback_reason = None
-        primary_runtime_result: dict[str, Any] | None = None
-        shadow_runtime_result: dict[str, Any] | None = None
         external_required_error: str | None = None
 
-        if skill_name in RUNTIME_ELIGIBLE_SKILLS and mcp_tool_id:
-            if policy["mode"] == "runtime_primary":
-                primary_runtime_result = self._mcp_runtime.invoke_tool(
-                    tool_id=mcp_tool_id,
-                    payload=merged_payload,
-                    trace_context={
-                        "workflow_mode": "free_workflow",
-                        "selected_skill": skill_name,
-                        "execution_mode": "runtime_primary",
-                    },
+        gateway_request = ExecutionRequest(
+            tool_id=mcp_tool_id or skill_name,
+            payload=merged_payload,
+            trace_context={
+                "workflow_mode": "free_workflow",
+                "selected_skill": skill_name,
+            },
+        )
+        gateway_outcome = self._execution_gateway.execute(
+            request=gateway_request,
+            mode=str(policy.get("mode") or "builtin_primary"),
+            runtime_executor=(
+                (
+                    lambda request: self._mcp_runtime.invoke_tool(
+                        tool_id=mcp_tool_id,
+                        payload=request.payload,
+                        trace_context={
+                            **request.trace_context,
+                            "execution_mode": "runtime_primary",
+                        },
+                    )
                 )
-                if primary_runtime_result.get("ok"):
-                    selected_path = "runtime"
-                else:
-                    fallback_reason = str((primary_runtime_result.get("error") or {}).get("message") or "")
-                    selected_path = "builtin_fallback"
-                    if strict_external:
-                        selected_path = "external_runtime_required"
-                        external_required_error = (
-                            f"external_runtime_required: runtime invoke failed for {skill_name} ({fallback_reason or 'unknown_error'})"
-                        )
+                if mcp_tool_id
+                else None
+            ),
+            builtin_executor=lambda request: self._runtime.execute(
+                skill_name,
+                payload=request.payload,
+                context=normalized_context,
+            ),
+            shadow_mode=bool(policy.get("shadow_mode")),
+            shadow_executor=(
+                (
+                    lambda request: self._mcp_runtime.invoke_shadow_tool(
+                        tool_id=mcp_tool_id,
+                        payload=request.payload,
+                        trace_context={
+                            **request.trace_context,
+                            "execution_mode": "shadow",
+                        },
+                    )
+                )
+                if mcp_tool_id
+                else None
+            ),
+            strict_runtime_required=strict_external and skill_name in RUNTIME_ELIGIBLE_SKILLS,
+        )
+        selected_path = gateway_outcome.selected_path
+        fallback_reason = gateway_outcome.fallback_reason
+        primary_runtime_result = gateway_outcome.runtime_result
+        shadow_runtime_result = gateway_outcome.shadow_result
+        builtin_result = gateway_outcome.builtin_result
 
-            if policy["shadow_mode"]:
-                shadow_runtime_result = self._mcp_runtime.invoke_shadow_tool(
-                    tool_id=mcp_tool_id,
-                    payload=merged_payload,
-                    trace_context={
-                        "workflow_mode": "free_workflow",
-                        "selected_skill": skill_name,
-                        "execution_mode": "shadow",
-                    },
-                )
-        elif strict_external and skill_name in RUNTIME_ELIGIBLE_SKILLS:
-            selected_path = "external_runtime_required"
-            fallback_reason = "runtime_tool_not_found"
+        if selected_path == "external_runtime_required":
             external_required_error = (
                 f"external_runtime_required: runtime tool not found for {skill_name}"
+                if fallback_reason == "runtime_tool_not_found"
+                else f"external_runtime_required: runtime invoke failed for {skill_name} ({fallback_reason or 'unknown_error'})"
             )
 
         if strict_external and skill_name in RUNTIME_ELIGIBLE_SKILLS and selected_path != "runtime":
@@ -283,21 +342,23 @@ class FreeWorkflowService:
             )
 
         if selected_path == "runtime" and primary_runtime_result:
+            runtime_payload = self._runtime_result_payload(
+                skill_name=skill_name,
+                runtime_result=primary_runtime_result.get("result"),
+                runtime_tool_id=mcp_tool_id,
+            )
             selected_result = {
                 "ok": True,
                 "trace_id": primary_runtime_result.get("trace_id"),
                 "duration_ms": primary_runtime_result.get("duration_ms"),
-                "result": {
-                    "summary": "Executed through MCP runtime.",
-                    "source": "mcp_runtime",
-                    "runtime_result": primary_runtime_result.get("result"),
-                    "runtime_tool_id": mcp_tool_id,
-                },
-                "result_summary": "Executed through MCP runtime",
+                "result": runtime_payload,
+                "result_summary": _normalize_text(
+                    runtime_payload.get("summary") or "Executed through MCP runtime"
+                ),
                 "error": None,
             }
         elif selected_result is None:
-            selected_result = runtime_result or {
+            selected_result = builtin_result or {
                 "ok": False,
                 "trace_id": None,
                 "duration_ms": None,
@@ -527,7 +588,13 @@ class FreeWorkflowService:
         summary_text = _normalize_text(summary or result_dict.get("summary") or "")
         if not summary_text:
             summary_text = f"{skill_name} executed"
+        result_bullets = [
+            str(item).strip()
+            for item in result_dict.get("bullets") or []
+            if str(item).strip()
+        ]
         bullets = [
+            *result_bullets,
             f"skill: {skill_name}",
             f"source: {_normalize_text(result_dict.get('source') or 'internal')}",
         ]
@@ -541,7 +608,13 @@ class FreeWorkflowService:
                 or summary_text
             ),
             "bullets": bullets,
-            "references": result_dict.get("results") if isinstance(result_dict.get("results"), list) else [],
+            "references": (
+                result_dict.get("references")
+                if isinstance(result_dict.get("references"), list)
+                else result_dict.get("results")
+                if isinstance(result_dict.get("results"), list)
+                else []
+            ),
             "execution_trace": [
                 {
                     "stage": "skill_runtime",
@@ -550,6 +623,153 @@ class FreeWorkflowService:
                     "detail": summary_text,
                 }
             ],
+        }
+
+    def _runtime_result_payload(
+        self,
+        *,
+        skill_name: str,
+        runtime_result: dict[str, Any] | None,
+        runtime_tool_id: str | None,
+    ) -> dict[str, Any]:
+        runtime_payload = runtime_result if isinstance(runtime_result, dict) else {}
+        bridge_output = runtime_payload.get("output")
+        if not isinstance(bridge_output, dict):
+            bridge_output = {}
+        result_value = bridge_output.get("result")
+        structured_result = result_value if isinstance(result_value, dict) else {}
+
+        if skill_name == "weather_skill" and structured_result:
+            weather_payload = self._weather_runtime_payload(
+                structured_result=structured_result,
+                runtime_payload=runtime_payload,
+                runtime_tool_id=runtime_tool_id,
+            )
+            if weather_payload is not None:
+                return weather_payload
+
+        summary_text = _normalize_text(
+            structured_result.get("summary")
+            or bridge_output.get("summary")
+            or runtime_payload.get("summary")
+            or ""
+        )
+        content_text = _normalize_text(
+            structured_result.get("content")
+            or structured_result.get("text")
+            or structured_result.get("speech")
+            or structured_result.get("message")
+            or summary_text
+        )
+        if not content_text and result_value is not None and not isinstance(result_value, dict):
+            content_text = _normalize_text(result_value)
+        if not content_text and structured_result:
+            try:
+                content_text = json.dumps(structured_result, ensure_ascii=False)
+            except TypeError:
+                content_text = _normalize_text(structured_result)
+        if not summary_text:
+            summary_text = content_text or "Executed through MCP runtime."
+
+        bullets_value = structured_result.get("bullets")
+        bullets = (
+            [str(item).strip() for item in bullets_value if str(item).strip()]
+            if isinstance(bullets_value, list)
+            else []
+        )
+        references_value = structured_result.get("references")
+        references = (
+            [item for item in references_value if isinstance(item, dict)]
+            if isinstance(references_value, list)
+            else []
+        )
+        title = _normalize_text(
+            structured_result.get("title")
+            or bridge_output.get("tool")
+            or skill_name
+        )
+        return {
+            "title": title or skill_name,
+            "summary": summary_text,
+            "content": content_text or summary_text,
+            "bullets": bullets,
+            "references": references,
+            "source": "mcp_runtime",
+            "runtime_result": runtime_payload,
+            "runtime_tool_id": runtime_tool_id,
+            "structured_data": structured_result or result_value,
+        }
+
+    def _weather_runtime_payload(
+        self,
+        *,
+        structured_result: dict[str, Any],
+        runtime_payload: dict[str, Any],
+        runtime_tool_id: str | None,
+    ) -> dict[str, Any] | None:
+        location = _normalize_text(
+            structured_result.get("location")
+            or structured_result.get("city")
+            or structured_result.get("query")
+            or ""
+        )
+        weather_label = _normalize_weather_label(
+            structured_result.get("weather_description") or structured_result.get("weather")
+        )
+        temperature = _format_decimal(structured_result.get("temperature_c"), suffix="°C")
+        wind_speed = _format_decimal(structured_result.get("wind_speed_kmh"), suffix=" km/h")
+
+        forecast_lines: list[str] = []
+        forecast_entries = structured_result.get("forecast")
+        if isinstance(forecast_entries, list):
+            for entry in forecast_entries[:3]:
+                if not isinstance(entry, dict):
+                    continue
+                day_label = _forecast_day_label(entry.get("day_offset"))
+                day_weather = _normalize_weather_label(entry.get("weather"))
+                day_temperature = _format_decimal(entry.get("temperature_c"), suffix="°C")
+                detail_parts = [piece for piece in (day_weather, day_temperature) if piece]
+                if not detail_parts:
+                    continue
+                detail = "，".join(detail_parts)
+                forecast_lines.append(f"{day_label}：{detail}" if day_label else detail)
+
+        if not any((location, weather_label, temperature, wind_speed, forecast_lines)):
+            return None
+
+        summary_parts = [piece for piece in (location, weather_label, temperature) if piece]
+        summary = "，".join(summary_parts)
+        if wind_speed:
+            summary = f"{summary}，风速{wind_speed}" if summary else f"风速{wind_speed}"
+        if not summary:
+            summary = "天气查询已完成"
+
+        content_lines: list[str] = []
+        if location and weather_label:
+            content_lines.append(f"{location}当前天气：{weather_label}")
+        elif weather_label:
+            content_lines.append(f"当前天气：{weather_label}")
+        elif location:
+            content_lines.append(f"查询城市：{location}")
+        if temperature:
+            content_lines.append(f"当前温度：{temperature}")
+        if wind_speed:
+            content_lines.append(f"风速：{wind_speed}")
+        if forecast_lines:
+            content_lines.append("未来天气：")
+            content_lines.extend(f"- {line}" for line in forecast_lines)
+
+        title = f"{location}天气" if location else "天气结果"
+        return {
+            "title": title,
+            "summary": summary,
+            "content": "\n".join(content_lines) or summary,
+            "bullets": forecast_lines,
+            "references": [],
+            "source": "mcp_runtime",
+            "runtime_result": runtime_payload,
+            "runtime_tool_id": runtime_tool_id,
+            "structured_data": structured_result,
         }
 
     def _register_builtin_skills(self) -> None:

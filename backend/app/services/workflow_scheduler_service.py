@@ -48,10 +48,11 @@ class WorkflowSchedulerService:
             run=claimed_run,
             claim_with_run=True,
         )
-        if queued:
-            self._cancel_timer(run_id)
-            return
 
+        # Keep a local timer even when the durable dispatch job is persisted.
+        # In single-process fallback mode this timer guarantees progress if the
+        # poller thread is not available; in normal multi-instance mode the
+        # timer exits harmlessly when another claimant has already consumed the job.
         timer = Timer(delay, self._advance_run, args=(run_id, step_delay))
         timer.daemon = True
 
@@ -153,7 +154,9 @@ class WorkflowSchedulerService:
             self.cancel(run_id)
             return
 
-        if workflow_dispatcher_service.dispatch_tick(run_id, step_delay=step_delay):
+        event_bus = getattr(workflow_dispatcher_service, "_event_bus", None)
+        event_bus_connected = bool(getattr(event_bus, "is_connected", lambda: False)())
+        if event_bus_connected and workflow_dispatcher_service.dispatch_tick(run_id, step_delay=step_delay):
             return
 
         workflow_dispatcher_service.process_tick(run_id, step_delay=step_delay)

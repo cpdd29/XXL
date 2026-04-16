@@ -1,0 +1,68 @@
+{
+  "ok": true,
+  "status": "passed",
+  "generated_at": "2026-04-15T19:44:20+00:00",
+  "checks": [
+    {
+      "key": "compat_shell_inventory_complete",
+      "ok": true,
+      "details": {
+        "existing": [
+          "app/services/master_bot_service.py",
+          "app/services/message_ingestion_service.py",
+          "app/services/workflow_execution_service.py"
+        ],
+        "missing": []
+      }
+    },
+    {
+      "key": "brain_core_no_compat_imports",
+      "ok": true,
+      "details": {
+        "violations": []
+      }
+    },
+    {
+      "key": "entrypoint_no_decision_residue",
+      "ok": true,
+      "details": {
+        "residue": []
+      }
+    },
+    {
+      "key": "execution_gateway_no_bypass_candidates",
+      "ok": true,
+      "details": {
+        "candidates": []
+      }
+    },
+    {
+      "key": "legacy_alias_frozen_baseline_not_growing",
+      "ok": true,
+      "details": {
+        "unexpected_growth": []
+      }
+    }
+  ],
+  "failed_steps": [],
+  "inventory": {
+    "existing": [
+      "app/services/master_bot_service.py",
+      "app/services/message_ingestion_service.py",
+      "app/services/workflow_execution_service.py"
+    ],
+    "missing": []
+  },
+  "legacy_aliases": {
+    "production_total": 9,
+    "compat_test_total": 16,
+    "production_grouped": {
+      "constant_alias": 4,
+      "wrapper_alias": 1,
+      "identifier_alias": 4
+    },
+    "compat_test_grouped": {
+      "test_wrapper": 16
+    }
+  }
+}

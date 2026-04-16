@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from typing import Any
 
 from app.adapters.registry import channel_adapter_registry
+from app.brain_core.coordinator.service import brain_coordinator_service
+from app.brain_core.orchestration.service import orchestration_service
+from app.brain_core.reception.service import reception_service
+from app.brain_core.task_view.service import task_view_service
 from app.config import get_settings
 from app.schemas.messages import UnifiedMessage, channel_display_name, webhook_auth_scope
-from app.services.language_service import detect_language
-from app.services.master_bot_service import dispatch_intent, master_bot_service, target_agent_name
 from app.services.agent_execution_worker_service import agent_execution_worker_service
+from app.services.language_service import detect_language
 from app.services.memory_service import memory_service
 from app.services.operational_log_service import append_realtime_event
 from app.services.persistence_service import persistence_service
@@ -16,10 +20,12 @@ from app.services.store import store
 from app.services.workflow_execution_service import (
     append_context_patch_to_run,
     complete_agent_execution_job,
-    create_direct_agent_run_for_task,
+    create_agent_dispatch_run_for_task,
     create_workflow_run_for_task,
     fail_workflow_run_due_agent_execution_error,
     mark_task_steps_authoritative,
+    sync_workflow_run_from_task,
+    tick_workflow_run,
 )
 
 ACTIVE_TASKS_BY_USER: dict[str, str] = {}
@@ -30,6 +36,14 @@ MEMORY_CONTEXT_LIMIT_MAX = 10
 DISPATCH_CONTEXT_MEMORY_LIMIT_MIN = 5
 DISPATCH_CONTEXT_MEMORY_LIMIT_MAX = 10
 DISPATCH_CONTEXT_TEXT_PREVIEW_LIMIT = 160
+MEMORY_INJECTION_TYPE_WHITELIST = {
+    "session_summary",
+    "preferences",
+    "decisions",
+    "task_result",
+    "event",
+}
+FACT_LAYER_STATE_MACHINE_VERSION = "brain_fact_layer_v1"
 PROFILE_ID_METADATA_KEYS = (
     "user_profile_id",
     "userProfileId",
@@ -50,93 +64,8 @@ PROFILE_NAME_METADATA_KEYS = (
 )
 PROFILE_EMAIL_METADATA_KEYS = ("email", "mail")
 ALLOWED_CONTROL_PLANE_ROLES = {"admin", "operator", "viewer"}
-CONTEXT_PATCH_CONTINUATION_MARKERS = (
-    "补充一下",
-    "补充",
-    "等等",
-    "等下",
-    "稍等",
-    "继续",
-    "接着",
-    "续上",
-    "刚才",
-    "前面",
-    "上面",
-    "在这个基础上",
-    "基于上面",
-    "顺着这个",
-    "along that",
-    "based on that",
-    "follow up",
-    "add context",
-)
-CONTEXT_PATCH_EDIT_MARKERS = (
-    "更正式",
-    "更口语",
-    "更简洁",
-    "更详细",
-    "更具体",
-    "改成",
-    "改为",
-    "强调",
-    "突出",
-    "补上",
-    "加上",
-    "增加",
-    "去掉",
-    "删掉",
-    "压缩",
-    "缩短",
-    "展开",
-    "细化",
-    "中文输出",
-    "英文输出",
-)
-CONTEXT_PATCH_NEW_TASK_MARKERS = (
-    "新任务",
-    "另一个任务",
-    "另外一个任务",
-    "换个任务",
-    "换一个任务",
-    "重新开一个",
-    "重新来一个",
-    "new task",
-    "another task",
-    "separate task",
-)
-CONTEXT_PATCH_NEW_REQUEST_MARKERS = (
-    "请帮我",
-    "帮我",
-    "帮忙",
-    "请搜索",
-    "请查",
-    "请写",
-    "写一封",
-    "写一份",
-    "写个",
-    "搜索",
-    "检索",
-    "查一下",
-    "查找",
-    "找一下",
-    "生成",
-    "总结",
-    "整理",
-    "翻译",
-    "search ",
-    "find ",
-    "lookup",
-    "write ",
-    "draft",
-    "summarize",
-    "translate",
-    "help me",
-)
-CONTEXT_PATCH_MAX_FOLLOW_UP_LENGTH = 80
 INTERACTION_MODES = {"chat", "task", "workflow_or_direct"}
 PROFESSIONAL_CONFIRM_TIMEOUT_SECONDS = 1800
-PROFESSIONAL_CONFIRM_MARKERS = ("确认", "开始", "同意", "继续", "执行", "ok", "yes", "confirm", "proceed")
-PROFESSIONAL_CANCEL_MARKERS = ("取消", "不用了", "停止", "驳回", "不执行", "cancel", "stop", "reject", "no")
 
 
 def _next_task_id() -> str:
@@ -193,6 +122,21 @@ def _find_cached_task(task_id: str) -> dict | None:
         if task["id"] == task_id:
             return task
     return None
+
+
+def _find_loaded_run(run_id: str | None) -> dict | None:
+    normalized_run_id = str(run_id or "").strip()
+    if not normalized_run_id:
+        return None
+    for run in store.workflow_runs:
+        if str(run.get("id") or "").strip() == normalized_run_id:
+            return run
+    database_run = persistence_service.get_workflow_run(normalized_run_id)
+    if database_run is None:
+        return None
+    payload = store.clone(database_run)
+    store.workflow_runs.insert(0, payload)
+    return payload
 
 
 def _sync_cached_task(task_payload: dict) -> dict:
@@ -709,40 +653,89 @@ def _sync_message_user_profile(
 
 
 def _memory_context_lines(memory_items: list[dict]) -> list[str]:
+    filtered_items, _ = _filter_memory_items_for_injection(memory_items)
     limit = _dynamic_memory_window(
-        memory_items=memory_items,
+        memory_items=filtered_items,
         min_limit=MEMORY_CONTEXT_LIMIT_MIN,
         max_limit=MEMORY_CONTEXT_LIMIT_MAX,
     )
     return [
         f"记忆注入: {str(item.get('memory_text') or '').strip()}"
-        for item in memory_items[:limit]
+        for item in filtered_items[:limit]
         if str(item.get("memory_text") or "").strip()
     ]
 
 
 def _memory_step_message(memory_items: list[dict]) -> str:
-    if not memory_items:
+    filtered_items, blocked_items = _filter_memory_items_for_injection(memory_items)
+    if not filtered_items:
         return "未命中长期记忆，按当前请求直接执行"
 
     previews = [
         _truncate_text(str(item.get("memory_text") or ""), 28)
-        for item in memory_items[:2]
+        for item in filtered_items[:2]
         if str(item.get("memory_text") or "").strip()
     ]
     if previews:
-        return f"已命中 {len(memory_items)} 条长期记忆：{'；'.join(previews)}"
-    return f"已命中 {len(memory_items)} 条长期记忆"
+        suffix = f"；拦截 {len(blocked_items)} 条非白名单记忆" if blocked_items else ""
+        return f"已注入 {len(filtered_items)} 条长期记忆：{'；'.join(previews)}{suffix}"
+    return f"已注入 {len(filtered_items)} 条长期记忆"
+
+
+def _filter_memory_items_for_injection(memory_items: list[dict]) -> tuple[list[dict], list[dict]]:
+    allowed: list[dict] = []
+    blocked: list[dict] = []
+    for item in memory_items:
+        memory_type = str(item.get("memory_type") or "session_summary").strip().lower()
+        if memory_type in MEMORY_INJECTION_TYPE_WHITELIST:
+            allowed.append(item)
+        else:
+            blocked.append(item)
+    return allowed, blocked
+
+
+def _memory_injection_summary(memory_items: list[dict]) -> dict[str, Any]:
+    allowed_items, blocked_items = _filter_memory_items_for_injection(memory_items)
+    source_counts: dict[str, int] = {}
+    for item in allowed_items:
+        memory_type = str(item.get("memory_type") or "session_summary").strip().lower() or "session_summary"
+        source_counts[memory_type] = source_counts.get(memory_type, 0) + 1
+    return {
+        "boundary": "long_term_read_only",
+        "whitelist_types": sorted(MEMORY_INJECTION_TYPE_WHITELIST),
+        "total_hits": len(memory_items),
+        "injected_hits": len(allowed_items),
+        "blocked_hits": len(blocked_items),
+        "source_counts": source_counts,
+        "sources": [
+            {
+                "memory_id": str(item.get("memory_id") or "").strip() or None,
+                "source_mid_term_id": str(item.get("source_mid_term_id") or "").strip() or None,
+                "memory_type": str(item.get("memory_type") or "").strip() or None,
+                "score": item.get("score"),
+                "summary": _truncate_text(str(item.get("summary") or item.get("memory_text") or ""), 80),
+            }
+            for item in allowed_items
+        ],
+        "blocked_sources": [
+            {
+                "memory_id": str(item.get("memory_id") or "").strip() or None,
+                "memory_type": str(item.get("memory_type") or "").strip() or None,
+            }
+            for item in blocked_items
+        ],
+    }
 
 
 def _dispatch_context_memory_items(memory_items: list[dict]) -> list[dict]:
+    filtered_items, _ = _filter_memory_items_for_injection(memory_items)
     limit = _dynamic_memory_window(
-        memory_items=memory_items,
+        memory_items=filtered_items,
         min_limit=DISPATCH_CONTEXT_MEMORY_LIMIT_MIN,
         max_limit=DISPATCH_CONTEXT_MEMORY_LIMIT_MAX,
     )
     items: list[dict] = []
-    for item in memory_items[:limit]:
+    for item in filtered_items[:limit]:
         items.append(
             {
                 "memory_id": str(item.get("memory_id") or "").strip() or None,
@@ -777,51 +770,6 @@ def _dynamic_memory_window(
     normalized_min = max(1, int(min_limit))
     normalized_max = max(normalized_min, int(max_limit))
     return min(len(memory_items), max(normalized_min, min(normalized_max, len(memory_items))))
-
-
-def _build_message_dispatch_context(
-    *,
-    message: UnifiedMessage,
-    entrypoint: str,
-    entrypoint_agent: str,
-    trace_id: str,
-    preferred_language: str | None,
-    memory_hits: int,
-    memory_items: list[dict],
-    route_decision: dict,
-    interaction_mode: str,
-) -> dict:
-    reception_mode = str(
-        route_decision.get("reception_mode") or route_decision.get("receptionMode") or ""
-    ).strip() or None
-    dispatch_context = {
-        "type": "message_dispatch",
-        "state": "queued",
-        "queued_at": store.now_string(),
-        "entrypoint": entrypoint,
-        "entrypoint_agent": entrypoint_agent,
-        "trace_id": trace_id,
-        "channel": message.channel.value,
-        "message_id": str(message.message_id),
-        "platform_user_id": str(message.platform_user_id),
-        "chat_id": str(message.chat_id),
-        "user_key": str(message.user_key or ""),
-        "session_id": str(message.session_id or ""),
-        "detected_lang": message.detected_lang,
-        "preferred_language": preferred_language,
-        "message_preview": _truncate_text(message.text, DISPATCH_CONTEXT_TEXT_PREVIEW_LIMIT),
-        "memory_hits": memory_hits,
-        "memory_items": _dispatch_context_memory_items(memory_items),
-        "interaction_mode": interaction_mode,
-        "interactionMode": interaction_mode,
-        "reception_mode": reception_mode,
-        "receptionMode": reception_mode,
-        "route_decision": store.clone(route_decision),
-    }
-    channel_delivery = _build_channel_delivery_binding(message)
-    if channel_delivery is not None:
-        dispatch_context["channel_delivery"] = channel_delivery
-    return dispatch_context
 
 
 def _build_channel_delivery_binding(message: UnifiedMessage) -> dict | None:
@@ -901,8 +849,84 @@ def _persist_execution_state(
     persistence_service.persist_runtime_state()
 
 
-def _normalize_message_text(text: str | None) -> str:
-    return " ".join(str(text or "").strip().lower().split())
+def _apply_orchestration_follow_up_plan(
+    follow_up_plan: Any,
+    *,
+    task: dict,
+    steps: list[dict] | None = None,
+    message_text: str | None = None,
+    trace_id: str | None = None,
+) -> str | None:
+    run_id = str(getattr(follow_up_plan, "run_id", "") or "").strip() or None
+    if bool(getattr(follow_up_plan, "should_sync_run_from_task", False)):
+        refreshed_run = sync_workflow_run_from_task(task)
+        return str((refreshed_run or {}).get("id") or run_id or "").strip() or None
+    if bool(getattr(follow_up_plan, "should_tick_run", False)):
+        if run_id is None:
+            _persist_execution_state(task=task, steps=steps)
+            return None
+        refreshed_run = tick_workflow_run(run_id)
+        return str(refreshed_run.get("id") or "").strip() or run_id
+    if bool(getattr(follow_up_plan, "should_append_patch_to_run", False)):
+        if run_id is not None and message_text is not None and trace_id is not None:
+            append_context_patch_to_run(run_id, message_text, trace_id)
+        return run_id
+    if bool(getattr(follow_up_plan, "should_persist_task_steps", False)) or (run_id is None and steps is not None):
+        _persist_execution_state(task=task, steps=steps)
+    return run_id
+
+
+def _launch_message_run(
+    *,
+    task: dict,
+    intent: str,
+    entrypoint: str,
+    memory_hits: int,
+    warnings: list[str],
+    dispatch_context: dict[str, Any],
+    launch_plan: Any,
+) -> dict:
+    if str(getattr(launch_plan, "mode", "")).strip() == "agent_dispatch":
+        run = create_agent_dispatch_run_for_task(
+            task=task,
+            intent=intent,
+            trigger=entrypoint,
+            memory_hits=memory_hits,
+            warnings=warnings,
+            dispatch_context=dispatch_context,
+        )
+        if bool(getattr(launch_plan, "should_queue_agent_execution", False)):
+            execution_agent_id = str(getattr(launch_plan, "execution_agent_id", "") or "").strip() or None
+            queued = agent_execution_worker_service.enqueue_execution(
+                run_id=str(run.get("id") or ""),
+                task_id=str(task.get("id") or ""),
+                workflow_id=str(run.get("workflow_id") or ""),
+                execution_agent_id=execution_agent_id,
+                step_delay=0.0,
+                published_at=store.now_string(),
+            )
+            if not queued:
+                try:
+                    run = complete_agent_execution_job(
+                        str(run.get("id") or ""),
+                        execution_agent_id=execution_agent_id,
+                    )
+                except Exception as exc:
+                    run = fail_workflow_run_due_agent_execution_error(
+                        str(run.get("id") or ""),
+                        failure_message=f"Agent dispatch 执行失败：{exc}",
+                    )
+        return run
+
+    return create_workflow_run_for_task(
+        task=task,
+        intent=intent,
+        trigger=entrypoint,
+        memory_hits=memory_hits,
+        warnings=warnings,
+        workflow_id=str(getattr(launch_plan, "workflow_id", "") or ""),
+        dispatch_context=dispatch_context,
+    )
 
 
 def _normalize_interaction_mode(value: object) -> str | None:
@@ -942,101 +966,97 @@ def _route_decision_bool(route_decision: dict | None, *keys: str) -> bool:
     return False
 
 
-def _route_decision_payload(route_decision: dict | None, *keys: str):
-    if not isinstance(route_decision, dict):
-        return None
-    for key in keys:
-        if key in route_decision:
-            return route_decision.get(key)
-    return None
-
-
 def _is_professional_confirmation_pending(task: dict) -> bool:
-    route_decision = task.get("route_decision") or task.get("routeDecision")
-    workflow_mode = _route_decision_field(route_decision, "workflow_mode", "workflowMode")
-    confirmation_required = _route_decision_bool(route_decision, "confirmation_required", "confirmationRequired")
-    confirmation_status = _route_decision_field(route_decision, "confirmation_status", "confirmationStatus")
-    return (
-        str(workflow_mode or "").strip().lower() == "professional_workflow"
-        and confirmation_required
-        and str(confirmation_status or "").strip().lower() == "pending"
-        and str(task.get("status") or "").strip().lower() == "pending"
-    )
+    return reception_service.is_professional_confirmation_pending(task)
 
 
 def _confirmation_action(message_text: str) -> str | None:
-    normalized = _normalize_message_text(message_text)
-    if not normalized:
+    return reception_service.confirmation_action(message_text)
+
+
+def _append_confirmation_step(task_id: str, *, title: str, message: str, status_value: str = "completed") -> None:
+    steps = _ensure_task_steps_loaded(task_id)
+    steps.append(
+        orchestration_service.build_confirmation_step(
+            task_id=task_id,
+            existing_step_count=len(steps),
+            title=title,
+            message=message,
+            status_value=status_value,
+            now_string=store.now_string,
+        )
+    )
+    AUTHORITATIVE_TASK_STEP_CACHE.add(task_id)
+    mark_task_steps_authoritative(task_id)
+
+
+def _handle_professional_confirmation_reply(
+    message: UnifiedMessage,
+    *,
+    received_at: datetime,
+    security_result: dict[str, object],
+) -> dict | None:
+    active_task = _resolve_active_task_for_user(message.user_key)
+    if active_task is None:
         return None
-    if any(marker in normalized for marker in PROFESSIONAL_CONFIRM_MARKERS):
-        return "confirm"
-    if any(marker in normalized for marker in PROFESSIONAL_CANCEL_MARKERS):
-        return "cancel"
-    return None
+
+    task_id, _ = active_task
+    task = _find_task(task_id)
+    if task is None or not _is_professional_confirmation_pending(task):
+        return None
+
+    action = _confirmation_action(message.text)
+    if action is None:
+        return None
+    transition = reception_service.build_confirmation_transition(
+        task=task,
+        action=action,
+        now_string=store.now_string,
+    )
+
+    run = _find_loaded_run(task.get("workflow_run_id"))
+    orchestration_service.apply_confirmation_transition(
+        task=task,
+        run=run,
+        action=action,
+        transition=transition,
+        now_string=store.now_string,
+    )
+
+    _append_confirmation_step(
+        task_id,
+        title=transition.step_title,
+        message=transition.step_message,
+        status_value=transition.step_status,
+    )
+    follow_up_plan = orchestration_service.build_confirmation_follow_up_plan(
+        task=task,
+        action=action,
+    )
+    response_run_id = _apply_orchestration_follow_up_plan(
+        follow_up_plan,
+        task=task,
+        steps=_ensure_task_steps_loaded(task_id),
+    )
+
+    LAST_MESSAGE_AT_BY_USER[message.user_key] = received_at
+    return task_view_service.build_task_event_response(
+        result_message=transition.response_message,
+        entrypoint="master_bot.confirmation",
+        task=task,
+        unified_message=message.model_dump(),
+        run_id=response_run_id,
+        intent=_task_route_intent(task),
+        trace_id=str(security_result["trace_id"]),
+        detected_lang=message.detected_lang,
+        memory_hits=0,
+        warnings=list(security_result["warnings"]),
+        merged_into_task_id=task_id,
+    )
 
 
 def _task_route_intent(task: dict | None) -> str | None:
-    if not isinstance(task, dict):
-        return None
-
-    route_decision = task.get("route_decision") or task.get("routeDecision")
-    if isinstance(route_decision, dict):
-        intent = str(route_decision.get("intent") or "").strip().lower()
-        if intent in {"search", "write", "help"}:
-            return intent
-
-    inferred_intent = dispatch_intent(
-        "\n".join(
-            part
-            for part in (
-                str(task.get("title") or "").strip(),
-                str(task.get("description") or "").strip(),
-            )
-            if part
-        )
-    )
-    if inferred_intent in {"search", "write", "help"}:
-        return inferred_intent
-    return None
-
-
-def _message_has_marker(message_text: str, markers: tuple[str, ...]) -> bool:
-    return any(marker in message_text for marker in markers)
-
-
-def _looks_like_follow_up_instruction(message_text: str) -> bool:
-    if len(message_text) > CONTEXT_PATCH_MAX_FOLLOW_UP_LENGTH:
-        return False
-    return _message_has_marker(message_text, CONTEXT_PATCH_EDIT_MARKERS)
-
-
-def _looks_like_new_request(message_text: str) -> bool:
-    return _message_has_marker(message_text, CONTEXT_PATCH_NEW_REQUEST_MARKERS)
-
-
-def _should_merge_into_active_task(task: dict, message_text: str) -> bool:
-    normalized_message = _normalize_message_text(message_text)
-    if not normalized_message:
-        return False
-
-    if _message_has_marker(normalized_message, CONTEXT_PATCH_NEW_TASK_MARKERS):
-        return False
-
-    if _message_has_marker(normalized_message, CONTEXT_PATCH_CONTINUATION_MARKERS):
-        return True
-
-    if _looks_like_follow_up_instruction(normalized_message):
-        return True
-
-    active_intent = _task_route_intent(task)
-    incoming_intent = dispatch_intent(normalized_message)
-    if active_intent and incoming_intent != active_intent and _looks_like_new_request(normalized_message):
-        return False
-
-    if _looks_like_new_request(normalized_message):
-        return False
-
-    return False
+    return reception_service.infer_task_intent(task)
 
 
 def _should_context_patch(user_key: str, received_at: datetime, message_text: str) -> str | None:
@@ -1047,57 +1067,30 @@ def _should_context_patch(user_key: str, received_at: datetime, message_text: st
     task_id, last_message_at = active_task
 
     task = _find_task(task_id)
-    if task is None or task["status"] not in {"pending", "running"}:
-        return None
-
-    if (received_at - last_message_at).total_seconds() > settings.message_debounce_seconds:
-        return None
-
-    if not _should_merge_into_active_task(task, message_text):
+    if not reception_service.should_context_patch(
+        active_task=task,
+        last_message_at=last_message_at,
+        received_at=received_at,
+        message_text=message_text,
+        message_debounce_seconds=settings.message_debounce_seconds,
+    ):
         return None
     return task_id
 
 
 def _resolve_active_task_for_user(user_key: str) -> tuple[str, datetime] | None:
-    normalized_user_key = str(user_key or "").strip()
-    if not normalized_user_key:
-        return None
-
-    task_id = ACTIVE_TASKS_BY_USER.get(normalized_user_key)
-    last_message_at = LAST_MESSAGE_AT_BY_USER.get(normalized_user_key)
-    if task_id and last_message_at:
-        task = _find_task(task_id)
-        if task is not None and task["status"] in {"pending", "running"}:
-            latest_message_at = _latest_message_at_for_task(task)
-            if latest_message_at > last_message_at:
-                last_message_at = latest_message_at
-                LAST_MESSAGE_AT_BY_USER[normalized_user_key] = latest_message_at
-            ACTIVE_TASKS_BY_USER[normalized_user_key] = task_id
-            return task_id, last_message_at
-
-    ACTIVE_TASKS_BY_USER.pop(normalized_user_key, None)
-    LAST_MESSAGE_AT_BY_USER.pop(normalized_user_key, None)
-
     find_latest_active_task = getattr(persistence_service, "find_latest_active_task_for_user", None)
-    if not callable(find_latest_active_task):
+    active_task = reception_service.resolve_active_task_reference(
+        user_key=user_key,
+        active_tasks_by_user=ACTIVE_TASKS_BY_USER,
+        last_message_at_by_user=LAST_MESSAGE_AT_BY_USER,
+        find_task=_find_task,
+        latest_message_at_for_task=_latest_message_at_for_task,
+        find_latest_active_task_for_user=find_latest_active_task if callable(find_latest_active_task) else None,
+    )
+    if active_task is None:
         return None
-
-    latest_task = find_latest_active_task(normalized_user_key)
-    if latest_task is None:
-        return None
-
-    latest_task_id = str(latest_task.get("id") or "").strip()
-    if not latest_task_id:
-        return None
-
-    task = _find_task(latest_task_id)
-    if task is None or task["status"] not in {"pending", "running"}:
-        return None
-
-    latest_message_at = _latest_message_at_for_task(task)
-    ACTIVE_TASKS_BY_USER[normalized_user_key] = latest_task_id
-    LAST_MESSAGE_AT_BY_USER[normalized_user_key] = latest_message_at
-    return latest_task_id, latest_message_at
+    return active_task.task_id, active_task.last_message_at
 
 
 def _append_context_patch(task_id: str, message: UnifiedMessage, trace_id: str) -> None:
@@ -1106,27 +1099,38 @@ def _append_context_patch(task_id: str, message: UnifiedMessage, trace_id: str) 
         return
 
     _refresh_task_steps_from_database(task_id)
-    task["description"] = f"{task['description']}\n补充上下文: {message.text}"
-    task["updated_at"] = store.now_string()
-    task["tokens"] = task.get("tokens", 0) + max(12, len(message.text) // 2)
+    plan = reception_service.build_context_patch_plan(
+        task=task,
+        message_text=message.text,
+        trace_id=trace_id,
+        channel=message.channel.value,
+        user_key=message.user_key,
+        preview_limit=DISPATCH_CONTEXT_TEXT_PREVIEW_LIMIT,
+        truncate_text=_truncate_text,
+        state_machine_version=FACT_LAYER_STATE_MACHINE_VERSION,
+        now_string=store.now_string,
+    )
+    applied_patch = orchestration_service.apply_context_patch_plan(
+        task=task,
+        plan=plan,
+    )
 
     steps = _ensure_task_steps_loaded(task_id)
     steps.append(
-        {
-            "id": f"{task_id}-ctx-{len(steps) + 1}",
-            "title": "上下文追加",
-            "status": "completed",
-            "agent": "Dispatcher Agent",
-            "started_at": store.now_string(),
-            "finished_at": store.now_string(),
-            "message": f"收到用户补充消息，已注入当前任务上下文 (trace={trace_id})",
-            "tokens": 0,
-        }
+        orchestration_service.build_context_patch_step(
+            task_id=task_id,
+            existing_step_count=len(steps),
+            step_entry=applied_patch["step_entry"],
+        )
     )
-    if task.get("workflow_run_id"):
-        append_context_patch_to_run(task["workflow_run_id"], message.text, trace_id)
-    else:
-        _persist_execution_state(task=task, steps=steps)
+    follow_up_plan = orchestration_service.build_context_patch_follow_up_plan(task=task)
+    workflow_run_id = _apply_orchestration_follow_up_plan(
+        follow_up_plan,
+        task=task,
+        steps=steps,
+        message_text=message.text,
+        trace_id=trace_id,
+    )
     append_realtime_event(
         agent="Dispatcher Agent",
         message=f"任务 {task_id} 已吸收追加上下文",
@@ -1134,82 +1138,9 @@ def _append_context_patch(task_id: str, message: UnifiedMessage, trace_id: str) 
         source="message_ingestion",
         trace_id=trace_id,
         task_id=task_id,
-        workflow_run_id=str(task.get("workflow_run_id") or "").strip() or None,
-        metadata={"event": "context_patch_absorbed", "user_key": message.user_key},
+        workflow_run_id=workflow_run_id,
+        metadata=applied_patch["realtime_metadata"],
     )
-
-
-def _create_task_steps(
-    *,
-    task_id: str,
-    entrypoint_agent: str,
-    memory_items: list[dict],
-    trace_id: str,
-    warnings: list[str],
-    route_message: str,
-    execution_agent_name: str,
-    direct_agent_dispatch: bool = False,
-) -> list[dict]:
-    warning_suffix = f"，附带处理: {', '.join(warnings)}" if warnings else ""
-    final_step_title = "执行节点" if direct_agent_dispatch else "等待调度"
-    final_step_agent = execution_agent_name if direct_agent_dispatch else "Workflow Dispatcher"
-    final_step_message = (
-        f"已直达 {execution_agent_name}，等待 Agent Worker 执行"
-        if direct_agent_dispatch
-        else f"已生成 dispatch context，等待派发到 {execution_agent_name}"
-    )
-    return [
-        {
-            "id": f"{task_id}-1",
-            "title": "接入层标准化",
-            "status": "completed",
-            "agent": entrypoint_agent,
-            "started_at": store.now_string(),
-            "finished_at": store.now_string(),
-            "message": f"渠道负载已标准化为 UnifiedMessage (trace={trace_id})",
-            "tokens": 0,
-        },
-        {
-            "id": f"{task_id}-2",
-            "title": "安全网关",
-            "status": "completed",
-            "agent": "安全网关",
-            "started_at": store.now_string(),
-            "finished_at": store.now_string(),
-            "message": f"消息已通过五层安全检查{warning_suffix}",
-            "tokens": 0,
-        },
-        {
-            "id": f"{task_id}-3",
-            "title": "长期记忆检索",
-            "status": "completed",
-            "agent": "Memory Service",
-            "started_at": store.now_string(),
-            "finished_at": store.now_string(),
-            "message": _memory_step_message(memory_items),
-            "tokens": 0,
-        },
-        {
-            "id": f"{task_id}-4",
-            "title": "Master Bot 路由",
-            "status": "completed",
-            "agent": "Dispatcher Agent",
-            "started_at": store.now_string(),
-            "finished_at": store.now_string(),
-            "message": route_message,
-            "tokens": 0,
-        },
-        {
-            "id": f"{task_id}-5",
-            "title": final_step_title,
-            "status": "running",
-            "agent": final_step_agent,
-            "started_at": store.now_string(),
-            "finished_at": None,
-            "message": final_step_message,
-            "tokens": 0,
-        },
-    ]
 
 
 def ingest_unified_message(
@@ -1262,51 +1193,66 @@ def ingest_unified_message(
             security_result["warnings"].append("Short-term memory distilled into mid/long-term layers")
 
     received_at = _parse_datetime(message.received_at)
+    confirmation_result = _handle_professional_confirmation_reply(
+        message,
+        received_at=received_at,
+        security_result=security_result,
+    )
+    if confirmation_result is not None:
+        return confirmation_result
     context_patch_task_id = _should_context_patch(message.user_key, received_at, message.text)
     if context_patch_task_id:
         _append_context_patch(context_patch_task_id, message, str(security_result["trace_id"]))
         LAST_MESSAGE_AT_BY_USER[message.user_key] = received_at
-        return {
-            "ok": True,
-            "message": "Message merged into active task context",
-            "entrypoint": "master_bot.context_patch",
-            "task_id": context_patch_task_id,
-            "intent": dispatch_intent(message.text),
-            "unified_message": message.model_dump(),
-            "trace_id": security_result["trace_id"],
-            "detected_lang": message.detected_lang,
-            "memory_hits": memory_matches["total"],
-            "warnings": security_result["warnings"],
-            "merged_into_task_id": context_patch_task_id,
-            "interaction_mode": "chat",
-            "reception_mode": "continuation",
-            "route_decision": None,
-        }
+        context_patch_task = _find_task(context_patch_task_id)
+        return task_view_service.build_context_patch_response(
+            result_message="Message merged into active task context",
+            entrypoint="master_bot.context_patch",
+            task=context_patch_task,
+            task_id=context_patch_task_id,
+            intent=reception_service.infer_message_intent(message.text),
+            unified_message=message.model_dump(),
+            trace_id=str(security_result["trace_id"]),
+            detected_lang=message.detected_lang,
+            memory_hits=memory_matches["total"],
+            warnings=list(security_result["warnings"]),
+            interaction_mode="chat",
+            reception_mode="continuation",
+        )
 
-    route_result = master_bot_service.route_message(
-        text=message.text,
-        channel=message.channel.value,
-        detected_lang=message.detected_lang,
+    dispatch_plan = brain_coordinator_service.build_dispatch_plan(
+        {
+            "text": message.text,
+            "language": message.detected_lang,
+            "channel": message.channel.value,
+            "user_id": message.user_key,
+            "session_id": message.session_id,
+            "metadata": message.metadata,
+        }
     )
-    intent = str(route_result["intent"])
-    workflow = route_result["workflow"]
-    route_message = str(route_result["route_message"])
-    route_decision = route_result["route_decision"]
-    interaction_mode = _resolve_interaction_mode(route_decision)
-    route_decision["interaction_mode"] = interaction_mode
-    route_decision["interactionMode"] = interaction_mode
-    reception_mode = str(
-        route_decision.get("reception_mode") or route_decision.get("receptionMode") or ""
-    ).strip() or None
-    direct_agent_dispatch = workflow is None
+    intent = dispatch_plan.intent
+    workflow = dispatch_plan.workflow
+    route_message = dispatch_plan.route_message
+    route_decision = dispatch_plan.route_decision
+    interaction_mode = dispatch_plan.interaction_mode
+    reception_mode = dispatch_plan.reception_mode
+    agent_dispatch = dispatch_plan.agent_dispatch
+    metadata = orchestration_service.prepare_message_dispatch_metadata(
+        route_decision=route_decision,
+        manager_packet=dispatch_plan.manager_packet,
+        brain_dispatch_summary=dispatch_plan.brain_dispatch_summary,
+        interaction_mode=interaction_mode,
+        approval_required=_route_decision_bool(route_decision, "approval_required", "approvalRequired"),
+        confirmation_status=_route_decision_field(route_decision, "confirmation_status", "confirmationStatus"),
+        confirmation_required=_route_decision_bool(route_decision, "confirmation_required", "confirmationRequired"),
+        clone=store.clone,
+    )
     task_id = _next_task_id()
     memory_items = memory_matches["items"]
-    execution_agent_name = str(
-        route_decision.get("execution_agent")
-        or route_decision.get("executionAgent")
-        or target_agent_name(intent)
-    ).strip() or target_agent_name(intent)
-    dispatch_context = _build_message_dispatch_context(
+    memory_injection_summary = _memory_injection_summary(memory_items)
+    execution_agent_name = dispatch_plan.execution_agent_name
+    artifacts = orchestration_service.build_message_task_artifacts(
+        task_id=task_id,
         message=message,
         entrypoint=entrypoint,
         entrypoint_agent=entrypoint_agent,
@@ -1314,91 +1260,46 @@ def ingest_unified_message(
         preferred_language=preferred_language,
         memory_hits=memory_matches["total"],
         memory_items=memory_items,
-        route_decision=route_decision,
-        interaction_mode=interaction_mode,
-    )
-    task_description_lines = [message.text, *_memory_context_lines(memory_items)]
-
-    task = {
-        "id": task_id,
-        "title": f"渠道消息任务 - {intent}",
-        "description": "\n".join(task_description_lines),
-        "status": "running",
-        "priority": "medium",
-        "created_at": store.now_string(),
-        "completed_at": None,
-        "agent": target_agent_name(intent),
-        "tokens": 0,
-        "duration": None,
-        "channel": message.channel.value,
-        "user_key": message.user_key,
-        "session_id": message.session_id,
-        "trace_id": security_result["trace_id"],
-        "preferred_language": preferred_language,
-        "detected_lang": message.detected_lang,
-        "confirmation_status": _route_decision_field(route_decision, "confirmation_status", "confirmationStatus"),
-        "approval_status": _route_decision_field(route_decision, "approval_status", "approvalStatus"),
-        "approval_required": _route_decision_bool(route_decision, "approval_required", "approvalRequired"),
-        "audit_id": _route_decision_field(route_decision, "audit_id", "auditId"),
-        "idempotency_key": _route_decision_field(route_decision, "idempotency_key", "idempotencyKey"),
-        "execution_scope": _route_decision_field(route_decision, "execution_scope", "executionScope"),
-        "schedule_plan": _route_decision_payload(route_decision, "schedule_plan", "schedulePlan"),
-        "route_decision": route_decision,
-        "result": None,
-    }
-    store.tasks.append(task)
-    store.task_steps[task_id] = _create_task_steps(
-        task_id=task_id,
-        entrypoint_agent=entrypoint_agent,
-        memory_items=memory_items,
-        trace_id=str(security_result["trace_id"]),
-        warnings=list(security_result["warnings"]),
+        memory_injection_summary=memory_injection_summary,
+        metadata=metadata,
+        intent=intent,
         route_message=route_message,
         execution_agent_name=execution_agent_name,
-        direct_agent_dispatch=direct_agent_dispatch,
+        agent_dispatch=agent_dispatch,
+        state_machine_version=FACT_LAYER_STATE_MACHINE_VERSION,
+        warnings=list(security_result["warnings"]),
+        truncate_text=_truncate_text,
+        dispatch_context_memory_items=_dispatch_context_memory_items,
+        build_channel_delivery_binding=_build_channel_delivery_binding,
+        preview_limit=DISPATCH_CONTEXT_TEXT_PREVIEW_LIMIT,
+        now_string=store.now_string,
+        clone=store.clone,
+        memory_context_lines=_memory_context_lines,
+        memory_step_message=_memory_step_message,
     )
+    route_decision = artifacts.route_decision
+    manager_packet = artifacts.manager_packet
+    brain_dispatch_summary = artifacts.brain_dispatch_summary
+    task = artifacts.task
+    dispatch_context = artifacts.dispatch_context
+    store.tasks.append(task)
+    store.task_steps[task_id] = list(artifacts.task_steps)
     AUTHORITATIVE_TASK_STEP_CACHE.add(task_id)
     mark_task_steps_authoritative(task_id)
-    if direct_agent_dispatch:
-        run = create_direct_agent_run_for_task(
-            task=task,
-            intent=intent,
-            trigger=entrypoint,
-            memory_hits=memory_matches["total"],
-            warnings=list(security_result["warnings"]),
-            dispatch_context=dispatch_context,
-        )
-        queued = agent_execution_worker_service.enqueue_execution(
-            run_id=str(run.get("id") or ""),
-            task_id=task_id,
-            workflow_id=str(run.get("workflow_id") or ""),
-            execution_agent_id=route_decision.get("execution_agent_id")
-            or route_decision.get("executionAgentId"),
-            step_delay=0.0,
-            published_at=store.now_string(),
-        )
-        if not queued:
-            try:
-                run = complete_agent_execution_job(
-                    str(run.get("id") or ""),
-                    execution_agent_id=route_decision.get("execution_agent_id")
-                    or route_decision.get("executionAgentId"),
-                )
-            except Exception as exc:
-                run = fail_workflow_run_due_agent_execution_error(
-                    str(run.get("id") or ""),
-                    failure_message=f"Direct Agent fallback 执行失败：{exc}",
-                )
-    else:
-        run = create_workflow_run_for_task(
-            task=task,
-            intent=intent,
-            trigger=entrypoint,
-            memory_hits=memory_matches["total"],
-            warnings=list(security_result["warnings"]),
-            workflow_id=str(workflow["id"]),
-            dispatch_context=dispatch_context,
-        )
+    run = _launch_message_run(
+        task=task,
+        intent=intent,
+        entrypoint=entrypoint,
+        memory_hits=memory_matches["total"],
+        warnings=list(security_result["warnings"]),
+        dispatch_context=dispatch_context,
+        launch_plan=orchestration_service.build_message_run_launch_plan(
+            agent_dispatch=agent_dispatch,
+            confirmation_pending=artifacts.confirmation_pending,
+            workflow_id=str((workflow or {}).get("id") or ""),
+            route_decision=route_decision,
+        ),
+    )
     ACTIVE_TASKS_BY_USER[message.user_key] = task_id
     LAST_MESSAGE_AT_BY_USER[message.user_key] = received_at
     append_realtime_event(
@@ -1414,26 +1315,27 @@ def ingest_unified_message(
             "user_key": message.user_key,
             "intent": intent,
             "entrypoint": entrypoint,
+            "manager_action": str(manager_packet.get("manager_action") or "").strip() or None,
+            "session_state": str(manager_packet.get("session_state") or "").strip() or None,
+            "response_contract": str(manager_packet.get("response_contract") or "").strip() or None,
         },
     )
 
-    return {
-        "ok": True,
-        "message": "Message accepted and dispatched",
-        "entrypoint": entrypoint,
-        "task_id": task_id,
-        "intent": intent,
-        "unified_message": message.model_dump(),
-        "trace_id": security_result["trace_id"],
-        "detected_lang": message.detected_lang,
-        "memory_hits": memory_matches["total"],
-        "warnings": security_result["warnings"],
-        "merged_into_task_id": None,
-        "interaction_mode": interaction_mode,
-        "reception_mode": reception_mode,
-        "run_id": run["id"],
-        "route_decision": route_decision,
-    }
+    return task_view_service.build_task_event_response(
+        result_message="Message accepted and dispatched",
+        entrypoint=entrypoint,
+        task=task,
+        unified_message=message.model_dump(),
+        run_id=str(run.get("id") or "").strip() or None,
+        intent=intent,
+        trace_id=str(security_result["trace_id"]),
+        detected_lang=message.detected_lang,
+        memory_hits=memory_matches["total"],
+        warnings=list(security_result["warnings"]),
+        merged_into_task_id=None,
+        interaction_mode=interaction_mode,
+        reception_mode=reception_mode,
+    )
 
 
 def ingest_channel_webhook(channel: str, payload: dict) -> dict:

@@ -1,0 +1,16 @@
+tools:
+  - name: rate_limit_state_reader
+    scope: local
+    mode: read_write
+  - name: auth_scope_validator
+    scope: local
+    mode: read_only
+  - name: prompt_injection_detector
+    scope: local
+    mode: read_only
+  - name: redaction_rewriter
+    scope: local
+    mode: read_only
+  - name: audit_append
+    scope: local
+    mode: append_only

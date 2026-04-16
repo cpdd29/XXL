@@ -13,17 +13,23 @@ from fastapi import HTTPException, status
 import yaml
 
 from app.services.tool_catalog_adapters.agent_reach_adapter import AgentReachAdapter
+from app.services.external_skill_registry_service import external_skill_registry_service
 from app.services.skill_registry_service import skill_registry_service
 
 
 logger = logging.getLogger(__name__)
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_AGENT_TOOLS_ROOT = PROJECT_ROOT / "agents"
+DEFAULT_EXTERNAL_REGISTRY_FILENAME = "workbot_external_sources.local.json"
+DEFAULT_EXTERNAL_REGISTRY_FALLBACK_PATHS = (
+    Path("/opt/workbot/external-registry") / DEFAULT_EXTERNAL_REGISTRY_FILENAME,
+)
 AGENT_CONFIG_ROOT_ENV = "WORKBOT_AGENT_CONFIG_ROOT"
 DEFAULT_EXTERNAL_AGENT_REACH_PATH: Path | None = None
 LOCAL_SOURCE_ID = "local-agents"
 EXTERNAL_SOURCE_ID = "agent-reach-external"
 INTERNAL_SOURCE_ID = "internal-skills"
+EXTERNAL_SKILL_SOURCE_ID = "external-skill-registry"
 LOCAL_MCP_SOURCE_ID = "local-mcp-services"
 TOOL_SOURCES_MODE_ENV = "WORKBOT_TOOL_SOURCES_MODE"
 ENABLE_LOCAL_MCP_SOURCE_ENV = "WORKBOT_ENABLE_LOCAL_MCP_SOURCE"
@@ -297,6 +303,11 @@ class ToolSourceService:
             sources.append(internal_source)
             raw_tools.extend(internal_tools)
 
+        external_skill_source, external_skill_tools = self._scan_external_skill_registry_source()
+        if external_skill_source is not None:
+            sources.append(external_skill_source)
+            raw_tools.extend(external_skill_tools)
+
         if enable_local_mcp_source:
             mcp_source, mcp_tools = self._scan_local_mcp_services_source()
             sources.append(mcp_source)
@@ -372,19 +383,36 @@ class ToolSourceService:
 
     def _load_external_sources_registry(self) -> list[dict[str, Any]]:
         registry_file = str(os.getenv(EXTERNAL_TOOL_SOURCES_FILE_ENV, "")).strip()
+        file_candidates: list[Path] = []
         if registry_file:
             registry_path = Path(registry_file)
             if not registry_path.is_absolute():
                 registry_path = PROJECT_ROOT / registry_path
+            file_candidates.append(registry_path)
+        file_candidates.extend(DEFAULT_EXTERNAL_REGISTRY_FALLBACK_PATHS)
+
+        checked_paths: set[Path] = set()
+        configured_path = file_candidates[0] if file_candidates else None
+        for registry_path in file_candidates:
+            if registry_path in checked_paths:
+                continue
+            checked_paths.add(registry_path)
             try:
                 raw = registry_path.read_text(encoding="utf-8")
             except OSError as exc:
-                logger.warning(
-                    "Failed to read external tool sources registry file %s: %s",
+                if registry_file or registry_path in DEFAULT_EXTERNAL_REGISTRY_FALLBACK_PATHS:
+                    logger.warning(
+                        "Failed to read external tool sources registry file %s: %s",
+                        registry_path,
+                        exc,
+                    )
+                continue
+            if configured_path is not None and registry_path != configured_path:
+                logger.info(
+                    "External tool sources registry fallback activated: %s -> %s",
+                    configured_path,
                     registry_path,
-                    exc,
                 )
-                return []
             payload = _safe_parse_json(raw, env_key=f"{EXTERNAL_TOOL_SOURCES_FILE_ENV}={registry_path}")
             normalized = self._normalize_external_sources_payload(
                 payload,
@@ -804,6 +832,81 @@ class ToolSourceService:
             "config_summary": {
                 "path_exists": True,
                 "scanned_at": _utc_now_iso(),
+            },
+            "bridge_summary": {
+                "catalog_bridge": True,
+                "doctor_bridge": False,
+                "runtime_bridge": True,
+                "skill_bridge": True,
+            },
+        }
+        return source, tools
+
+    def _scan_external_skill_registry_source(self) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+        skill_items = external_skill_registry_service.list_skills(include_offline=True)
+        if not skill_items:
+            return None, []
+
+        tools: list[dict[str, Any]] = []
+        for ability in skill_items:
+            invocation = deepcopy(ability.get("invocation") or {})
+            health_status = (
+                "healthy"
+                if ability.get("routable", False)
+                else str(ability.get("health_status") or "offline")
+            )
+            tools.append(
+                {
+                    "id": str(ability.get("id") or ability.get("name") or ""),
+                    "name": str(ability.get("name") or ability.get("id") or ""),
+                    "type": "skill",
+                    "source": EXTERNAL_SKILL_SOURCE_ID,
+                    "source_id": EXTERNAL_SKILL_SOURCE_ID,
+                    "source_kind": "external_skill_registry",
+                    "enabled": bool(ability.get("routable", False)),
+                    "description": str(ability.get("description") or ""),
+                    "tags": list(ability.get("tags") or []),
+                    "provider": str(invocation.get("protocol") or "external-http"),
+                    "bridge_mode": "external_skill_registry",
+                    "health_status": health_status,
+                    "agent_ids": [],
+                    "permissions": {
+                        "requires_permission": False,
+                        "scopes": ["agents:read"],
+                        "roles": ["admin", "operator", "power_user", "viewer"],
+                        "approval_required": False,
+                    },
+                    "input_schema": deepcopy(ability.get("input_schema") or {}),
+                    "output_schema": deepcopy(ability.get("output_schema") or {}),
+                    "recent_call_summary": _default_recent_call_summary(),
+                    "health_summary": deepcopy(ability.get("health_summary") or {}),
+                    "config_summary": {
+                        "version": ability.get("version"),
+                        "capabilities": list(ability.get("capabilities") or []),
+                        "invocation": invocation,
+                    },
+                }
+            )
+
+        source = {
+            "id": EXTERNAL_SKILL_SOURCE_ID,
+            "name": "External Skill Registry",
+            "kind": "external_skill_registry",
+            "path": "",
+            "status": "available",
+            "scan_status": "success" if tools else "empty",
+            "tool_count": len(tools),
+            "notes": ["外接 Skill 通过正式注册中心进入主脑，不依赖本地目录扫描。"],
+            "registry": {
+                "source_id": EXTERNAL_SKILL_SOURCE_ID,
+                "origin": "external_skill_registry",
+                "bridge_enabled": True,
+            },
+            "origin": "external_skill_registry",
+            "config_summary": {
+                "path_exists": True,
+                "scanned_at": _utc_now_iso(),
+                "registered_count": len(skill_items),
             },
             "bridge_summary": {
                 "catalog_bridge": True,

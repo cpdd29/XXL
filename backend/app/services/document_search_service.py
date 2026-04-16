@@ -9,8 +9,18 @@ import re
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
+DOCS_ROOT = PROJECT_ROOT / "docs"
 MAX_CHUNK_CHARS = 720
 SVG_LAYER_PREFIXES = ("①", "②", "③", "④", "⑤")
+SECURITY_SECTION_ALIASES = {
+    "③ prompt injection dual check": "③ Prompt injection scan",
+    "③ prompt injection dual-check": "③ Prompt injection scan",
+}
+MEMORY_STAGE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("Short-term", re.compile(r"^[①-⑤]\s*short[- ]term(?:\s+memory)?$", flags=re.IGNORECASE)),
+    ("Mid-term", re.compile(r"^[①-⑤]\s*mid[- ]term(?:\s+memory)?$", flags=re.IGNORECASE)),
+    ("Long-term", re.compile(r"^[①-⑤]\s*long[- ]term(?:\s+memory)?$", flags=re.IGNORECASE)),
+)
 INTENT_HINTS = {
     "search": ("搜索", "检索", "部署", "接入", "安全", "工作流", "记忆", "架构", "文档"),
     "write": ("项目", "架构", "目标", "优先级", "工作流", "安全", "记忆", "Agent", "MVP"),
@@ -102,11 +112,23 @@ class ProjectDocumentSearchService:
 
     def _load_chunks(self) -> list[DocumentChunk]:
         chunks: list[DocumentChunk] = []
-        chunks.extend(self._load_markdown_chunks(PROJECT_ROOT / "WorkBot_开发全指南.md"))
-        chunks.extend(self._load_markdown_chunks(PROJECT_ROOT / "开发指南补充.md"))
-        chunks.extend(self._load_svg_chunks(PROJECT_ROOT / "security_gateway_pipeline.svg"))
-        chunks.extend(self._load_svg_chunks(PROJECT_ROOT / "memory_distillation_lifecycle.svg"))
+        chunks.extend(self._load_named_chunks("WorkBot_开发全指南.md", kind="markdown"))
+        chunks.extend(self._load_named_chunks("开发指南补充.md", kind="markdown"))
+        chunks.extend(self._load_named_chunks("security_gateway_pipeline.svg", kind="svg"))
+        chunks.extend(self._load_named_chunks("memory_distillation_lifecycle.svg", kind="svg"))
         return chunks
+
+    def _load_named_chunks(self, filename: str, *, kind: str) -> list[DocumentChunk]:
+        for candidate in (
+            DOCS_ROOT / filename,
+            PROJECT_ROOT / filename,
+        ):
+            if not candidate.exists():
+                continue
+            if kind == "markdown":
+                return self._load_markdown_chunks(candidate)
+            return self._load_svg_chunks(candidate)
+        return []
 
     def _load_markdown_chunks(self, path: Path) -> list[DocumentChunk]:
         if not path.exists():
@@ -186,7 +208,7 @@ class ProjectDocumentSearchService:
 
     def _load_security_gateway_chunks(self, path: Path) -> list[DocumentChunk]:
         lines = self._extract_svg_text_lines(path)
-        title = next((line for line in lines if "pipeline" in line.lower()), path.name)
+        title = "Security gateway — 5-layer pipeline"
         chunks: list[DocumentChunk] = []
         current_section: str | None = None
         current_lines: list[str] = []
@@ -213,10 +235,10 @@ class ProjectDocumentSearchService:
                 continue
             if line.startswith(SVG_LAYER_PREFIXES):
                 flush_current()
-                current_section = line
+                current_section = self._canonical_security_section(line)
                 current_lines = [line]
                 continue
-            if line == "Master Bot — trusted input":
+            if line in {"Master Bot — trusted input", "Master Bot - trusted input"}:
                 flush_current()
                 chunks.append(
                     DocumentChunk(
@@ -241,15 +263,15 @@ class ProjectDocumentSearchService:
 
     def _load_memory_lifecycle_chunks(self, path: Path) -> list[DocumentChunk]:
         lines = self._extract_svg_text_lines(path)
-        title = next((line for line in lines if "lifecycle" in line.lower()), path.name)
+        title = "Memory distillation lifecycle"
         chunks: list[DocumentChunk] = []
 
-        lines_without_title = [line for line in lines if line != title]
+        lines_without_title = [line for line in lines if "lifecycle" not in line.lower()]
         index = 0
-        stages = {"Short-term", "Mid-term", "Long-term"}
         while index < len(lines_without_title):
             line = lines_without_title[index]
-            if line not in stages:
+            stage = self._canonical_memory_stage(line)
+            if stage is None:
                 index += 1
                 continue
 
@@ -257,7 +279,7 @@ class ProjectDocumentSearchService:
             cursor = index + 1
             while cursor < len(lines_without_title):
                 candidate = lines_without_title[cursor]
-                if candidate in stages:
+                if candidate.startswith(SVG_LAYER_PREFIXES) or self._canonical_memory_stage(candidate) is not None:
                     break
                 content_lines.append(candidate)
                 cursor += 1
@@ -265,7 +287,7 @@ class ProjectDocumentSearchService:
             chunks.append(
                 DocumentChunk(
                     source_name=path.name,
-                    section=line,
+                    section=stage,
                     content="\n".join([title, *content_lines]),
                     order=60000 + len(chunks),
                     kind="svg",
@@ -276,21 +298,16 @@ class ProjectDocumentSearchService:
             )
             index = cursor
 
-        overview_lines = [
-            line
-            for line in lines_without_title
-            if line in {"Raw messages", "Entity / decision extract", "Semantic vector retrieval"}
-        ]
-        if overview_lines:
+        if not chunks:
             chunks.append(
                 DocumentChunk(
                     source_name=path.name,
                     section="Lifecycle overview",
-                    content="\n".join([title, *overview_lines]),
+                    content="\n".join([title, *lines_without_title]),
                     order=60000 + len(chunks),
                     kind="svg",
                     searchable_text=self._normalize_text(
-                        f"{path.name} lifecycle overview {' '.join(overview_lines)} {title} {SVG_SEARCH_ALIASES.get(path.name, '')}"
+                        f"{path.name} lifecycle overview {' '.join(lines_without_title)} {title} {SVG_SEARCH_ALIASES.get(path.name, '')}"
                     ),
                 )
             )
@@ -392,6 +409,13 @@ class ProjectDocumentSearchService:
 
         if chunk.kind == "svg" and any(token in searchable_text for token in query_tokens):
             score += 0.8
+        if self._is_memory_lifecycle_focused_query(query_tokens, normalized_query):
+            if chunk.source_name == "memory_distillation_lifecycle.svg":
+                score += 6.0
+                if chunk.section in {"Short-term", "Mid-term", "Long-term"}:
+                    score += 6.0
+            else:
+                score -= 1.2
 
         for fallback_keyword in FALLBACK_KEYWORDS.get(intent, ()):
             normalized_keyword = self._normalize_text(fallback_keyword)
@@ -543,6 +567,25 @@ class ProjectDocumentSearchService:
         lowered = unescape(value).lower()
         lowered = re.sub(r"[^\w\u4e00-\u9fff]+", " ", lowered)
         return re.sub(r"\s+", " ", lowered).strip()
+
+    def _canonical_security_section(self, section: str) -> str:
+        normalized = self._normalize_text(section)
+        if normalized in SECURITY_SECTION_ALIASES:
+            return SECURITY_SECTION_ALIASES[normalized]
+        return section
+
+    def _canonical_memory_stage(self, line: str) -> str | None:
+        normalized = self._normalize_text(line)
+        for stage, pattern in MEMORY_STAGE_PATTERNS:
+            if pattern.match(normalized):
+                return stage
+        return None
+
+    def _is_memory_lifecycle_focused_query(self, query_tokens: set[str], normalized_query: str) -> bool:
+        focus_tokens = {"memory", "distillation", "redis", "chromadb", "retrieval", "记忆", "蒸馏"}
+        if query_tokens.intersection(focus_tokens):
+            return True
+        return "memory distillation" in normalized_query or "记忆蒸馏" in normalized_query
 
     def _truncate(self, value: str, limit: int) -> str:
         cleaned = value.strip()

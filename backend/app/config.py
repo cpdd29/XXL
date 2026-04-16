@@ -3,12 +3,15 @@ from functools import lru_cache
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+EXTERNAL_CONNECTION_DEFAULT_SHARED_SECRET = "workbot-external-secret"
+
+
 class Settings(BaseSettings):
     app_name: str = "WorkBot Backend"
     api_prefix: str = "/api"
     environment: str = "development"
     agent_config_root: str = "agents"
-    database_url: str = "postgresql://workbot:workbot@localhost:5432/workbot"
+    database_url: str = "postgresql+psycopg://workbot:workbot@localhost:5432/workbot"
     redis_url: str = "redis://localhost:6379/0"
     memory_sqlite_path: str = "data/memory-midterm.sqlite3"
     nats_url: str = "nats://localhost:4222"
@@ -23,6 +26,7 @@ class Settings(BaseSettings):
     demo_admin_email: str = "admin@workbot.ai"
     demo_admin_password: str = "workbot123"
     auth_jwt_secret: str = "workbot-dev-secret"
+    metrics_scrape_token: str | None = None
     data_encryption_key: str | None = None
     auth_access_token_ttl_seconds: int = 3600
     auth_refresh_token_ttl_seconds: int = 604800
@@ -76,6 +80,11 @@ class Settings(BaseSettings):
     webhook_rate_limit_max_requests: int = 120
     webhook_rate_limit_window_seconds: int = 60
     webhook_max_payload_bytes: int = 128 * 1024
+    external_connection_shared_secret: str = EXTERNAL_CONNECTION_DEFAULT_SHARED_SECRET
+    external_connection_signature_ttl_seconds: int = 300
+    external_connection_circuit_breaker_threshold: int = 3
+    external_connection_backoff_base_seconds: int = 15
+    external_connection_backoff_max_seconds: int = 300
 
     model_config = SettingsConfigDict(
         env_prefix="WORKBOT_",

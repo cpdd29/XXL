@@ -290,3 +290,12 @@ def sanitize_webhook_payload(payload: Any, *, _depth: int = 0) -> Any:
 def reset_webhook_guard_state() -> None:
     with _RATE_LIMIT_LOCK:
         _IN_MEMORY_RATE_BUCKETS.clear()
+    client = redis_provider.get_client()
+    if client is None:
+        return
+    try:
+        keys = list(client.scan_iter(match="webhook:*"))
+        if keys:
+            client.delete(*keys)
+    except Exception:
+        pass

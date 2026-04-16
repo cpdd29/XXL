@@ -80,6 +80,15 @@ def _fake_config_service(monkeypatch: pytest.MonkeyPatch, *, status: str | None)
 def test_agent_execution_branching(intent: str, agent_type: str, expected_kind: str, expected_prefix: str) -> None:
     task = _build_task(description="Search or write something about deployment.")
     run = _build_run(intent)
+    run["dispatch_context"] = {
+        "manager_packet": {
+            "manager_action": "handoff_to_execution",
+            "next_owner": "Search Executor" if intent == "search" else "Write Executor",
+            "delivery_mode": "structured_result",
+            "decomposition_hint": "direct_execute",
+            "workflow_admission": "free_workflow",
+        }
+    }
     execution_agent = _build_execution_agent(agent_type)
 
     result = agent_execution_service.execute_task(task=task, run=run, execution_agent=execution_agent)
@@ -93,9 +102,31 @@ def test_agent_execution_branching(intent: str, agent_type: str, expected_kind: 
         "request_analysis",
         "knowledge_retrieval",
         "context_memory_injection",
+        "manager_directive",
         "result_rendering",
         "execution_profile",
     }.issubset(stages)
+
+
+def test_agent_execution_trace_exposes_manager_directive() -> None:
+    task = _build_task(description="Please help with WorkBot guidance.")
+    run = _build_run("help")
+    run["dispatch_context"] = {
+        "manager_packet": {
+            "manager_action": "handoff_to_execution",
+            "next_owner": "Write Executor",
+            "delivery_mode": "structured_result",
+            "decomposition_hint": "direct_execute",
+            "workflow_admission": "free_workflow",
+        }
+    }
+    execution_agent = _build_execution_agent("write")
+
+    result = agent_execution_service.execute_task(task=task, run=run, execution_agent=execution_agent)
+
+    directive = next(item for item in result["execution_trace"] if item["stage"] == "manager_directive")
+    assert directive["metadata"]["manager_action"] == "handoff_to_execution"
+    assert directive["metadata"]["next_owner"] == "Write Executor"
 
 
 def test_help_intent_stays_help_note_when_agent_is_write() -> None:

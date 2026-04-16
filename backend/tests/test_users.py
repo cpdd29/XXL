@@ -146,6 +146,27 @@ def test_viewer_cannot_bind_platform_account(viewer_auth_headers: dict[str, str]
     assert response.json()["detail"] == "Permission denied"
 
 
+def test_power_user_cannot_update_user_role(auth_headers_factory) -> None:
+    response = client.put(
+        "/api/users/2/role",
+        headers=auth_headers_factory(role="power_user"),
+        json={"role": "viewer"},
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Permission denied"
+
+
+def test_update_user_role_rejects_unknown_role(auth_headers) -> None:
+    response = client.put(
+        "/api/users/2/role",
+        headers=auth_headers,
+        json={"role": "not-a-real-role"},
+    )
+
+    assert response.status_code == 422
+
+
 def test_bind_user_platform_account_rejects_cross_user_conflict(auth_headers) -> None:
     response = client.post(
         "/api/users/2/platform-accounts/bind",

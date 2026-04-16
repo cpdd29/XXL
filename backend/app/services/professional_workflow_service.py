@@ -5,6 +5,14 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
 
+from app.core.brain_payload_fields import (
+    alias_value,
+    dispatch_context_from_run,
+    route_decision_from_payload,
+    route_decision_from_task,
+)
+from app.execution_gateway import ExecutionRequest, SkillExecutionGateway
+from app.execution_gateway.skill_execution_gateway import skill_execution_gateway
 from app.services.mcp_runtime_service import MCPRuntimeService, mcp_runtime_service
 
 
@@ -51,21 +59,10 @@ def _string_list(value: Any) -> list[str]:
     return [item for item in (_normalize_text(raw) for raw in value) if item]
 
 
-def _snake_value(payload: dict[str, Any], *keys: str) -> Any:
-    for key in keys:
-        if key in payload:
-            return payload[key]
-    return None
-
-
 def _route_value(task: dict, run: dict, *keys: str) -> Any:
-    dispatch_context = run.get("dispatch_context")
-    route_decision = dispatch_context.get("route_decision") if isinstance(dispatch_context, dict) else None
-    if not isinstance(route_decision, dict):
-        route_decision = task.get("route_decision") or task.get("routeDecision")
-    if not isinstance(route_decision, dict):
-        route_decision = {}
-    return _snake_value(route_decision, *keys)
+    dispatch_context = dispatch_context_from_run(run)
+    route_decision = route_decision_from_payload(dispatch_context) or route_decision_from_task(task) or {}
+    return alias_value(route_decision, *keys)
 
 
 def _request_text(task: dict) -> str:
@@ -194,8 +191,14 @@ def _infer_runtime_tool_id(
 
 
 class ProfessionalWorkflowService:
-    def __init__(self, *, runtime_service: MCPRuntimeService | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        runtime_service: MCPRuntimeService | None = None,
+        execution_gateway: SkillExecutionGateway | None = None,
+    ) -> None:
         self._runtime_service = runtime_service or mcp_runtime_service
+        self._execution_gateway = execution_gateway or skill_execution_gateway
 
     def assess_admission(
         self,
@@ -205,7 +208,7 @@ class ProfessionalWorkflowService:
     ) -> dict[str, Any]:
         user_context = user_context or {}
         workflow_mode = _normalize_text(
-            _snake_value(route_decision, "workflow_mode", "workflowMode") or "chat"
+            alias_value(route_decision, "workflow_mode", "workflowMode") or "chat"
         ).lower()
         if workflow_mode != "professional_workflow":
             return {
@@ -216,7 +219,7 @@ class ProfessionalWorkflowService:
             }
 
         requires_permission = bool(
-            _snake_value(route_decision, "requires_permission", "requiresPermission")
+            alias_value(route_decision, "requires_permission", "requiresPermission")
         )
         role = _normalize_text(user_context.get("role") or "viewer").lower()
         granted_permissions = ROLE_PERMISSION_HINTS.get(role, ROLE_PERMISSION_HINTS["viewer"])
@@ -281,8 +284,8 @@ class ProfessionalWorkflowService:
     ) -> dict[str, Any]:
         admission = self.assess_admission(route_decision=route_decision, user_context=user_context or {})
         required_capabilities = _string_list(
-            _snake_value(request, "required_capabilities", "requiredCapabilities")
-            or _snake_value(route_decision, "required_capabilities", "requiredCapabilities")
+            alias_value(request, "required_capabilities", "requiredCapabilities")
+            or alias_value(route_decision, "required_capabilities", "requiredCapabilities")
             or []
         )
         role_plan = self.assign_roles(required_capabilities=required_capabilities)
@@ -307,24 +310,24 @@ class ProfessionalWorkflowService:
             }
 
         runtime_tool_id = _normalize_text(
-            _snake_value(request, "runtime_tool_id", "runtimeToolId")
-            or _snake_value(request, "tool_id", "toolId")
+            alias_value(request, "runtime_tool_id", "runtimeToolId")
+            or alias_value(request, "tool_id", "toolId")
         )
-        payload = deepcopy(_snake_value(request, "payload") or {})
+        payload = deepcopy(alias_value(request, "payload") or {})
         request_text = _normalize_text(
             str(
-                _snake_value(request, "text", "description", "message")
+                alias_value(request, "text", "description", "message")
                 or ""
             )
         )
         entity_summary = _extract_entities(request_text)
         governance = {
-            "audit_id": str(_snake_value(request, "audit_id", "auditId") or f"audit-{uuid4().hex[:12]}"),
+            "audit_id": str(alias_value(request, "audit_id", "auditId") or f"audit-{uuid4().hex[:12]}"),
             "idempotency_key": str(
-                _snake_value(request, "idempotency_key", "idempotencyKey") or f"professional:{uuid4().hex[:16]}"
+                alias_value(request, "idempotency_key", "idempotencyKey") or f"professional:{uuid4().hex[:16]}"
             ),
-            "execution_scope": str(_snake_value(request, "execution_scope", "executionScope") or "read_only"),
-            "approval_required": bool(_snake_value(request, "approval_required", "approvalRequired") or False),
+            "execution_scope": str(alias_value(request, "execution_scope", "executionScope") or "read_only"),
+            "approval_required": bool(alias_value(request, "approval_required", "approvalRequired") or False),
             "evidence_policy": "strict",
             "has_evidence": bool(entity_summary.get("has_evidence")),
         }
@@ -378,17 +381,36 @@ class ProfessionalWorkflowService:
                 "selected_runtime_tool_id": None,
             }
 
-        runtime_response = self._runtime_service.invoke_tool(
-            tool_id=runtime_tool_id,
-            payload=payload,
-            trace_context={
-                "workflow_mode": "professional_workflow",
-                "required_capabilities": required_capabilities,
-                "audit_id": governance["audit_id"],
-                "idempotency_key": governance["idempotency_key"],
-                "execution_scope": governance["execution_scope"],
+        gateway_outcome = self._execution_gateway.execute(
+            request=ExecutionRequest(
+                tool_id=runtime_tool_id,
+                payload=payload,
+                trace_context={
+                    "workflow_mode": "professional_workflow",
+                    "required_capabilities": required_capabilities,
+                    "audit_id": governance["audit_id"],
+                    "idempotency_key": governance["idempotency_key"],
+                    "execution_scope": governance["execution_scope"],
+                },
+            ),
+            mode="runtime_primary",
+            runtime_executor=lambda request: self._runtime_service.invoke_tool(
+                tool_id=runtime_tool_id,
+                payload=request.payload,
+                trace_context=request.trace_context,
+            ),
+            builtin_executor=lambda request: {
+                "ok": False,
+                "error": {"message": "builtin_not_available_for_professional_workflow"},
+                "result": {"payload": deepcopy(request.payload)},
             },
+            strict_runtime_required=True,
         )
+        runtime_response = gateway_outcome.runtime_result or {
+            "ok": False,
+            "trace_id": None,
+            "error": {"message": gateway_outcome.fallback_reason or "runtime_error"},
+        }
         if not runtime_response.get("ok"):
             return {
                 "ok": False,

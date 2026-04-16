@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
 from app.core.chroma_memory_store import ChromaLongTermMemoryStore, LocalPersistentChromaClient
 from app.core.sqlite_memory_store import SQLiteMidTermMemoryStore
 from app.services.memory_service import MemoryService
@@ -83,6 +85,17 @@ class RecordingChromaModule:
         return FakeChromaClient()
 
 
+class EnvSensitiveChromaModule:
+    class _HttpClientSettings(BaseSettings):
+        tenant: str = "default"
+        model_config = SettingsConfigDict(env_prefix="WORKBOT_", extra="forbid")
+
+    def HttpClient(self, *, host: str, port: int, ssl: bool):
+        _ = (host, port, ssl)
+        self._HttpClientSettings()
+        return FakeChromaClient()
+
+
 def test_chroma_long_term_memory_store_builds_http_client(monkeypatch) -> None:
     fake_module = RecordingChromaModule()
     monkeypatch.setattr("app.core.chroma_memory_store._load_chromadb_module", lambda: fake_module)
@@ -98,6 +111,25 @@ def test_chroma_long_term_memory_store_builds_http_client(monkeypatch) -> None:
     assert isinstance(client, FakeChromaClient)
     assert fake_module.http_calls == [{"host": "memory.example", "port": 9443, "ssl": True}]
     assert fake_module.persistent_calls == []
+
+
+def test_chroma_long_term_memory_store_isolates_workbot_env_for_http_client(monkeypatch) -> None:
+    monkeypatch.setenv("WORKBOT_ENVIRONMENT", "docker-compose")
+    monkeypatch.setenv("WORKBOT_MESSAGE_RATE_LIMIT_PER_MINUTE", "9")
+    monkeypatch.setattr(
+        "app.core.chroma_memory_store._load_chromadb_module",
+        lambda: EnvSensitiveChromaModule(),
+    )
+
+    store = ChromaLongTermMemoryStore(
+        chroma_url="https://memory.example:9443",
+        chroma_client_mode="http",
+        collection_name="isolated_env_collection",
+    )
+
+    client = store._build_client()
+
+    assert isinstance(client, FakeChromaClient)
 
 
 def test_chroma_long_term_memory_store_builds_persistent_client(monkeypatch, tmp_path) -> None:

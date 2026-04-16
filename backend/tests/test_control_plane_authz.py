@@ -25,6 +25,27 @@ def test_viewer_cannot_mutate_control_plane_resources(
     assert response.json()["detail"] == "Permission denied"
 
 
+def test_power_user_cannot_trigger_internal_workflow(auth_headers_factory) -> None:
+    response = client.post(
+        "/api/workflows/internal/system.health_check",
+        headers=auth_headers_factory(role="power_user"),
+        json={"payload": {"source": "test"}},
+    )
+
+    assert response.status_code == status.HTTP_403_FORBIDDEN
+    assert response.json()["detail"] == "Permission denied"
+
+
+def test_power_user_cannot_scan_tool_sources(auth_headers_factory) -> None:
+    response = client.post(
+        "/api/tool-sources/scan",
+        headers=auth_headers_factory(role="power_user"),
+    )
+
+    assert response.status_code == status.HTTP_403_FORBIDDEN
+    assert response.json()["detail"] == "Permission denied"
+
+
 def test_public_message_ingest_route_remains_anonymous() -> None:
     response = client.post(
         "/api/messages/ingest",

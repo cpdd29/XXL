@@ -7,6 +7,7 @@ import os
 import re
 import sqlite3
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -19,6 +20,32 @@ from app.services.encryption_service import encryption_service
 
 logger = logging.getLogger(__name__)
 _CHROMADB_MODULE = None
+_CHROMADB_ALLOWED_ENV_KEYS = {
+    "CURL_CA_BUNDLE",
+    "HOME",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "LOGNAME",
+    "NO_PROXY",
+    "PATH",
+    "PYTHONPATH",
+    "REQUESTS_CA_BUNDLE",
+    "SHELL",
+    "SSL_CERT_DIR",
+    "SSL_CERT_FILE",
+    "TEMP",
+    "TMP",
+    "TMPDIR",
+    "USER",
+    "VIRTUAL_ENV",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
+}
+_CHROMADB_ALLOWED_ENV_PREFIXES = ("CHROMA_", "chroma_", "LC_")
 
 
 EMBEDDING_DIMENSION = 64
@@ -33,13 +60,16 @@ def _normalize_chroma_client_mode(value: object) -> str:
     return "http"
 
 
-def _load_chromadb_module():
-    global _CHROMADB_MODULE
+def _is_chromadb_safe_env_key(key: str) -> bool:
+    if key in _CHROMADB_ALLOWED_ENV_KEYS:
+        return True
+    return any(key.startswith(prefix) for prefix in _CHROMADB_ALLOWED_ENV_PREFIXES)
 
-    if _CHROMADB_MODULE is not None:
-        return _CHROMADB_MODULE
 
+@contextmanager
+def _isolated_chromadb_settings_env():
     original_cwd = os.getcwd()
+    original_env = os.environ.copy()
     original_base_settings_init = BaseSettings.__init__
 
     def _patched_base_settings_init(instance, *args, **kwargs):
@@ -47,18 +77,37 @@ def _load_chromadb_module():
             kwargs["_env_file"] = None
         return original_base_settings_init(instance, *args, **kwargs)
 
+    safe_env = {
+        key: value for key, value in original_env.items() if _is_chromadb_safe_env_key(key)
+    }
+
     try:
-        # chromadb 1.5.x may read the current working directory's `.env` during import.
-        # Force-disable dotenv loading for chromadb settings and import from a neutral
-        # directory to avoid our backend `.env` leaking into chromadb's BaseSettings.
         BaseSettings.__init__ = _patched_base_settings_init
+        os.environ.clear()
+        os.environ.update(safe_env)
         os.chdir(tempfile.gettempdir())
-        import chromadb as chromadb_module  # type: ignore
-    except Exception as exc:  # pragma: no cover - depends on runtime environment
-        raise RuntimeError(f"chromadb import failed: {exc}") from exc
+        yield
     finally:
         BaseSettings.__init__ = original_base_settings_init
+        os.environ.clear()
+        os.environ.update(original_env)
         os.chdir(original_cwd)
+
+
+def _load_chromadb_module():
+    global _CHROMADB_MODULE
+
+    if _CHROMADB_MODULE is not None:
+        return _CHROMADB_MODULE
+
+    try:
+        with _isolated_chromadb_settings_env():
+            # chromadb may read the current working directory's `.env` and process
+            # environment during import. Import it from a neutral environment so our
+            # deployment variables do not leak into chromadb's BaseSettings.
+            import chromadb as chromadb_module  # type: ignore
+    except Exception as exc:  # pragma: no cover - depends on runtime environment
+        raise RuntimeError(f"chromadb import failed: {exc}") from exc
 
     _CHROMADB_MODULE = chromadb_module
     return _CHROMADB_MODULE
@@ -163,21 +212,36 @@ class LocalPersistentChromaCollection:
         )
         self._connection.commit()
 
+    @staticmethod
+    def _matches_where(metadata: dict[str, Any], where: dict[str, Any] | None) -> bool:
+        if not where:
+            return True
+        for key, value in where.items():
+            if value is None:
+                continue
+            if str(metadata.get(key) or "") != str(value):
+                return False
+        return True
+
     def get(self, where, include):
-        user_id = str((where or {}).get("user_id") or "")
         rows = self._connection.execute(
             """
             SELECT memory_id, document, metadata_json
             FROM long_term_memory
-            WHERE collection_name = ? AND user_id = ?
+            WHERE collection_name = ?
             ORDER BY memory_id
             """,
-            (self._collection_name, user_id),
+            (self._collection_name,),
         ).fetchall()
+        filtered_rows = []
+        for row in rows:
+            metadata = json.loads(row[2]) if row[2] else {}
+            if self._matches_where(metadata, where):
+                filtered_rows.append((row[0], row[1], metadata))
         return {
-            "ids": [row[0] for row in rows],
-            "documents": [row[1] for row in rows],
-            "metadatas": [json.loads(row[2]) if row[2] else {} for row in rows],
+            "ids": [row[0] for row in filtered_rows],
+            "documents": [row[1] for row in filtered_rows],
+            "metadatas": [row[2] for row in filtered_rows],
             "include": include,
         }
 
@@ -186,20 +250,21 @@ class LocalPersistentChromaCollection:
         return sum((lval - rval) ** 2 for lval, rval in zip(left, right))
 
     def query(self, query_embeddings, n_results, where, include):
-        user_id = str((where or {}).get("user_id") or "")
         query_embedding = query_embeddings[0]
         rows = self._connection.execute(
             """
             SELECT memory_id, embedding_json, document, metadata_json
             FROM long_term_memory
-            WHERE collection_name = ? AND user_id = ?
+            WHERE collection_name = ?
             """,
-            (self._collection_name, user_id),
+            (self._collection_name,),
         ).fetchall()
         scored = []
         for memory_id, embedding_json, document, metadata_json in rows:
             embedding = json.loads(embedding_json) if embedding_json else []
             metadata = json.loads(metadata_json) if metadata_json else {}
+            if not self._matches_where(metadata, where):
+                continue
             scored.append(
                 (
                     self._distance(query_embedding, embedding),
@@ -283,7 +348,8 @@ class ChromaLongTermMemoryStore:
         host = parsed.hostname or "localhost"
         port = parsed.port or 8000
         ssl = parsed.scheme == "https"
-        return chromadb.HttpClient(host=host, port=port, ssl=ssl)
+        with _isolated_chromadb_settings_env():
+            return chromadb.HttpClient(host=host, port=port, ssl=ssl)
 
     def _get_client(self):
         if self._client is not None:
@@ -329,6 +395,27 @@ class ChromaLongTermMemoryStore:
             "keywords_json": encryption_service.encrypt_text(
                 json.dumps(memory.get("keywords", []), ensure_ascii=False)
             ),
+            "memory_scope": memory.get("memory_scope", "tenant"),
+            "memory_layer_kind": memory.get("memory_layer_kind", "conversation"),
+            "write_source": memory.get("write_source", "brain_internal"),
+            "trust_level": memory.get("trust_level", "trusted"),
+            "memory_status": memory.get("memory_status", "active"),
+            "review_status": memory.get("review_status", "approved"),
+            "reviewed_by": memory.get("reviewed_by"),
+            "reviewed_at": memory.get("reviewed_at"),
+            "review_note": memory.get("review_note"),
+            "tenant_id": memory.get("tenant_id", "default"),
+            "project_id": memory.get("project_id", "default"),
+            "environment": memory.get("environment", "development"),
+            "expires_at": memory.get("expires_at"),
+            "archived_at": memory.get("archived_at"),
+            "deleted_at": memory.get("deleted_at"),
+            "corrected_at": memory.get("corrected_at"),
+            "retention_policy": memory.get("retention_policy", "default"),
+            "local_only_reasons_json": encryption_service.encrypt_text(
+                json.dumps(memory.get("local_only_reasons", []), ensure_ascii=False)
+            ),
+            "local_only_filtered_count": int(memory.get("local_only_filtered_count") or 0),
         }
         return metadata
 
@@ -346,6 +433,15 @@ class ChromaLongTermMemoryStore:
                 keywords = []
         except Exception:
             keywords = []
+        decoded_local_only_reasons = str(
+            encryption_service.decrypt_text(str(payload.get("local_only_reasons_json") or "[]")) or "[]"
+        )
+        try:
+            local_only_reasons = json.loads(decoded_local_only_reasons)
+            if not isinstance(local_only_reasons, list):
+                local_only_reasons = []
+        except Exception:
+            local_only_reasons = []
         return {
             "id": memory_id,
             "user_id": payload.get("user_id", ""),
@@ -355,6 +451,25 @@ class ChromaLongTermMemoryStore:
             "memory_text": decrypted_memory_text or "",
             "keywords": keywords,
             "created_at": payload.get("created_at", ""),
+            "memory_scope": payload.get("memory_scope", "tenant"),
+            "memory_layer_kind": payload.get("memory_layer_kind", "conversation"),
+            "write_source": payload.get("write_source", "brain_internal"),
+            "trust_level": payload.get("trust_level", "trusted"),
+            "memory_status": payload.get("memory_status", "active"),
+            "review_status": payload.get("review_status", "approved"),
+            "reviewed_by": payload.get("reviewed_by"),
+            "reviewed_at": payload.get("reviewed_at"),
+            "review_note": payload.get("review_note"),
+            "tenant_id": payload.get("tenant_id", "default"),
+            "project_id": payload.get("project_id", "default"),
+            "environment": payload.get("environment", "development"),
+            "expires_at": payload.get("expires_at"),
+            "archived_at": payload.get("archived_at"),
+            "deleted_at": payload.get("deleted_at"),
+            "corrected_at": payload.get("corrected_at"),
+            "retention_policy": payload.get("retention_policy", "default"),
+            "local_only_reasons": local_only_reasons,
+            "local_only_filtered_count": int(payload.get("local_only_filtered_count") or 0),
         }
 
     def save_memory(self, memory: dict) -> bool:
@@ -375,13 +490,14 @@ class ChromaLongTermMemoryStore:
             logger.warning("Chroma long-term memory write failed, using in-memory fallback: %s", exc)
             return False
 
-    def list_memories(self, user_id: str) -> list[dict] | None:
+    def list_memories(self, user_id: str, filters: dict[str, Any] | None = None) -> list[dict] | None:
         collection = self._get_collection()
         if collection is None:
             return None
 
         try:
-            result = collection.get(where={"user_id": user_id}, include=["documents", "metadatas"])
+            where = {"user_id": user_id, **(filters or {})}
+            result = collection.get(where=where, include=["documents", "metadatas"])
             ids = result.get("ids") or []
             documents = result.get("documents") or []
             metadatas = result.get("metadatas") or []
@@ -399,7 +515,13 @@ class ChromaLongTermMemoryStore:
             logger.warning("Chroma long-term memory read failed, using in-memory fallback: %s", exc)
             return None
 
-    def query_memories(self, user_id: str, query: str, limit: int) -> list[dict] | None:
+    def query_memories(
+        self,
+        user_id: str,
+        query: str,
+        limit: int,
+        filters: dict[str, Any] | None = None,
+    ) -> list[dict] | None:
         collection = self._get_collection()
         if collection is None:
             return None
@@ -416,7 +538,7 @@ class ChromaLongTermMemoryStore:
             result = collection.query(
                 query_embeddings=[self.embedding_function.embed(query)],
                 n_results=max(1, limit),
-                where={"user_id": user_id},
+                where={"user_id": user_id, **(filters or {})},
                 include=["documents", "metadatas", "distances"],
             )
             ids = (result.get("ids") or [[]])[0]
@@ -455,6 +577,11 @@ class ChromaLongTermMemoryStore:
                         "distance": round(distance, 8),
                         "matched_terms": matched_terms,
                         "created_at": record["created_at"],
+                        "retention_policy": record.get("retention_policy", "default"),
+                        "local_only_reasons": record.get("local_only_reasons", []),
+                        "local_only_filtered_count": int(
+                            record.get("local_only_filtered_count") or 0
+                        ),
                     }
                 )
             return items

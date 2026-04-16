@@ -237,3 +237,82 @@ def test_get_task_exposes_governance_fields_from_route_decision(auth_headers) ->
     assert payload["idempotencyKey"] == "route:task-governance-1"
     assert payload["executionScope"] == "read_only"
     assert payload["schedulePlan"]["cron"] == "0 15 * * 5"
+
+
+def test_get_task_exposes_brain_dispatch_summary_from_dispatch_context(auth_headers) -> None:
+    created_at = store.now_string()
+    task_id = "task-brain-dispatch-summary"
+    store.tasks.append(
+        {
+            "id": task_id,
+            "title": "主脑分发摘要任务",
+            "description": "验证任务详情从 dispatch_context 回填主脑分发摘要",
+            "status": "running",
+            "priority": "medium",
+            "created_at": created_at,
+            "completed_at": None,
+            "agent": "Dispatcher Agent",
+            "tokens": 0,
+            "duration": None,
+            "workflow_run_id": "run-brain-dispatch-summary",
+            "route_decision": {"workflow_mode": "free_workflow"},
+        }
+    )
+    store.workflow_runs.append(
+        {
+            "id": "run-brain-dispatch-summary",
+            "workflow_id": "workflow-brain-dispatch",
+            "workflow_name": "自由工作流",
+            "task_id": task_id,
+            "trigger": "message",
+            "status": "running",
+            "created_at": created_at,
+            "updated_at": created_at,
+            "started_at": created_at,
+            "current_stage": "等待调度",
+            "nodes": [],
+            "logs": [],
+            "dispatch_context": {
+                "state": "queued",
+                "brain_dispatch_summary": {
+                    "dispatch_type": "agent_dispatch",
+                    "workflow_mode": "free_workflow",
+                    "execution_agent": "Writer Agent",
+                    "summary_line": "项目经理 handoff_to_execution -> 路由 free_workflow -> 直达 Writer Agent",
+                },
+            },
+        }
+    )
+
+    response = client.get(f"/api/tasks/{task_id}", headers=auth_headers)
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["brainDispatchSummary"]["dispatchType"] == "agent_dispatch"
+    assert payload["brainDispatchSummary"]["workflowMode"] == "free_workflow"
+    assert payload["brainDispatchSummary"]["executionAgent"] == "Writer Agent"
+    assert payload["brainDispatchSummary"]["summaryLine"]
+
+
+def test_get_task_exposes_memory_injection_summary_and_state_machine(auth_headers) -> None:
+    ingest = client.post(
+        "/api/messages/ingest",
+        json={
+            "channel": "telegram",
+            "platformUserId": "task-memory-user",
+            "chatId": "task-memory-chat",
+            "text": "请帮我整理一下之前关于安全网关的结论",
+        },
+    )
+    assert ingest.status_code == 200
+
+    response = client.get(f"/api/tasks/{ingest.json()['taskId']}", headers=auth_headers)
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["memoryInjectionSummary"]["boundary"] == "long_term_read_only"
+    assert {"total_hits", "injected_hits", "blocked_hits", "source_counts"}.issubset(
+        set(payload["memoryInjectionSummary"].keys())
+    )
+    assert payload["stateMachine"]["version"] == "brain_fact_layer_v1"
+    assert payload["stateMachine"]["dispatch_state"] in {"queued", "agent_queued", "dispatched", "completed"}

@@ -4,6 +4,7 @@ from datetime import UTC, datetime, timedelta
 import logging
 from uuid import uuid4
 
+from app.core.brain_payload_fields import alias_text, dispatch_context_from_run, route_decision_from_payload
 from app.core.agent_protocol import (
     apply_protocol_to_run,
     build_protocol_envelope,
@@ -83,6 +84,10 @@ class WorkflowDispatcherService:
         )
 
     def dispatch_tick(self, run_id: str, *, step_delay: float) -> bool:
+        if not getattr(self._persistence, "enabled", False):
+            return False
+        if not bool(getattr(self._event_bus, "is_connected", lambda: False)()):
+            return False
         return self._event_bus.publish_json(
             WORKFLOW_DISPATCH_SUBJECT,
             {
@@ -104,20 +109,12 @@ class WorkflowDispatcherService:
 
         queued_at = published_at or _utc_now().isoformat()
 
-        dispatch_context = run.get("dispatch_context")
-        if not isinstance(dispatch_context, dict):
-            dispatch_context = {}
-        route_decision = dispatch_context.get("route_decision")
-        if not isinstance(route_decision, dict):
-            route_decision = dispatch_context.get("routeDecision")
-        if not isinstance(route_decision, dict):
-            route_decision = {}
+        dispatch_context = dispatch_context_from_run(run) or {}
+        route_decision = route_decision_from_payload(dispatch_context) or {}
 
-        execution_agent_id = str(
-            dispatch_context.get("execution_agent_id")
-            or dispatch_context.get("executionAgentId")
-            or route_decision.get("execution_agent_id")
-            or route_decision.get("executionAgentId")
+        execution_agent_id = (
+            alias_text(dispatch_context, "execution_agent_id", "executionAgentId")
+            or alias_text(route_decision, "execution_agent_id", "executionAgentId")
             or ""
         ).strip()
         dispatch_state = str(
@@ -146,7 +143,7 @@ class WorkflowDispatcherService:
             dispatch_context=dispatch_context,
             run_id=str(run.get("id") or run_id),
             default_max_attempts=self._dispatch_protocol_max_attempts(run),
-            attempt=max(int(run.get("dispatch_failure_count") or 0), 0) + 1,
+            attempt=self._execution_attempt_for_run(run),
             emitted_at=queued_at,
             available_at=queued_at,
             source={"kind": "workflow_dispatcher", "id": self.dispatcher_id},
@@ -155,6 +152,10 @@ class WorkflowDispatcherService:
         apply_protocol_to_run(run, protocol)
         self._persist_run(run)
         self._enqueue_execution_job(run_id, step_delay=step_delay, queued_at=queued_at, protocol=protocol)
+        if not getattr(self._persistence, "enabled", False):
+            return False
+        if not bool(getattr(self._event_bus, "is_connected", lambda: False)()):
+            return False
         return self._event_bus.publish_json(WORKFLOW_EXECUTION_SUBJECT, envelope)
 
     def try_acquire_schedule_slot(self, run_id: str) -> dict | None:
@@ -194,11 +195,63 @@ class WorkflowDispatcherService:
                 step_delay=step_delay,
                 published_at=published_at,
             )
+            eager_fallback_attempted = False
+            if not execution_publish_succeeded:
+                eager_fallback_attempted = True
+                try:
+                    from app.services.workflow_execution_service import (
+                        complete_agent_execution_job,
+                        execute_workflow_run,
+                    )
+
+                    eager_run = execute_workflow_run(run_id)
+                    eager_execution_agent_id = None
+                    eager_dispatch_context = (
+                        eager_run.get("dispatch_context")
+                        if isinstance(eager_run, dict)
+                        else None
+                    )
+                    if isinstance(eager_dispatch_context, dict):
+                        eager_execution_agent_id = (
+                            str(
+                                eager_dispatch_context.get("execution_agent_id")
+                                or eager_dispatch_context.get("executionAgentId")
+                                or ""
+                            ).strip()
+                            or None
+                        )
+                    if (
+                        isinstance(eager_run, dict)
+                        and str(eager_run.get("status") or "").strip() not in TERMINAL_RUN_STATUSES
+                    ):
+                        complete_agent_execution_job(
+                            run_id,
+                            execution_agent_id=eager_execution_agent_id,
+                        )
+                except Exception as exc:
+                    logger.warning(
+                        "Workflow execution eager fallback failed for run %s: %s",
+                        run_id,
+                        exc,
+                    )
             execution_job_durable = self._has_execution_job(run_id)
             if execution_publish_succeeded or execution_job_durable:
                 self._claim_run(run_id, respect_existing_owner=False)
                 workflow_scheduler_service.schedule(run_id, delay=step_delay, step_delay=step_delay)
                 return self._find_run(run_id)
+            if eager_fallback_attempted:
+                fallback_run = self._find_run(run_id)
+                if fallback_run is not None:
+                    if str(fallback_run.get("status") or "").strip() in TERMINAL_RUN_STATUSES:
+                        workflow_scheduler_service.cancel(run_id)
+                    else:
+                        self._claim_run(run_id, respect_existing_owner=False)
+                        workflow_scheduler_service.schedule(
+                            run_id,
+                            delay=step_delay,
+                            step_delay=step_delay,
+                        )
+                    return fallback_run
             run = execute_workflow_run(run_id)
         except Exception as exc:
             logger.warning("Workflow dispatch tick failed for run %s: %s", run_id, exc)
@@ -533,6 +586,22 @@ class WorkflowDispatcherService:
                 "message": message,
             }
         )
+
+    @staticmethod
+    def _execution_attempt_for_run(run: dict | None) -> int:
+        if not isinstance(run, dict):
+            return 1
+        dispatch_context = dispatch_context_from_run(run) or {}
+        protocol = protocol_from_dispatch_context(dispatch_context)
+        try:
+            protocol_attempt = int(protocol.get("attempt") or 1)
+        except (TypeError, ValueError):
+            protocol_attempt = 1
+        try:
+            dispatch_attempt = max(int(run.get("dispatch_failure_count") or 0), 0) + 1
+        except (TypeError, ValueError):
+            dispatch_attempt = 1
+        return max(protocol_attempt, dispatch_attempt, 1)
 
     @classmethod
     def _dispatch_protocol_max_attempts(cls, run: dict | None) -> int:

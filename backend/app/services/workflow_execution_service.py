@@ -7,14 +7,25 @@ from uuid import uuid4
 
 from fastapi import HTTPException, status
 
+from app.core.brain_payload_fields import (
+    alias_bool,
+    alias_text,
+    dispatch_context_from_run,
+    route_decision_from_payload,
+    route_decision_from_task,
+)
+from app.core.nats_event_bus import nats_event_bus
 from app.config import get_settings
 from app.services.agent_execution_service import agent_execution_service
+from app.services.external_agent_registry_service import external_agent_registry_service
+from app.services.tenancy_service import attach_scope, matches_scope
 from app.services.agent_service import is_agent_routable, routing_priority
 from app.services.channel_outbound_service import channel_outbound_service
 from app.services.document_search_service import document_search_service
 from app.services.language_service import detect_language
 from app.services.memory_service import memory_service
 from app.services.persistence_service import persistence_service
+from app.services.trace_exporter_service import trace_exporter_service
 from app.services.workflow_scheduler_service import workflow_scheduler_service
 from app.services.workflow_realtime_service import workflow_realtime_service
 from app.services.store import store
@@ -73,6 +84,41 @@ STEP_HINTS_BY_AGENT_TYPE = {
 }
 ACTIVE_NODE_STATUSES = {"completed", "running", "waiting", "error"}
 TERMINAL_TASK_STATUSES = {"completed", "failed", "cancelled"}
+def _task_confirmation_pending(task: dict | None) -> bool:
+    if not isinstance(task, dict):
+        return False
+    route_decision = route_decision_from_task(task)
+    if route_decision is None:
+        return False
+    workflow_mode = str(alias_text(route_decision, "workflow_mode", "workflowMode") or "").lower()
+    confirmation_required = alias_bool(route_decision, "confirmation_required", "confirmationRequired")
+    confirmation_status = str(
+        alias_text(route_decision, "confirmation_status", "confirmationStatus") or ""
+    ).lower()
+    return (
+        workflow_mode == "professional_workflow"
+        and bool(confirmation_required)
+        and confirmation_status == "pending"
+        and str(task.get("status") or "").strip().lower() == "pending"
+    )
+
+
+def _refresh_confirmation_pending_run_locked(*, run: dict, task: dict) -> dict:
+    dispatch_context = _run_dispatch_context(run)
+    if isinstance(dispatch_context, dict):
+        dispatch_context["state"] = "awaiting_confirmation"
+        dispatch_context["updated_at"] = store.now_string()
+    refreshed_run = _refresh_run_state(run, task)
+    _publish_run_event(refreshed_run, "workflow_run.updated")
+    _persist_execution_state(
+        task=task,
+        steps=_ensure_task_steps_loaded(task["id"]),
+        run=refreshed_run,
+    )
+    _cancel_scheduled_run(refreshed_run["id"])
+    return refreshed_run
+
+
 MANUAL_AUTO_START_DELAY_SECONDS = 0.6
 AUTO_STEP_DELAY_SECONDS = 0.6
 TASK_RETRY_FOLLOW_UP_DELAY_SECONDS = 5.0
@@ -80,8 +126,17 @@ CONTEXT_PATCH_PREVIEW_LIMIT = 160
 DEFAULT_WORKFLOW_MAX_DISPATCH_RETRY = 6
 DEFAULT_WORKFLOW_DISPATCH_RETRY_BACKOFF_SECONDS = 2.0
 DEFAULT_WORKFLOW_EXECUTION_TIMEOUT_SECONDS = 45.0
-DIRECT_AGENT_FALLBACK_WORKFLOW_ID = "__direct_agent_fallback__"
-DIRECT_AGENT_FALLBACK_WORKFLOW_NAME = "Direct Agent Fallback"
+AGENT_DISPATCH_WORKFLOW_ID = "__agent_dispatch__"
+AGENT_DISPATCH_WORKFLOW_NAME = "Direct Agent Fallback"
+LEGACY_AGENT_DISPATCH_WORKFLOW_ID = "__direct_agent_fallback__"
+AGENT_DISPATCH_WORKFLOW_IDS = {AGENT_DISPATCH_WORKFLOW_ID, LEGACY_AGENT_DISPATCH_WORKFLOW_ID}
+DIRECT_AGENT_FALLBACK_WORKFLOW_ID = LEGACY_AGENT_DISPATCH_WORKFLOW_ID
+DIRECT_AGENT_FALLBACK_WORKFLOW_NAME = AGENT_DISPATCH_WORKFLOW_NAME
+LEGACY_DIRECT_AGENT_DISPATCH_TYPE = "direct_agent_dispatch"
+LEGACY_DIRECT_AGENT_FALLBACK_MODE = "direct_agent_fallback"
+AGENT_DISPATCH_RUN_TYPES = {"agent_dispatch", LEGACY_DIRECT_AGENT_DISPATCH_TYPE}
+AGENT_DISPATCH_FALLBACK_POLICY_MODES = {"agent_dispatch_fallback", LEGACY_DIRECT_AGENT_FALLBACK_MODE}
+AUTO_RECOVERY_FALLBACK_MODES = {"planner_recovery", *AGENT_DISPATCH_FALLBACK_POLICY_MODES}
 _TICK_LOCK = Lock()
 logger = logging.getLogger(__name__)
 AUTHORITATIVE_TASK_STEP_CACHE: set[str] = set()
@@ -106,9 +161,16 @@ def _schedule_manual_auto_progress(run_id: str) -> None:
 
 def _schedule_message_auto_progress(run_id: str) -> None:
     step_delay = _workflow_step_delay_for_run(run_id)
+    configured_delay = float(get_settings().message_debounce_seconds)
+    delay = configured_delay
+    if (
+        not getattr(persistence_service, "enabled", False)
+        and not bool(getattr(nats_event_bus, "is_connected", lambda: False)())
+    ):
+        delay = min(configured_delay, step_delay)
     workflow_scheduler_service.schedule(
         run_id,
-        delay=float(get_settings().message_debounce_seconds),
+        delay=delay,
         step_delay=step_delay,
     )
 
@@ -380,12 +442,24 @@ def _load_workflows_for_selection() -> list[dict]:
 def _load_agents_for_execution() -> list[dict]:
     database_agents = persistence_service.list_agents()
     if database_agents is not None:
-        store.agents = [store.clone(agent) for agent in database_agents]
-        return store.agents
+        base_agents = [store.clone(agent) for agent in database_agents]
+    elif getattr(persistence_service, "enabled", False):
+        base_agents = []
+    else:
+        base_agents = [store.clone(agent) for agent in store.agents]
 
-    if getattr(persistence_service, "enabled", False):
-        return []
+    merged: dict[str, dict] = {
+        str(agent.get("id") or "").strip(): agent
+        for agent in base_agents
+        if str(agent.get("id") or "").strip()
+    }
+    for external_agent in external_agent_registry_service.list_agents(include_offline=True):
+        agent_id = str(external_agent.get("id") or "").strip()
+        if not agent_id or agent_id in merged:
+            continue
+        merged[agent_id] = store.clone(external_agent)
 
+    store.agents = [store.clone(agent) for agent in merged.values()]
     return store.agents
 
 
@@ -430,6 +504,12 @@ def _find_agent_mutable(agent_id: str) -> dict | None:
     for agent in store.agents:
         if str(agent.get("id") or "") == normalized_agent_id:
             return agent
+
+    external_agent = external_agent_registry_service.get_agent(normalized_agent_id)
+    if external_agent is not None:
+        payload = store.clone(external_agent)
+        store.agents.append(payload)
+        return payload
 
     return None
 
@@ -622,10 +702,14 @@ def _build_run_dispatch_context(
     default_state: str,
 ) -> dict:
     context = store.clone(dispatch_context) if isinstance(dispatch_context, dict) else {}
-    context["type"] = str(context.get("type") or default_type).strip() or default_type
+    context["type"] = (
+        _normalize_dispatch_context_type(str(context.get("type") or default_type).strip() or default_type)
+        or default_type
+    )
     context["state"] = str(context.get("state") or default_state).strip() or default_state
     context["queued_at"] = str(context.get("queued_at") or context.get("queuedAt") or created_at).strip()
     context["updated_at"] = str(context.get("updated_at") or context.get("updatedAt") or created_at).strip()
+    _normalize_dispatch_fallback_policy_mode_for_write(context)
     context["workflow_policy"] = _workflow_policy_from_workflow(workflow)
     return context
 
@@ -889,10 +973,35 @@ def _normalize_intent(value: str | None) -> str | None:
     return None
 
 
-def _find_enabled_agent_by_type(agent_type: str | None) -> dict | None:
+def _execution_route_seed(
+    *,
+    run: dict | None = None,
+    workflow: dict | None = None,
+    agent_type: str | None = None,
+) -> str | None:
+    parts = [
+        str((run or {}).get("id") or "").strip(),
+        str((run or {}).get("task_id") or "").strip(),
+        str((workflow or {}).get("id") or "").strip(),
+        str(agent_type or "").strip().lower(),
+    ]
+    items = [part for part in parts if part]
+    if not items:
+        return None
+    return ":".join(items)
+
+
+def _find_enabled_agent_by_type(agent_type: str | None, *, route_seed: str | None = None) -> dict | None:
     normalized_type = str(agent_type or "").strip().lower()
     if not normalized_type:
         return None
+
+    selected_external = external_agent_registry_service.select_agent(
+        agent_type=normalized_type,
+        route_seed=route_seed,
+    )
+    if selected_external is not None:
+        return selected_external
 
     candidates: list[dict] = []
     for agent in _load_agents_for_execution():
@@ -910,21 +1019,62 @@ def _find_enabled_agent_by_type(agent_type: str | None) -> dict | None:
         healthy.sort(key=routing_priority, reverse=True)
         return healthy[0]
 
-    degraded_fallback = [agent for agent in candidates if is_agent_routable(agent, include_degraded=True)]
-    if degraded_fallback:
-        degraded_fallback.sort(key=routing_priority, reverse=True)
-        return degraded_fallback[0]
+    degraded_candidates = [agent for agent in candidates if is_agent_routable(agent, include_degraded=True)]
+    if degraded_candidates:
+        degraded_candidates.sort(key=routing_priority, reverse=True)
+        return degraded_candidates[0]
     return None
 
 
-def resolve_direct_execution_agent(intent: str | None) -> dict | None:
+def resolve_agent_dispatch_execution_agent(intent: str | None, *, route_seed: str | None = None) -> dict | None:
     selected_agent_type = INTENT_AGENT_TYPE_MAP.get(_normalize_intent(intent))
     if not selected_agent_type:
         return None
-    return _find_enabled_agent_by_type(selected_agent_type)
+    return _find_enabled_agent_by_type(selected_agent_type, route_seed=route_seed)
 
 
-def _resolve_agent_binding(binding: str | None, *, expected_type: str | None) -> dict | None:
+def resolve_direct_execution_agent(intent: str | None, *, route_seed: str | None = None) -> dict | None:
+    # Compatibility wrapper for legacy callers.
+    return resolve_agent_dispatch_execution_agent(intent, route_seed=route_seed)
+
+
+def _normalize_dispatch_context_type(dispatch_type: str | None) -> str:
+    normalized = str(dispatch_type or "").strip().lower()
+    if normalized == LEGACY_DIRECT_AGENT_DISPATCH_TYPE:
+        return "agent_dispatch"
+    return normalized
+
+
+def _normalize_fallback_policy_mode(mode: str | None) -> str:
+    normalized = str(mode or "").strip().lower()
+    if normalized == LEGACY_DIRECT_AGENT_FALLBACK_MODE:
+        return "agent_dispatch_fallback"
+    return normalized
+
+
+def _normalize_fallback_policy_payload_mode_for_write(policy: object) -> None:
+    if not isinstance(policy, dict):
+        return
+    normalized_mode = _normalize_fallback_policy_mode(policy.get("mode"))
+    if normalized_mode:
+        policy["mode"] = normalized_mode
+
+
+def _normalize_dispatch_fallback_policy_mode_for_write(dispatch_context: dict) -> None:
+    _normalize_fallback_policy_payload_mode_for_write(dispatch_context.get("fallback_policy"))
+    route_decision = _dispatch_context_route_decision(dispatch_context)
+    if not isinstance(route_decision, dict):
+        return
+    _normalize_fallback_policy_payload_mode_for_write(route_decision.get("fallback_policy"))
+    _normalize_fallback_policy_payload_mode_for_write(route_decision.get("fallbackPolicy"))
+
+
+def _resolve_agent_binding(
+    binding: str | None,
+    *,
+    expected_type: str | None,
+    route_seed: str | None = None,
+) -> dict | None:
     normalized_binding = str(binding or "").strip()
     if not normalized_binding:
         return None
@@ -944,10 +1094,15 @@ def _resolve_agent_binding(binding: str | None, *, expected_type: str | None) ->
         return None
     if expected_type and binding_type != expected_type:
         return None
-    return _find_enabled_agent_by_type(binding_type)
+    return _find_enabled_agent_by_type(binding_type, route_seed=route_seed)
 
 
-def resolve_workflow_execution_agent(workflow: dict, intent: str | None) -> dict | None:
+def resolve_workflow_execution_agent(
+    workflow: dict,
+    intent: str | None,
+    *,
+    route_seed: str | None = None,
+) -> dict | None:
     selected_agent_type = INTENT_AGENT_TYPE_MAP.get(intent)
     if not selected_agent_type:
         return None
@@ -958,45 +1113,44 @@ def resolve_workflow_execution_agent(workflow: dict, intent: str | None) -> dict
         return _resolve_agent_binding(
             explicit_node_binding,
             expected_type=selected_agent_type,
+            route_seed=route_seed,
         )
 
     if selected_node is not None:
         node_agent = _find_enabled_agent_by_type(
-            _derive_agent_type(selected_node) or selected_agent_type
+            _derive_agent_type(selected_node) or selected_agent_type,
+            route_seed=route_seed,
         )
         if node_agent is not None:
             return node_agent
 
     for binding in workflow.get("agent_bindings") or []:
-        resolved = _resolve_agent_binding(str(binding), expected_type=selected_agent_type)
+        resolved = _resolve_agent_binding(
+            str(binding),
+            expected_type=selected_agent_type,
+            route_seed=route_seed,
+        )
         if resolved is not None:
             return resolved
 
-    return _find_enabled_agent_by_type(selected_agent_type)
+    return _find_enabled_agent_by_type(selected_agent_type, route_seed=route_seed)
 
 
-def _is_direct_agent_run(run: dict | None) -> bool:
+def _is_agent_dispatch_run(run: dict | None) -> bool:
     if not isinstance(run, dict):
         return False
-    return str(run.get("workflow_id") or "").strip() == DIRECT_AGENT_FALLBACK_WORKFLOW_ID
-
+    dispatch_context = _run_dispatch_context(run)
+    dispatch_type = _normalize_dispatch_context_type((dispatch_context or {}).get("type"))
+    if dispatch_type == "agent_dispatch":
+        return True
+    return str(run.get("workflow_id") or "").strip() in AGENT_DISPATCH_WORKFLOW_IDS
 
 def _run_dispatch_context(run: dict | None) -> dict | None:
-    if not isinstance(run, dict):
-        return None
-    context = run.get("dispatch_context")
-    if isinstance(context, dict):
-        return context
-    return None
+    return dispatch_context_from_run(run)
 
 
 def _dispatch_context_route_decision(dispatch_context: dict | None) -> dict | None:
-    if not isinstance(dispatch_context, dict):
-        return None
-    route_decision = dispatch_context.get("route_decision") or dispatch_context.get("routeDecision")
-    if isinstance(route_decision, dict):
-        return route_decision
-    return None
+    return route_decision_from_payload(dispatch_context)
 
 
 def _dispatch_context_execution_agent_id(dispatch_context: dict | None) -> str | None:
@@ -1029,6 +1183,11 @@ def _mark_dispatch_context_state(run: dict, state: str, **updates: object) -> No
     dispatch_context["updated_at"] = store.now_string()
     for key, value in updates.items():
         dispatch_context[key] = value
+    state_machine = dispatch_context.get("state_machine")
+    if not isinstance(state_machine, dict):
+        state_machine = {"version": "brain_fact_layer_v1"}
+        dispatch_context["state_machine"] = state_machine
+    state_machine["dispatch_state"] = state
 
 
 def _mark_dispatch_context_failure(
@@ -1049,6 +1208,412 @@ def _mark_dispatch_context_failure(
         failure_message=failure_message,
         **updates,
     )
+    _append_fallback_history(
+        run,
+        state=state,
+        failure_stage=failure_stage,
+        failure_message=failure_message,
+        failed_at=timestamp,
+    )
+
+
+def _dispatch_context_fallback_policy(dispatch_context: dict | None) -> dict:
+    if not isinstance(dispatch_context, dict):
+        return {}
+    policy = dispatch_context.get("fallback_policy")
+    if not isinstance(policy, dict):
+        policy = dispatch_context.get("fallbackPolicy")
+    if not isinstance(policy, dict):
+        route_decision = _dispatch_context_route_decision(dispatch_context)
+        if isinstance(route_decision, dict):
+            policy = route_decision.get("fallback_policy") or route_decision.get("fallbackPolicy")
+    return policy if isinstance(policy, dict) else {}
+
+
+def _classify_fallback_reason(*, state: str, failure_stage: str, failure_message: str) -> str:
+    normalized_message = str(failure_message or "").strip().lower()
+    if "timeout" in normalized_message or "超时" in normalized_message or state == "execution_timeout":
+        return "execution_timeout"
+    if "协议" in normalized_message or "protocol" in normalized_message:
+        return "protocol_error"
+    if "不可用" in normalized_message or "missing" in normalized_message or "缺少可用" in normalized_message:
+        return "executor_unavailable"
+    if "结果" in normalized_message and ("不合格" in normalized_message or "invalid" in normalized_message):
+        return "invalid_result"
+    if failure_stage == "dispatch":
+        return "dispatch_failure"
+    if failure_stage == "execution":
+        return "execution_failure"
+    if failure_stage == "outbound":
+        return "delivery_failure"
+    return "unknown_failure"
+
+
+def _resolved_fallback_action(*, fallback_policy: dict, reason: str) -> str:
+    mode = _normalize_fallback_policy_mode(fallback_policy.get("mode"))
+    on_failure = str(
+        fallback_policy.get("on_failure") or fallback_policy.get("onFailure") or ""
+    ).strip().lower()
+    if mode == "approval_gate":
+        return "human_handoff"
+    if mode == "planner_recovery":
+        return (
+            "planner_retry"
+            if reason in {"execution_timeout", "executor_unavailable", "dispatch_failure"}
+            else "planner_review"
+        )
+    if mode == "agent_dispatch_fallback":
+        return "reroute_agent_execution"
+    if on_failure == "retry_or_fail_terminal":
+        return "retry_or_fail_terminal"
+    if on_failure:
+        return on_failure
+    return "fail_terminal"
+
+
+def _state_machine_fallback_attempts(dispatch_context: dict | None) -> int:
+    if not isinstance(dispatch_context, dict):
+        return 0
+    state_machine = dispatch_context.get("state_machine")
+    if not isinstance(state_machine, dict):
+        return 0
+    try:
+        return max(int(state_machine.get("fallback_attempt_count") or 0), 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _increment_fallback_attempts(dispatch_context: dict | None) -> int:
+    if not isinstance(dispatch_context, dict):
+        return 0
+    state_machine = dispatch_context.setdefault("state_machine", {"version": "brain_fact_layer_v1"})
+    if not isinstance(state_machine, dict):
+        state_machine = {"version": "brain_fact_layer_v1"}
+        dispatch_context["state_machine"] = state_machine
+    attempts = _state_machine_fallback_attempts(dispatch_context) + 1
+    state_machine["fallback_attempt_count"] = attempts
+    return attempts
+
+
+def _should_auto_recover_fallback(*, fallback_policy: dict, reason: str, dispatch_context: dict | None) -> bool:
+    mode = _normalize_fallback_policy_mode(fallback_policy.get("mode"))
+    if mode not in AUTO_RECOVERY_FALLBACK_MODES:
+        return False
+    if reason not in {
+        "execution_timeout",
+        "executor_unavailable",
+        "dispatch_failure",
+        "protocol_error",
+        "invalid_result",
+    }:
+        return False
+    return _state_machine_fallback_attempts(dispatch_context) < 1
+
+
+def _append_fallback_step(task_id: str, *, message: str) -> None:
+    _append_step(
+        task_id=task_id,
+        title="主脑自动回退",
+        status="completed",
+        agent="Brain Fallback Controller",
+        message=message,
+        tokens=0,
+    )
+
+
+def _append_workflow_runtime_audit(
+    *,
+    run: dict,
+    task: dict | None,
+    action: str,
+    status_value: str,
+    details: str,
+    metadata: dict[str, object] | None = None,
+) -> None:
+    payload = {
+        "id": f"audit-workflow-{uuid4().hex[:10]}",
+        "timestamp": store.now_string(),
+        "action": action,
+        "user": str(
+            (task or {}).get("user_key")
+            or (task or {}).get("session_id")
+            or (task or {}).get("id")
+            or "system"
+        ),
+        "resource": f"workflow_run:{str(run.get('id') or '').strip() or 'unknown'}",
+        "status": status_value,
+        "ip": "-",
+        "details": details,
+    }
+    if metadata:
+        payload["metadata"] = store.clone(metadata)
+    store.audit_logs.insert(0, store.clone(payload))
+    del store.audit_logs[200:]
+    persistence_service.append_audit_log(log=payload)
+    trace_exporter_service.export_audit_event(payload)
+
+
+def _is_valid_task_result_payload(task_result: object) -> bool:
+    if not isinstance(task_result, dict):
+        return False
+    result_kind = str(task_result.get("kind") or "").strip()
+    if not result_kind:
+        return False
+    for key in ("title", "summary", "content", "text"):
+        if str(task_result.get(key) or "").strip():
+            return True
+    bullets = task_result.get("bullets")
+    if isinstance(bullets, list) and any(str(item or "").strip() for item in bullets):
+        return True
+    return False
+
+
+def _normalize_agent_execution_failure_message(exc: Exception) -> str:
+    message = str(exc or "").strip() or "Agent 执行失败"
+    if "protocol" in message.lower() or "协议" in message:
+        return f"Agent 执行协议错误：{message}"
+    return message
+
+
+def _attempt_fallback_recovery_locked(
+    *,
+    task: dict | None,
+    run: dict,
+    failure_stage: str,
+    failure_message: str,
+    state: str,
+    recovery_trigger: str,
+) -> dict | None:
+    if task is None:
+        return None
+    dispatch_context = _run_dispatch_context(run)
+    fallback_policy = _dispatch_context_fallback_policy(dispatch_context)
+    mode = _normalize_fallback_policy_mode(fallback_policy.get("mode"))
+    reason = _classify_fallback_reason(
+        state=state,
+        failure_stage=failure_stage,
+        failure_message=failure_message,
+    )
+    if mode == "approval_gate":
+        return _enter_manual_handoff_locked(
+            task=task,
+            run=run,
+            failure_stage=failure_stage,
+            failure_message=failure_message,
+            state=state,
+            reason=reason,
+            handoff_source="fallback_policy",
+            operator="Brain Fallback Controller",
+        )
+    if not _should_auto_recover_fallback(
+        fallback_policy=fallback_policy,
+        reason=reason,
+        dispatch_context=dispatch_context,
+    ):
+        return None
+
+    attempts = _increment_fallback_attempts(dispatch_context)
+    timestamp = store.now_string()
+    _append_fallback_history(
+        run,
+        state=state,
+        failure_stage=failure_stage,
+        failure_message=failure_message,
+        failed_at=timestamp,
+    )
+    recovery_action = _resolved_fallback_action(
+        fallback_policy=fallback_policy,
+        reason=reason,
+    )
+    _append_fallback_step(
+        str(task.get("id") or ""),
+        message=(
+            f"检测到{reason}，已按策略执行自动回退；"
+            f"action={recovery_action}；attempt={attempts}"
+        ),
+    )
+    restarted_run = restart_workflow_run_for_task(
+        task,
+        intent=run.get("intent"),
+        trigger=recovery_trigger,
+    )
+    restarted_run = _find_run(str(restarted_run.get("id") or ""))
+    restarted_context = _run_dispatch_context(restarted_run)
+    if isinstance(restarted_context, dict):
+        restarted_context["fallback_recovery_state"] = "scheduled"
+        restarted_context["fallback_recovery_reason"] = reason
+        restarted_context["fallback_recovery_action"] = recovery_action
+        restarted_context["fallback_recovery_at"] = timestamp
+        restarted_context["updated_at"] = timestamp
+    restarted_run = _refresh_run_state(restarted_run, task)
+    _publish_run_event(restarted_run, "workflow_run.updated")
+    _persist_execution_state(
+        task=task,
+        steps=_ensure_task_steps_loaded(str(task.get("id") or "")),
+        run=restarted_run,
+    )
+    _schedule_retry_follow_up(restarted_run["id"])
+    return restarted_run
+
+
+def _enter_manual_handoff_locked(
+    *,
+    task: dict,
+    run: dict,
+    failure_stage: str,
+    failure_message: str,
+    state: str,
+    reason: str | None = None,
+    handoff_source: str,
+    operator: str | None = None,
+    note: str | None = None,
+) -> dict:
+    timestamp = store.now_string()
+    steps = _ensure_task_steps_loaded(str(task.get("id") or ""))
+    dispatch_context = _run_dispatch_context(run)
+    fallback_policy = _dispatch_context_fallback_policy(dispatch_context)
+    resolved_reason = reason or _classify_fallback_reason(
+        state=state,
+        failure_stage=failure_stage,
+        failure_message=failure_message,
+    )
+    resolved_action = _resolved_fallback_action(
+        fallback_policy=fallback_policy,
+        reason=resolved_reason,
+    )
+    running_step = next(
+        (step for step in reversed(steps) if step.get("status") == "running"),
+        None,
+    )
+    handoff_message = note or failure_message or "任务已转入人工接管，等待人工确认"
+    if running_step is not None:
+        running_step["status"] = "failed"
+        running_step["finished_at"] = timestamp
+        running_step["message"] = handoff_message
+    else:
+        _append_step(
+            task_id=str(task.get("id") or ""),
+            title="人工接管",
+            status="failed",
+            agent="Brain Manual Handoff Controller",
+            message=handoff_message,
+            tokens=0,
+        )
+    _append_fallback_step(
+        str(task.get("id") or ""),
+        message=(
+            f"检测到{resolved_reason}，已转入人工接管；"
+            f"action={resolved_action}；source={handoff_source}"
+        ),
+    )
+
+    task["status"] = "failed"
+    task["completed_at"] = timestamp
+    task["duration"] = task.get("duration") or "等待人工接管"
+    task["result"] = None
+
+    route_decision = _dispatch_context_route_decision(dispatch_context)
+    if isinstance(route_decision, dict):
+        route_decision["approval_required"] = True
+        route_decision["requires_approval"] = True
+        route_decision["approval_status"] = "pending_manual_handoff"
+
+    _mark_dispatch_context_state(
+        run,
+        "manual_handoff_required",
+        failed_at=timestamp,
+        failure_stage=failure_stage,
+        failure_message=failure_message,
+        fallback_recovery_state="handoff_required",
+        fallback_recovery_reason=resolved_reason,
+        fallback_recovery_action=resolved_action,
+        fallback_recovery_at=timestamp,
+        manual_handoff_required_at=timestamp,
+        manual_handoff_source=handoff_source,
+        manual_handoff_operator=str(operator or "").strip() or None,
+        manual_handoff_note=str(note or "").strip() or None,
+        approval_status="pending_manual_handoff",
+    )
+    _append_fallback_history(
+        run,
+        state=state,
+        failure_stage=failure_stage,
+        failure_message=failure_message,
+        failed_at=timestamp,
+    )
+    _append_workflow_runtime_audit(
+        run=run,
+        task=task,
+        action="workflow.manual_handoff",
+        status_value="warning",
+        details=(
+            f"run={run.get('id')}; task={task.get('id')}; reason={resolved_reason}; "
+            f"source={handoff_source}; note={str(note or '').strip() or '-'}"
+        ),
+        metadata={
+            "workflow_run_id": str(run.get("id") or ""),
+            "task_id": str(task.get("id") or ""),
+            "reason": resolved_reason,
+            "failure_stage": failure_stage,
+            "handoff_source": handoff_source,
+            "operator": str(operator or "").strip() or None,
+            "action": resolved_action,
+        },
+    )
+
+    try:
+        refreshed_run = _refresh_run_state(run, task)
+    except HTTPException as exc:
+        if not _is_workflow_not_found(exc):
+            raise
+        refreshed_run = _refresh_run_state_without_workflow(run, task)
+    _publish_run_event(refreshed_run, "workflow_run.updated")
+    _persist_execution_state(task=task, steps=steps, run=refreshed_run)
+    _cancel_scheduled_run(refreshed_run["id"])
+    return refreshed_run
+
+
+def _append_fallback_history(
+    run: dict,
+    *,
+    state: str,
+    failure_stage: str,
+    failure_message: str,
+    failed_at: str,
+) -> None:
+    dispatch_context = _run_dispatch_context(run)
+    if dispatch_context is None:
+        return
+    fallback_policy = _dispatch_context_fallback_policy(dispatch_context)
+    reason = _classify_fallback_reason(
+        state=state,
+        failure_stage=failure_stage,
+        failure_message=failure_message,
+    )
+    history = dispatch_context.setdefault("fallback_history", [])
+    if not isinstance(history, list):
+        history = []
+        dispatch_context["fallback_history"] = history
+    history.append(
+        {
+            "id": f"fallback-{uuid4().hex[:10]}",
+            "timestamp": failed_at,
+            "state": state,
+            "failure_stage": failure_stage,
+            "reason": reason,
+            "message": failure_message,
+            "policy_mode": str(fallback_policy.get("mode") or "").strip() or None,
+            "policy_target": str(fallback_policy.get("target") or "").strip() or None,
+            "resolved_action": _resolved_fallback_action(
+                fallback_policy=fallback_policy,
+                reason=reason,
+            ),
+        }
+    )
+    state_machine = dispatch_context.setdefault("state_machine", {"version": "brain_fact_layer_v1"})
+    if isinstance(state_machine, dict):
+        state_machine["last_fallback_reason"] = reason
+        state_machine["last_fallback_at"] = failed_at
 
 
 def _record_delivery_state(run: dict, delivery: dict | None, *, preserve_failure: bool = True) -> None:
@@ -1076,6 +1641,96 @@ def _record_delivery_state(run: dict, delivery: dict | None, *, preserve_failure
         dispatch_context.pop("delivery_failed_at", None)
 
 
+def _mask_delivery_target(value: str | None) -> str | None:
+    normalized = str(value or "").strip()
+    if not normalized:
+        return None
+    if len(normalized) <= 8:
+        return "*" * len(normalized)
+    return f"{normalized[:3]}***{normalized[-4:]}"
+
+
+def _delivery_target_type(*, run: dict, channel: str, target_id: str | None) -> str | None:
+    dispatch_context = _run_dispatch_context(run)
+    channel_delivery = None
+    if isinstance(dispatch_context, dict):
+        candidate = dispatch_context.get("channel_delivery") or dispatch_context.get("channelDelivery")
+        if isinstance(candidate, dict):
+            channel_delivery = candidate
+    if isinstance(channel_delivery, dict):
+        target_type = str(
+            channel_delivery.get("target_type")
+            or channel_delivery.get("targetType")
+            or ""
+        ).strip()
+        if target_type:
+            return target_type
+        if channel == "dingtalk" and str(channel_delivery.get("session_webhook") or channel_delivery.get("sessionWebhook") or "").strip():
+            return "session_webhook"
+        if channel == "dingtalk" and str(channel_delivery.get("platform_user_id") or channel_delivery.get("platformUserId") or "").strip():
+            return "openapi_user"
+    if target_id:
+        return "chat_id" if channel == "telegram" else "session_id"
+    return None
+
+
+def _delivery_result_title(task_result: dict | None) -> str | None:
+    if not isinstance(task_result, dict):
+        return None
+    for key in ("title", "text", "summary", "content"):
+        value = str(task_result.get(key) or "").strip()
+        if value:
+            return value[:120]
+    return None
+
+
+def _build_delivery_fact_context(
+    *,
+    task: dict,
+    run: dict,
+    delivery: dict | None,
+    task_result: dict | None = None,
+) -> dict[str, object]:
+    manager_packet = task.get("manager_packet") if isinstance(task.get("manager_packet"), dict) else {}
+    dispatch_context = _run_dispatch_context(run)
+    if not isinstance(dispatch_context, dict):
+        dispatch_context = {}
+    channel = str(task.get("channel") or dispatch_context.get("channel") or "").strip() or None
+    target_id = None
+    if channel:
+        try:
+            target_id = channel_outbound_service._resolve_target_id(task, run=run, channel=channel)
+        except Exception:
+            target_id = None
+    if not target_id:
+        if channel == "telegram":
+            target_id = (
+                str(dispatch_context.get("chat_id") or dispatch_context.get("chatId") or "").strip()
+                or str(task.get("session_id") or "").strip().removeprefix("telegram:")
+                or str(task.get("user_key") or "").strip().removeprefix("telegram:")
+                or None
+            )
+        elif channel:
+            target_id = (
+                str(task.get("session_id") or "").strip()
+                or str(dispatch_context.get("session_id") or dispatch_context.get("sessionId") or "").strip()
+                or str(dispatch_context.get("chat_id") or dispatch_context.get("chatId") or "").strip()
+                or None
+            )
+    status_value = str((delivery or {}).get("status") or "").strip().lower() or None
+    return {
+        "delivery_mode": str(manager_packet.get("delivery_mode") or manager_packet.get("deliveryMode") or "").strip() or None,
+        "response_contract": str(manager_packet.get("response_contract") or manager_packet.get("responseContract") or "").strip() or None,
+        "channel": channel,
+        "target_type": _delivery_target_type(run=run, channel=channel or "", target_id=target_id),
+        "target_present": bool(target_id),
+        "target_ref": _mask_delivery_target(target_id),
+        "result_kind": str((task_result or {}).get("kind") or dispatch_context.get("result_kind") or "").strip() or None,
+        "result_title": _delivery_result_title(task_result),
+        "fallback_delivery": status_value in {"failed", "skipped"},
+    }
+
+
 def _requeue_dispatch_context(run: dict, *, queued_at: str | None = None) -> None:
     dispatch_context = _run_dispatch_context(run)
     if dispatch_context is None:
@@ -1093,6 +1748,7 @@ def _requeue_dispatch_context(run: dict, *, queued_at: str | None = None) -> Non
         "delivery_completed_at",
         "delivery_failed_at",
         "result_kind",
+        "delivery_fact_context",
     ):
         dispatch_context.pop(key, None)
     dispatch_context["execution_agent_id"] = None
@@ -1160,6 +1816,16 @@ def _apply_context_patch_to_dispatch_context(
     dispatch_context["last_context_patch_preview"] = (
         _truncate_text(message_text, CONTEXT_PATCH_PREVIEW_LIMIT) or None
     )
+    audit_items = dispatch_context.setdefault("context_patch_audit", [])
+    if isinstance(audit_items, list):
+        audit_items.append(
+            {
+                "patched_at": timestamp,
+                "trace_id": str(trace_id or "").strip() or None,
+                "message_preview": _truncate_text(message_text, CONTEXT_PATCH_PREVIEW_LIMIT) or None,
+                "state_before": _dispatch_context_state(dispatch_context),
+            }
+        )
 
     current_state = _dispatch_context_state(dispatch_context)
     should_requeue = current_state in {"failed"}
@@ -1194,14 +1860,25 @@ def _resolve_dispatch_execution_agent(
     dispatch_context = _run_dispatch_context(run)
     execution_agent_id = _dispatch_context_execution_agent_id(dispatch_context)
     selected_agent_type = INTENT_AGENT_TYPE_MAP.get(intent)
+    route_seed = _execution_route_seed(run=run, workflow=workflow, agent_type=selected_agent_type)
     if execution_agent_id:
         resolved = _resolve_agent_binding(
             execution_agent_id,
             expected_type=selected_agent_type,
+            route_seed=route_seed,
         )
         if resolved is not None:
             return resolved
-    return resolve_workflow_execution_agent(workflow, intent)
+    try:
+        return resolve_workflow_execution_agent(
+            workflow,
+            intent,
+            route_seed=route_seed,
+        )
+    except TypeError as exc:
+        if "route_seed" not in str(exc):
+            raise
+        return resolve_workflow_execution_agent(workflow, intent)
 
 
 def _workflow_has_execution_target(
@@ -1362,6 +2039,208 @@ def _parse_datetime(value: str | None) -> datetime | None:
     if parsed.tzinfo is None:
         return parsed.replace(tzinfo=UTC)
     return parsed
+
+
+def _duration_ms_between(started_at: str | None, finished_at: str | None) -> int | None:
+    started = _parse_datetime(started_at)
+    finished = _parse_datetime(finished_at)
+    if started is None or finished is None:
+        return None
+    duration_ms = round((finished - started).total_seconds() * 1000)
+    return max(duration_ms, 0)
+
+
+def _step_duration_ms(step: dict | None) -> int:
+    if not isinstance(step, dict):
+        return 0
+    duration_ms = _duration_ms_between(step.get("started_at"), step.get("finished_at"))
+    if duration_ms is None:
+        return 0
+    return duration_ms
+
+
+def _normalize_run_metrics_payload(payload: dict | None) -> dict:
+    metrics = payload if isinstance(payload, dict) else {}
+    tokens_total = 0
+    duration_ms = metrics.get("duration_ms")
+    step_count = 0
+    for field in ("tokens_total", "step_count"):
+        try:
+            metrics[field] = max(int(metrics.get(field) or 0), 0)
+        except (TypeError, ValueError):
+            metrics[field] = 0
+    tokens_total = metrics["tokens_total"]
+    step_count = metrics["step_count"]
+    try:
+        normalized_duration_ms = max(int(duration_ms), 0) if duration_ms is not None else None
+    except (TypeError, ValueError):
+        normalized_duration_ms = None
+
+    return {
+        "tokens_total": tokens_total,
+        "duration_ms": normalized_duration_ms,
+        "step_count": step_count,
+        "execution_agent_id": str(metrics.get("execution_agent_id") or "").strip() or None,
+        "execution_agent": str(metrics.get("execution_agent") or "").strip() or None,
+        "agent_started_at": str(metrics.get("agent_started_at") or "").strip() or None,
+        "agent_finished_at": str(metrics.get("agent_finished_at") or "").strip() or None,
+    }
+
+
+def _run_metrics_from_dispatch_context(run: dict | None) -> dict | None:
+    dispatch_context = _run_dispatch_context(run)
+    if not isinstance(dispatch_context, dict):
+        return None
+    return _normalize_run_metrics_payload(dispatch_context.get("run_metrics"))
+
+
+def _apply_stored_run_metrics(run: dict) -> dict:
+    metrics = _run_metrics_from_dispatch_context(run)
+    if metrics is None:
+        metrics = _normalize_run_metrics_payload(None)
+    run["metrics"] = store.clone(metrics)
+    run["tokens_total"] = metrics["tokens_total"]
+    run["duration_ms"] = metrics["duration_ms"]
+    run["step_count"] = metrics["step_count"]
+    run["execution_agent_id"] = metrics["execution_agent_id"]
+    run["execution_agent"] = metrics["execution_agent"]
+    run["agent_started_at"] = metrics["agent_started_at"]
+    run["agent_finished_at"] = metrics["agent_finished_at"]
+    return run
+
+
+def _compute_run_metrics(*, run: dict, task: dict, steps: list[dict]) -> dict:
+    dispatch_context = _run_dispatch_context(run)
+    execution_agent_id = None
+    execution_agent = None
+    if isinstance(dispatch_context, dict):
+        execution_agent_id = str(dispatch_context.get("execution_agent_id") or "").strip() or None
+        execution_agent = str(dispatch_context.get("execution_agent") or "").strip() or None
+
+    execution_steps = [
+        step
+        for step in steps
+        if str(step.get("agent") or "").strip() not in {"安全Agent", "意图识别Agent", "输出Agent"}
+    ]
+    primary_execution_step = execution_steps[-1] if execution_steps else None
+
+    agent_started_at = None
+    agent_finished_at = None
+    if isinstance(primary_execution_step, dict):
+        agent_started_at = str(primary_execution_step.get("started_at") or "").strip() or None
+        agent_finished_at = str(primary_execution_step.get("finished_at") or "").strip() or None
+        if execution_agent is None:
+            execution_agent = str(primary_execution_step.get("agent") or "").strip() or None
+
+    duration_ms = _duration_ms_between(run.get("started_at"), task.get("completed_at") or run.get("completed_at"))
+    if duration_ms is None:
+        duration_ms = sum(_step_duration_ms(step) for step in steps)
+        if duration_ms <= 0:
+            duration_ms = None
+
+    return _normalize_run_metrics_payload(
+        {
+            "tokens_total": sum(max(int(step.get("tokens") or 0), 0) for step in steps),
+            "duration_ms": duration_ms,
+            "step_count": len(steps),
+            "execution_agent_id": execution_agent_id,
+            "execution_agent": execution_agent,
+            "agent_started_at": agent_started_at,
+            "agent_finished_at": agent_finished_at,
+        }
+    )
+
+
+def _sync_run_metrics(run: dict, task: dict, steps: list[dict]) -> dict:
+    metrics = _compute_run_metrics(run=run, task=task, steps=steps)
+    dispatch_context = _run_dispatch_context(run)
+    if isinstance(dispatch_context, dict):
+        dispatch_context["run_metrics"] = store.clone(metrics)
+
+    _apply_stored_run_metrics(run)
+    return metrics
+
+
+def _build_brain_fact_snapshot(*, run: dict, task: dict, steps: list[dict]) -> dict:
+    dispatch_context = _run_dispatch_context(run) or {}
+    route_decision = _dispatch_context_route_decision(dispatch_context) or {}
+    manager_packet = dispatch_context.get("manager_packet")
+    if not isinstance(manager_packet, dict):
+        manager_packet = task.get("manager_packet") if isinstance(task.get("manager_packet"), dict) else {}
+    brain_dispatch_summary = dispatch_context.get("brain_dispatch_summary")
+    if not isinstance(brain_dispatch_summary, dict):
+        brain_dispatch_summary = (
+            task.get("brain_dispatch_summary")
+            if isinstance(task.get("brain_dispatch_summary"), dict)
+            else {}
+        )
+    fallback_history = dispatch_context.get("fallback_history")
+    if not isinstance(fallback_history, list):
+        fallback_history = []
+    run_metrics = _run_metrics_from_dispatch_context(run) or _compute_run_metrics(run=run, task=task, steps=steps)
+    delivery_fact_context = dispatch_context.get("delivery_fact_context")
+    if not isinstance(delivery_fact_context, dict):
+        delivery_fact_context = {}
+    return {
+        "version": "brain_fact.v1",
+        "routing_fact": {
+            "intent": str(run.get("intent") or route_decision.get("intent") or "").strip() or None,
+            "workflow_id": str(run.get("workflow_id") or route_decision.get("workflow_id") or route_decision.get("workflowId") or "").strip() or None,
+            "workflow_name": str(run.get("workflow_name") or route_decision.get("workflow_name") or route_decision.get("workflowName") or "").strip() or None,
+            "interaction_mode": str(route_decision.get("interaction_mode") or route_decision.get("interactionMode") or "").strip() or None,
+            "workflow_mode": str(route_decision.get("workflow_mode") or route_decision.get("workflowMode") or "").strip() or None,
+            "execution_agent_id": str(dispatch_context.get("execution_agent_id") or route_decision.get("execution_agent_id") or route_decision.get("executionAgentId") or "").strip() or None,
+            "execution_agent": str(dispatch_context.get("execution_agent") or route_decision.get("execution_agent") or route_decision.get("executionAgent") or "").strip() or None,
+            "approval_required": bool(
+                route_decision.get("approval_required")
+                if isinstance(route_decision.get("approval_required"), bool)
+                else route_decision.get("approvalRequired")
+            ),
+            "approval_status": str(route_decision.get("approval_status") or route_decision.get("approvalStatus") or "").strip() or None,
+            "route_reason_summary": str(brain_dispatch_summary.get("route_reason_summary") or brain_dispatch_summary.get("routeReasonSummary") or "").strip() or None,
+        },
+        "manager_fact": {
+            "manager_action": str(manager_packet.get("manager_action") or manager_packet.get("managerAction") or "").strip() or None,
+            "next_owner": str(manager_packet.get("next_owner") or manager_packet.get("nextOwner") or "").strip() or None,
+            "delivery_mode": str(manager_packet.get("delivery_mode") or manager_packet.get("deliveryMode") or "").strip() or None,
+            "response_contract": str(manager_packet.get("response_contract") or manager_packet.get("responseContract") or "").strip() or None,
+            "session_state": str(manager_packet.get("session_state") or manager_packet.get("sessionState") or "").strip() or None,
+        },
+        "fallback_fact": {
+            "count": len(fallback_history),
+            "last_reason": str((fallback_history[-1] or {}).get("reason") or "").strip() or None if fallback_history else None,
+            "last_failure_stage": str((fallback_history[-1] or {}).get("failure_stage") or "").strip() or None if fallback_history else None,
+            "recovery_action": str(dispatch_context.get("fallback_recovery_action") or "").strip() or None,
+            "manual_handoff_required": str(dispatch_context.get("state") or "").strip() == "manual_handoff_required",
+        },
+        "delivery_fact": {
+            "delivery_mode": str(delivery_fact_context.get("delivery_mode") or manager_packet.get("delivery_mode") or manager_packet.get("deliveryMode") or "").strip() or None,
+            "response_contract": str(delivery_fact_context.get("response_contract") or manager_packet.get("response_contract") or manager_packet.get("responseContract") or "").strip() or None,
+            "channel": str(delivery_fact_context.get("channel") or task.get("channel") or dispatch_context.get("channel") or "").strip() or None,
+            "target_type": str(delivery_fact_context.get("target_type") or "").strip() or None,
+            "target_present": bool(delivery_fact_context.get("target_present")),
+            "target_ref": str(delivery_fact_context.get("target_ref") or "").strip() or None,
+            "delivery_status": str(dispatch_context.get("delivery_status") or "").strip() or None,
+            "delivery_message": str(dispatch_context.get("delivery_message") or "").strip() or None,
+            "delivery_completed_at": str(dispatch_context.get("delivery_completed_at") or "").strip() or None,
+            "delivery_failed_at": str(dispatch_context.get("delivery_failed_at") or "").strip() or None,
+            "result_kind": str(delivery_fact_context.get("result_kind") or dispatch_context.get("result_kind") or "").strip() or None,
+            "result_title": str(delivery_fact_context.get("result_title") or "").strip() or None,
+            "fallback_delivery": bool(delivery_fact_context.get("fallback_delivery")),
+        },
+        "execution_fact": {
+            "status": str(task.get("status") or "").strip() or None,
+            "tokens_total": int(run_metrics.get("tokens_total") or 0),
+            "duration_ms": run_metrics.get("duration_ms"),
+            "step_count": int(run_metrics.get("step_count") or 0),
+            "current_stage": str(run.get("current_stage") or "").strip() or None,
+        },
+        "state_fact": {
+            "dispatch_state": str(dispatch_context.get("state") or "").strip() or None,
+            "task_status": str(task.get("status") or "").strip() or None,
+            "updated_at": str(run.get("updated_at") or store.now_string()),
+        },
+    }
 
 
 def _node_issue_sort_key(issue: dict) -> datetime:
@@ -1979,11 +2858,27 @@ def _refresh_run_state_without_workflow(run: dict, task: dict) -> dict:
     run["active_edges"] = []
     run["current_stage"] = _current_stage(task, [])
     run["logs"] = _build_logs(task, run, steps)
+    dispatch_context = _run_dispatch_context(run)
+    if isinstance(dispatch_context, dict):
+        state_machine = dispatch_context.setdefault("state_machine", {"version": "brain_fact_layer_v1"})
+        state_machine["dispatch_state"] = str(dispatch_context.get("state") or "").strip() or None
+        state_machine["task_status"] = str(task.get("status") or "").strip() or None
+        state_machine["session_state"] = str((task.get("manager_packet") or {}).get("session_state") or "").strip() or None
+    task["state_machine"] = {
+        "version": "brain_fact_layer_v1",
+        "dispatch_state": str((dispatch_context or {}).get("state") or "").strip() or None,
+        "task_status": str(task.get("status") or "").strip() or None,
+        "session_state": str((task.get("manager_packet") or {}).get("session_state") or "").strip() or None,
+    }
+    _sync_run_metrics(run, task, steps)
+    task["brain_fact_snapshot"] = _build_brain_fact_snapshot(run=run, task=task, steps=steps)
+    if isinstance(dispatch_context, dict):
+        dispatch_context["brain_fact_snapshot"] = store.clone(task["brain_fact_snapshot"])
     return store.clone(run)
 
 
 def _refresh_run_state(run: dict, task: dict) -> dict:
-    if _is_direct_agent_run(run):
+    if _is_agent_dispatch_run(run):
         return _refresh_run_state_without_workflow(run, task)
     workflow = _find_workflow(run["workflow_id"])
     steps = store.clone(_ensure_task_steps_loaded(task["id"]))
@@ -2000,6 +2895,22 @@ def _refresh_run_state(run: dict, task: dict) -> dict:
     run["active_edges"] = _build_active_edges(workflow, nodes)
     run["current_stage"] = _current_stage(task, nodes)
     run["logs"] = _build_logs(task, run, steps)
+    dispatch_context = _run_dispatch_context(run)
+    if isinstance(dispatch_context, dict):
+        state_machine = dispatch_context.setdefault("state_machine", {"version": "brain_fact_layer_v1"})
+        state_machine["dispatch_state"] = str(dispatch_context.get("state") or "").strip() or None
+        state_machine["task_status"] = str(task.get("status") or "").strip() or None
+        state_machine["session_state"] = str((task.get("manager_packet") or {}).get("session_state") or "").strip() or None
+    task["state_machine"] = {
+        "version": "brain_fact_layer_v1",
+        "dispatch_state": str((dispatch_context or {}).get("state") or "").strip() or None,
+        "task_status": str(task.get("status") or "").strip() or None,
+        "session_state": str((task.get("manager_packet") or {}).get("session_state") or "").strip() or None,
+    }
+    _sync_run_metrics(run, task, steps)
+    task["brain_fact_snapshot"] = _build_brain_fact_snapshot(run=run, task=task, steps=steps)
+    if isinstance(dispatch_context, dict):
+        dispatch_context["brain_fact_snapshot"] = store.clone(task["brain_fact_snapshot"])
     return store.clone(run)
 
 
@@ -2673,6 +3584,13 @@ def create_workflow_run_for_task(
         "memory_hits": memory_hits,
         "warnings": list(warnings),
     }
+    run_dispatch_context["run_metrics"] = _normalize_run_metrics_payload(
+        {
+            "tokens_total": 0,
+            "duration_ms": None,
+            "step_count": len(store.task_steps.get(str(task.get("id") or ""), [])),
+        }
+    )
     store.workflow_runs.insert(0, run)
     task["workflow_id"] = workflow["id"]
     task["workflow_run_id"] = run["id"]
@@ -2683,12 +3601,12 @@ def create_workflow_run_for_task(
         steps=store.task_steps.get(str(task.get("id") or ""), []),
         run=refreshed_run,
     )
-    if task["status"] in {"pending", "running"}:
+    if task["status"] in {"pending", "running"} and not _task_confirmation_pending(task):
         _schedule_message_auto_progress(refreshed_run["id"])
     return refreshed_run
 
 
-def create_direct_agent_run_for_task(
+def create_agent_dispatch_run_for_task(
     *,
     task: dict,
     intent: str,
@@ -2702,13 +3620,13 @@ def create_direct_agent_run_for_task(
         dispatch_context=dispatch_context,
         workflow=None,
         created_at=created_at,
-        default_type="direct_agent_dispatch",
+        default_type="agent_dispatch",
         default_state="agent_queued",
     )
     run = {
         "id": f"run-{uuid4().hex[:10]}",
-        "workflow_id": DIRECT_AGENT_FALLBACK_WORKFLOW_ID,
-        "workflow_name": DIRECT_AGENT_FALLBACK_WORKFLOW_NAME,
+        "workflow_id": AGENT_DISPATCH_WORKFLOW_ID,
+        "workflow_name": AGENT_DISPATCH_WORKFLOW_NAME,
         "task_id": task["id"],
         "trigger": trigger,
         "intent": intent,
@@ -2728,8 +3646,15 @@ def create_direct_agent_run_for_task(
         "memory_hits": memory_hits,
         "warnings": list(warnings),
     }
+    run_dispatch_context["run_metrics"] = _normalize_run_metrics_payload(
+        {
+            "tokens_total": 0,
+            "duration_ms": None,
+            "step_count": len(store.task_steps.get(str(task.get("id") or ""), [])),
+        }
+    )
     store.workflow_runs.insert(0, run)
-    task["workflow_id"] = DIRECT_AGENT_FALLBACK_WORKFLOW_ID
+    task["workflow_id"] = AGENT_DISPATCH_WORKFLOW_ID
     task["workflow_run_id"] = run["id"]
     refreshed_run = _refresh_run_state_without_workflow(run, task)
     _publish_run_event(refreshed_run, "workflow_run.created")
@@ -2739,6 +3664,33 @@ def create_direct_agent_run_for_task(
         run=refreshed_run,
     )
     return refreshed_run
+
+
+def _execute_agent_task_with_locked_failures(
+    *,
+    task: dict,
+    run: dict,
+    execution_agent: dict,
+) -> tuple[dict | None, dict | None]:
+    try:
+        task_result = agent_execution_service.execute_task(
+            task=task,
+            run=run,
+            execution_agent=execution_agent,
+        )
+    except Exception as exc:
+        return None, _fail_workflow_run_due_agent_execution_error_locked(
+            run,
+            task,
+            failure_message=_normalize_agent_execution_failure_message(exc),
+        )
+    if not _is_valid_task_result_payload(task_result):
+        return None, _fail_workflow_run_due_agent_execution_error_locked(
+            run,
+            task,
+            failure_message="Agent 执行结果不合格，主脑已拒收并准备回退",
+        )
+    return task_result, None
 
 
 def _trigger_display_name(trigger: str) -> str:
@@ -2891,30 +3843,42 @@ def create_manual_workflow_run(
     }
 
 
-def list_workflow_runs(workflow_id: str | None = None, task_id: str | None = None) -> dict:
+def list_workflow_runs(
+    workflow_id: str | None = None,
+    task_id: str | None = None,
+    *,
+    scope: dict[str, str] | None = None,
+) -> dict:
     database_runs = persistence_service.list_workflow_runs(workflow_id=workflow_id, task_id=task_id)
     if database_runs is not None:
-        items = database_runs
+        items = [_apply_stored_run_metrics(store.clone(item)) for item in database_runs]
     elif getattr(persistence_service, "enabled", False):
         items = []
     else:
-        items = store.clone(store.workflow_runs)
+        items = [_apply_stored_run_metrics(store.clone(item)) for item in store.workflow_runs]
         if workflow_id:
             items = [item for item in items if item["workflow_id"] == workflow_id]
         if task_id:
             items = [item for item in items if item.get("task_id") == task_id]
-    return {"items": items, "total": len(items)}
+    scoped_items = [attach_scope(item) for item in items]
+    if scope is not None:
+        scoped_items = [item for item in scoped_items if matches_scope(item, scope)]
+    return {"items": scoped_items, "total": len(scoped_items)}
 
 
-def get_workflow_run(run_id: str) -> dict:
+def get_workflow_run(run_id: str, *, scope: dict[str, str] | None = None) -> dict:
     run = _find_run(run_id)
     task = _find_task(run.get("task_id"))
     task_id = str(run.get("task_id") or "").strip()
     if task_id:
         _refresh_task_steps_from_database(task_id)
     if task:
-        return _refresh_run_state(run, task)
-    return store.clone(run)
+        payload = attach_scope(_refresh_run_state(run, task))
+    else:
+        payload = attach_scope(_apply_stored_run_metrics(store.clone(run)))
+    if scope is not None and not matches_scope(payload, scope):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Workflow run not found")
+    return payload
 
 
 def append_context_patch_to_run(run_id: str, message_text: str, trace_id: str) -> dict:
@@ -2963,7 +3927,7 @@ def sync_workflow_run_from_task(task: dict) -> dict | None:
         steps=_ensure_task_steps_loaded(task["id"]),
         run=refreshed_run,
     )
-    if task["status"] in {"pending", "running"}:
+    if task["status"] in {"pending", "running"} and not _task_confirmation_pending(task):
         _schedule_follow_up(refreshed_run["id"])
     else:
         _cancel_scheduled_run(refreshed_run["id"])
@@ -3007,6 +3971,17 @@ def fail_workflow_run_due_dispatch_failure(run_id: str, *, failure_message: str)
                 run=refreshed_run,
             )
             return refreshed_run
+
+        recovered_run = _attempt_fallback_recovery_locked(
+            task=task,
+            run=run,
+            failure_stage="dispatch",
+            failure_message=failure_message,
+            state="failed",
+            recovery_trigger="fallback.dispatch_failure",
+        )
+        if recovered_run is not None:
+            return recovered_run
 
         steps = _ensure_task_steps_loaded(task["id"])
         running_step = next(
@@ -3056,6 +4031,16 @@ def fail_workflow_run_due_execution_timeout(run_id: str, *, failure_message: str
         task = _find_task(run.get("task_id"))
         if task is not None:
             _refresh_task_steps_from_database(task["id"])
+            recovered_run = _attempt_fallback_recovery_locked(
+                task=task,
+                run=run,
+                failure_stage="execution",
+                failure_message=failure_message,
+                state="execution_timeout",
+                recovery_trigger="fallback.execution_timeout",
+            )
+            if recovered_run is not None:
+                return recovered_run
         timestamp = store.now_string()
 
         if task is None:
@@ -3130,84 +4115,107 @@ def fail_workflow_run_due_execution_timeout(run_id: str, *, failure_message: str
         return refreshed_run
 
 
-def fail_workflow_run_due_agent_execution_error(run_id: str, *, failure_message: str) -> dict:
-    with _TICK_LOCK:
-        run = _find_run(run_id)
-        task = _find_task(run.get("task_id"))
-        if task is not None:
-            _refresh_task_steps_from_database(task["id"])
-        timestamp = store.now_string()
-
-        if task is None:
-            run["status"] = "failed"
-            run["updated_at"] = timestamp
-            run["completed_at"] = timestamp
-            _mark_dispatch_context_failure(
-                run,
-                state="agent_execution_failed",
-                failure_stage="execution",
-                failure_message=failure_message,
-            )
-            _publish_run_event(store.clone(run), "workflow_run.updated")
-            _persist_execution_state(run=run)
-            _cancel_scheduled_run(run_id)
-            return store.clone(run)
-
-        if task["status"] in TERMINAL_TASK_STATUSES:
-            _cancel_scheduled_run(run_id)
-            try:
-                refreshed_run = _refresh_run_state(run, task)
-            except HTTPException as exc:
-                if not _is_workflow_not_found(exc):
-                    raise
-                refreshed_run = _refresh_run_state_without_workflow(run, task)
-            _persist_execution_state(
-                task=task,
-                steps=_ensure_task_steps_loaded(task["id"]),
-                run=refreshed_run,
-            )
-            return refreshed_run
-
-        steps = _ensure_task_steps_loaded(task["id"])
-        running_step = next(
-            (step for step in reversed(steps) if step.get("status") == "running"),
-            None,
+def _fail_workflow_run_due_agent_execution_error_locked(
+    run: dict,
+    task: dict | None,
+    *,
+    failure_message: str,
+) -> dict:
+    if task is not None:
+        _refresh_task_steps_from_database(task["id"])
+        recovered_run = _attempt_fallback_recovery_locked(
+            task=task,
+            run=run,
+            failure_stage="execution",
+            failure_message=failure_message,
+            state="agent_execution_failed",
+            recovery_trigger="fallback.agent_execution_failed",
         )
-        if running_step is not None:
-            running_step["status"] = "failed"
-            running_step["finished_at"] = timestamp
-            running_step["message"] = failure_message
-        else:
-            _append_step(
-                task_id=task["id"],
-                title="Agent 执行失败",
-                status="failed",
-                agent="Agent Execution Worker",
-                message=failure_message,
-                tokens=0,
-            )
+        if recovered_run is not None:
+            return recovered_run
+    timestamp = store.now_string()
 
-        task["status"] = "failed"
-        task["completed_at"] = timestamp
-        task["duration"] = task.get("duration") or "Agent 执行失败"
-        task["result"] = None
+    if task is None:
+        run["status"] = "failed"
+        run["updated_at"] = timestamp
+        run["completed_at"] = timestamp
         _mark_dispatch_context_failure(
             run,
             state="agent_execution_failed",
             failure_stage="execution",
             failure_message=failure_message,
         )
+        _publish_run_event(store.clone(run), "workflow_run.updated")
+        _persist_execution_state(run=run)
+        _cancel_scheduled_run(str(run.get("id") or ""))
+        return store.clone(run)
 
+    if task["status"] in TERMINAL_TASK_STATUSES:
+        _cancel_scheduled_run(str(run.get("id") or ""))
         try:
             refreshed_run = _refresh_run_state(run, task)
         except HTTPException as exc:
             if not _is_workflow_not_found(exc):
                 raise
             refreshed_run = _refresh_run_state_without_workflow(run, task)
-        _publish_run_event(refreshed_run, "workflow_run.updated")
-        _persist_execution_state(task=task, steps=steps, run=refreshed_run)
-        _cancel_scheduled_run(refreshed_run["id"])
+        _persist_execution_state(
+            task=task,
+            steps=_ensure_task_steps_loaded(task["id"]),
+            run=refreshed_run,
+        )
         return refreshed_run
+
+    steps = _ensure_task_steps_loaded(task["id"])
+    running_step = next(
+        (step for step in reversed(steps) if step.get("status") == "running"),
+        None,
+    )
+    if running_step is not None:
+        running_step["status"] = "failed"
+        running_step["finished_at"] = timestamp
+        running_step["message"] = failure_message
+    else:
+        _append_step(
+            task_id=task["id"],
+            title="Agent 执行失败",
+            status="failed",
+            agent="Agent Execution Worker",
+            message=failure_message,
+            tokens=0,
+        )
+
+    task["status"] = "failed"
+    task["completed_at"] = timestamp
+    task["duration"] = task.get("duration") or "Agent 执行失败"
+    task["result"] = None
+    _mark_dispatch_context_failure(
+        run,
+        state="agent_execution_failed",
+        failure_stage="execution",
+        failure_message=failure_message,
+    )
+
+    try:
+        refreshed_run = _refresh_run_state(run, task)
+    except HTTPException as exc:
+        if not _is_workflow_not_found(exc):
+            raise
+        refreshed_run = _refresh_run_state_without_workflow(run, task)
+    _publish_run_event(refreshed_run, "workflow_run.updated")
+    _persist_execution_state(task=task, steps=steps, run=refreshed_run)
+    _cancel_scheduled_run(refreshed_run["id"])
+    return refreshed_run
+
+
+def fail_workflow_run_due_agent_execution_error(run_id: str, *, failure_message: str) -> dict:
+    with _TICK_LOCK:
+        run = _find_run(run_id)
+        task = _find_task(run.get("task_id"))
+        return _fail_workflow_run_due_agent_execution_error_locked(
+            run,
+            task,
+            failure_message=failure_message,
+        )
 
 
 def _fail_workflow_run_due_unavailable_agent(
@@ -3218,6 +4226,17 @@ def _fail_workflow_run_due_unavailable_agent(
     failure_message: str,
     execution_agent: dict | None = None,
 ) -> dict:
+    recovered_run = _attempt_fallback_recovery_locked(
+        task=task,
+        run=run,
+        failure_stage="dispatch",
+        failure_message=failure_message,
+        state="failed",
+        recovery_trigger="fallback.executor_unavailable",
+    )
+    if recovered_run is not None:
+        return recovered_run
+
     timestamp = store.now_string()
     active_step = next((step for step in reversed(steps) if step.get("status") == "running"), None)
     if active_step is not None:
@@ -3299,6 +4318,47 @@ def _finalize_agent_task_result_locked(
     task["tokens"] = sum(step.get("tokens", 0) for step in steps)
     task["agent"] = execution_step["agent"]
     task["result"] = task_result
+    aggregation_contract = task_result.get("aggregation_contract")
+    aggregation_notes = task_result.get("aggregation_notes")
+    dispatch_context = _run_dispatch_context(run)
+    if isinstance(dispatch_context, dict):
+        if isinstance(aggregation_contract, dict):
+            dispatch_context["aggregation_contract"] = store.clone(aggregation_contract)
+        if isinstance(aggregation_notes, dict):
+            dispatch_context["aggregation_notes"] = store.clone(aggregation_notes)
+        dispatch_context["delivery_fact_context"] = _build_delivery_fact_context(
+            task=task,
+            run=run,
+            delivery=delivery,
+            task_result=task_result,
+        )
+        state_machine = dispatch_context.get("state_machine")
+        if not isinstance(state_machine, dict):
+            state_machine = {"version": "brain_fact_layer_v1"}
+            dispatch_context["state_machine"] = state_machine
+        if isinstance(aggregation_contract, dict):
+            state_machine["coordination_mode"] = (
+                str(aggregation_contract.get("mode") or "").strip() or None
+            )
+            state_machine["branch_results"] = store.clone(
+                aggregation_contract.get("branch_results") or []
+            )
+            state_machine["successful_agents"] = int(
+                aggregation_contract.get("successful_agents") or 0
+            )
+            state_machine["failed_agents"] = int(
+                aggregation_contract.get("failed_agents") or 0
+            )
+            state_machine["cancelled_agents"] = int(
+                aggregation_contract.get("cancelled_agents") or 0
+            )
+        if isinstance(aggregation_notes, dict):
+            state_machine["selected_branch_id"] = (
+                str(aggregation_notes.get("selected_branch_id") or "").strip() or None
+            )
+            state_machine["selected_agent"] = (
+                str(aggregation_notes.get("selected_agent") or "").strip() or None
+            )
     _mark_dispatch_context_state(
         run,
         "completed",
@@ -3381,11 +4441,13 @@ def _sync_execute_agent_locked(
             steps,
             failure_message="选定工作流缺少可用的执行 Agent，任务已终止",
         )
-    task_result = agent_execution_service.execute_task(
+    task_result, failure_run = _execute_agent_task_with_locked_failures(
         task=task,
         run=run,
         execution_agent=execution_agent,
     )
+    if failure_run is not None:
+        return failure_run
     return _finalize_agent_task_result_locked(
         task=task,
         run=run,
@@ -3422,6 +4484,8 @@ def _dispatch_workflow_run_locked(
     workflow: dict,
     auto_schedule: bool,
 ) -> dict:
+    if _task_confirmation_pending(task):
+        return _refresh_confirmation_pending_run_locked(run=run, task=task)
     resolved_intent = _resolve_tick_intent(run, workflow)
     run["intent"] = resolved_intent
     if not _workflow_has_execution_target(workflow, run, resolved_intent):
@@ -3546,11 +4610,13 @@ def _finalize_completed_execution_locked(
                 steps,
                 failure_message="选定工作流缺少可用的执行 Agent，任务已终止",
             )
-        task_result = agent_execution_service.execute_task(
+        task_result, failure_run = _execute_agent_task_with_locked_failures(
             task=task,
             run=run,
             execution_agent=execution_agent,
         )
+        if failure_run is not None:
+            return failure_run
     else:
         execution_agent = _resolve_dispatch_execution_agent(workflow, run, run.get("intent"))
     orchestration_steps = task_result.pop("orchestration_steps", None)
@@ -3573,6 +4639,14 @@ def _finalize_completed_execution_locked(
     task["duration"] = task.get("duration") or "自动完成"
     task["tokens"] = sum(step.get("tokens", 0) for step in steps)
     task["result"] = task_result
+    dispatch_context = _run_dispatch_context(run)
+    if isinstance(dispatch_context, dict):
+        dispatch_context["delivery_fact_context"] = _build_delivery_fact_context(
+            task=task,
+            run=run,
+            delivery=delivery,
+            task_result=task_result,
+        )
     _mark_dispatch_context_state(
         run,
         "completed",
@@ -3587,174 +4661,160 @@ def _finalize_completed_execution_locked(
     return refreshed_run
 
 
-def dispatch_workflow_run(run_id: str) -> dict:
-    with _TICK_LOCK:
-        run = _find_run(run_id)
-        task = _find_task(run.get("task_id"))
-        if task is None:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
-        _refresh_task_steps_from_database(task["id"])
-        steps = _ensure_task_steps_loaded(task["id"])
+def _advance_workflow_run_locked(
+    run_id: str,
+    *,
+    mode: str,
+    auto_schedule: bool = True,
+) -> dict:
+    run = _find_run(run_id)
+    task = _find_task(run.get("task_id"))
+    if task is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
+    _refresh_task_steps_from_database(task["id"])
+    steps = _ensure_task_steps_loaded(task["id"])
 
-        if task["status"] in TERMINAL_TASK_STATUSES:
-            return _refresh_terminal_workflow_run_locked(
-                run_id,
-                run=run,
-                task=task,
-                steps=steps,
-            )
+    if task["status"] in TERMINAL_TASK_STATUSES:
+        return _refresh_terminal_workflow_run_locked(
+            run_id,
+            run=run,
+            task=task,
+            steps=steps,
+        )
+    if _task_confirmation_pending(task):
+        return _refresh_confirmation_pending_run_locked(run=run, task=task)
 
-        workflow = _find_workflow(run["workflow_id"])
+    workflow = _find_workflow(run["workflow_id"])
+    selected_node = _selected_branch_node(workflow, run.get("intent"))
+    execution_step = _execution_step_for_node(steps, selected_node)
+
+    if execution_step is None:
+        dispatched_run = _dispatch_workflow_run_locked(
+            task=task,
+            run=run,
+            steps=steps,
+            workflow=workflow,
+            auto_schedule=(auto_schedule if mode == "tick" else False),
+        )
+        if mode in {"dispatch", "tick"}:
+            return dispatched_run
+
         selected_node = _selected_branch_node(workflow, run.get("intent"))
         execution_step = _execution_step_for_node(steps, selected_node)
 
-        if execution_step is None:
-            return _dispatch_workflow_run_locked(
-                task=task,
-                run=run,
-                steps=steps,
-                workflow=workflow,
-                auto_schedule=False,
-            )
-
+    if mode == "dispatch":
         return _refresh_run_state(run, task)
+
+    if execution_step and execution_step.get("status") == "running":
+        return _execute_running_workflow_run_locked(
+            task=task,
+            run=run,
+            steps=steps,
+            workflow=workflow,
+            execution_step=execution_step,
+            allow_async_agent_queue=(mode == "execute"),
+        )
+
+    if execution_step and execution_step.get("status") == "completed" and task["status"] != "completed":
+        return _finalize_completed_execution_locked(
+            task=task,
+            run=run,
+            steps=steps,
+            workflow=workflow,
+        )
+
+    if mode != "tick":
+        return _refresh_run_state(run, task)
+
+    task["status"] = "failed"
+    task["completed_at"] = store.now_string()
+    task["result"] = None
+    assistant_message = channel_outbound_service.render_task_failure_text(
+        task,
+        "工作流推进失败，缺少可执行节点",
+    )
+    delivery = _delivery_message_for_failure(task, run, "工作流推进失败，缺少可执行节点")
+    delivery_message = str(delivery.get("message") or "").strip()
+    _append_assistant_conversation_message(task, assistant_message)
+    _mark_dispatch_context_failure(
+        run,
+        state="failed",
+        failure_stage="dispatch",
+        failure_message="工作流推进失败，缺少可执行节点",
+    )
+    dispatch_context = _run_dispatch_context(run)
+    if isinstance(dispatch_context, dict):
+        dispatch_context["delivery_fact_context"] = _build_delivery_fact_context(
+            task=task,
+            run=run,
+            delivery=delivery,
+        )
+    _record_delivery_state(run, delivery)
+    _append_step(
+        task_id=task["id"],
+        title="执行异常",
+        status="failed",
+        agent=task["agent"],
+        message=delivery_message,
+        tokens=0,
+    )
+    _mark_execution_agent_failed(
+        resolve_workflow_execution_agent(
+            workflow,
+            run.get("intent"),
+            route_seed=_execution_route_seed(
+                run=run,
+                workflow=workflow,
+                agent_type=INTENT_AGENT_TYPE_MAP.get(run.get("intent")),
+            ),
+        )
+    )
+    refreshed_run = _refresh_run_state(run, task)
+    _publish_run_event(refreshed_run, "workflow_run.updated")
+    _persist_execution_state(task=task, steps=steps, run=refreshed_run)
+    _cancel_scheduled_run(refreshed_run["id"])
+    return refreshed_run
+
+
+def dispatch_workflow_run(run_id: str) -> dict:
+    with _TICK_LOCK:
+        return _advance_workflow_run_locked(run_id, mode="dispatch", auto_schedule=False)
 
 
 def execute_workflow_run(run_id: str) -> dict:
     with _TICK_LOCK:
-        run = _find_run(run_id)
-        task = _find_task(run.get("task_id"))
-        if task is None:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
-        _refresh_task_steps_from_database(task["id"])
-        steps = _ensure_task_steps_loaded(task["id"])
-
-        if task["status"] in TERMINAL_TASK_STATUSES:
-            return _refresh_terminal_workflow_run_locked(
-                run_id,
-                run=run,
-                task=task,
-                steps=steps,
-            )
-
-        workflow = _find_workflow(run["workflow_id"])
-        selected_node = _selected_branch_node(workflow, run.get("intent"))
-        execution_step = _execution_step_for_node(steps, selected_node)
-
-        if execution_step is None:
-            _dispatch_workflow_run_locked(
-                task=task,
-                run=run,
-                steps=steps,
-                workflow=workflow,
-                auto_schedule=False,
-            )
-            _refresh_task_steps_from_database(task["id"])
-            steps = _ensure_task_steps_loaded(task["id"])
-            selected_node = _selected_branch_node(workflow, run.get("intent"))
-            execution_step = _execution_step_for_node(steps, selected_node)
-
-        if execution_step and execution_step.get("status") == "running":
-            return _execute_running_workflow_run_locked(
-                task=task,
-                run=run,
-                steps=steps,
-                workflow=workflow,
-                execution_step=execution_step,
-                allow_async_agent_queue=True,
-            )
-
-        if execution_step and execution_step.get("status") == "completed" and task["status"] != "completed":
-            return _finalize_completed_execution_locked(
-                task=task,
-                run=run,
-                steps=steps,
-                workflow=workflow,
-            )
-
-        return _refresh_run_state(run, task)
+        return _advance_workflow_run_locked(run_id, mode="execute", auto_schedule=False)
 
 
 def tick_workflow_run(run_id: str, *, auto_schedule: bool = True) -> dict:
+    with _TICK_LOCK:
+        return _advance_workflow_run_locked(run_id, mode="tick", auto_schedule=auto_schedule)
+
+
+def request_manual_handoff_for_workflow_run(
+    run_id: str,
+    *,
+    operator: str | None = None,
+    note: str | None = None,
+) -> dict:
     with _TICK_LOCK:
         run = _find_run(run_id)
         task = _find_task(run.get("task_id"))
         if task is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
         _refresh_task_steps_from_database(task["id"])
-        steps = _ensure_task_steps_loaded(task["id"])
-
-        if task["status"] in TERMINAL_TASK_STATUSES:
-            return _refresh_terminal_workflow_run_locked(
-                run_id,
-                run=run,
-                task=task,
-                steps=steps,
-            )
-
-        workflow = _find_workflow(run["workflow_id"])
-
-        selected_node = _selected_branch_node(workflow, run.get("intent"))
-        execution_step = _execution_step_for_node(steps, selected_node)
-
-        if execution_step is None:
-            return _dispatch_workflow_run_locked(
-                task=task,
-                run=run,
-                steps=steps,
-                workflow=workflow,
-                auto_schedule=auto_schedule,
-            )
-
-        if execution_step and execution_step.get("status") == "running":
-            return _execute_running_workflow_run_locked(
-                task=task,
-                run=run,
-                steps=steps,
-                workflow=workflow,
-                execution_step=execution_step,
-                allow_async_agent_queue=False,
-            )
-
-        if execution_step and execution_step.get("status") == "completed" and task["status"] != "completed":
-            return _finalize_completed_execution_locked(
-                task=task,
-                run=run,
-                steps=steps,
-                workflow=workflow,
-            )
-
-        task["status"] = "failed"
-        task["completed_at"] = store.now_string()
-        task["result"] = None
-        assistant_message = channel_outbound_service.render_task_failure_text(
-            task,
-            "工作流推进失败，缺少可执行节点",
+        dispatch_context = _run_dispatch_context(run)
+        return _enter_manual_handoff_locked(
+            task=task,
+            run=run,
+            failure_stage=str(dispatch_context.get("failure_stage") or "manual_review"),
+            failure_message=str(note or "运行已转入人工接管，等待人工确认").strip(),
+            state="manual_handoff_requested",
+            reason="human_review_required",
+            handoff_source="operator_request",
+            operator=operator,
+            note=note,
         )
-        delivery = _delivery_message_for_failure(task, run, "工作流推进失败，缺少可执行节点")
-        delivery_message = str(delivery.get("message") or "").strip()
-        _append_assistant_conversation_message(task, assistant_message)
-        _mark_dispatch_context_failure(
-            run,
-            state="failed",
-            failure_stage="dispatch",
-            failure_message="工作流推进失败，缺少可执行节点",
-        )
-        _record_delivery_state(run, delivery)
-        _append_step(
-            task_id=task["id"],
-            title="执行异常",
-            status="failed",
-            agent=task["agent"],
-            message=delivery_message,
-            tokens=0,
-        )
-        _mark_execution_agent_failed(resolve_workflow_execution_agent(workflow, run.get("intent")))
-        refreshed_run = _refresh_run_state(run, task)
-        _publish_run_event(refreshed_run, "workflow_run.updated")
-        _persist_execution_state(task=task, steps=steps, run=refreshed_run)
-        _cancel_scheduled_run(refreshed_run["id"])
-        return refreshed_run
 
 
 def complete_agent_execution_job(run_id: str, *, execution_agent_id: str | None = None) -> dict:
@@ -3774,7 +4834,7 @@ def complete_agent_execution_job(run_id: str, *, execution_agent_id: str | None 
                 steps=steps,
             )
 
-        workflow = None if _is_direct_agent_run(run) else _find_workflow(run["workflow_id"])
+        workflow = None if _is_agent_dispatch_run(run) else _find_workflow(run["workflow_id"])
         selected_node = _selected_branch_node(workflow, run.get("intent")) if workflow else None
         execution_step = (
             _execution_step_for_node(steps, selected_node)
@@ -3804,22 +4864,32 @@ def complete_agent_execution_job(run_id: str, *, execution_agent_id: str | None 
                 execution_agent = _resolve_dispatch_execution_agent(workflow, run, run.get("intent"))
             else:
                 dispatch_context = _run_dispatch_context(run)
-                direct_execution_agent_id = _dispatch_context_execution_agent_id(dispatch_context)
+                dispatch_execution_agent_id = _dispatch_context_execution_agent_id(dispatch_context)
                 selected_agent_type = INTENT_AGENT_TYPE_MAP.get(_normalize_intent(run.get("intent")))
-                if direct_execution_agent_id:
+                if dispatch_execution_agent_id:
                     execution_agent = _resolve_agent_binding(
-                        direct_execution_agent_id,
+                        dispatch_execution_agent_id,
                         expected_type=selected_agent_type,
+                        route_seed=_execution_route_seed(
+                            run=run,
+                            agent_type=selected_agent_type,
+                        ),
                     )
                 if execution_agent is None:
-                    execution_agent = resolve_direct_execution_agent(run.get("intent"))
+                    execution_agent = resolve_agent_dispatch_execution_agent(
+                        run.get("intent"),
+                        route_seed=_execution_route_seed(
+                            run=run,
+                            agent_type=selected_agent_type,
+                        ),
+                    )
         if execution_agent is None:
             return _fail_workflow_run_due_unavailable_agent(
                 task,
                 run,
                 steps,
                 failure_message=(
-                    "Direct Agent fallback 缺少可用的执行 Agent，任务已终止"
+                    "Agent dispatch 缺少可用的执行 Agent，任务已终止"
                     if workflow is None
                     else "选定工作流缺少可用的执行 Agent，任务已终止"
                 ),
@@ -3836,11 +4906,13 @@ def complete_agent_execution_job(run_id: str, *, execution_agent_id: str | None 
         refreshed_run = _refresh_run_state(run, task)
         _publish_run_event(refreshed_run, "workflow_run.updated")
         _persist_execution_state(task=task, steps=steps, run=refreshed_run)
-        task_result = agent_execution_service.execute_task(
+        task_result, failure_run = _execute_agent_task_with_locked_failures(
             task=task,
             run=run,
             execution_agent=execution_agent,
         )
+        if failure_run is not None:
+            return failure_run
         return _finalize_agent_task_result_locked(
             task=task,
             run=run,

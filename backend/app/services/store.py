@@ -126,6 +126,7 @@ class InMemoryStore:
                 "message": "Token 使用量接近限制",
             },
         ]
+        self.operational_logs = []
 
         self.agents = [
             {

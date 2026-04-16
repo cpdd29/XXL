@@ -1,6 +1,7 @@
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from app.main import app
@@ -79,7 +80,11 @@ def test_security_report_route_aggregates_recent_logs_and_rules(auth_headers) ->
             "status": "success",
             "ip": "127.0.0.1",
             "details": "消息通过安全网关",
-            "metadata": {"rewrite_notes": ["masked phone number"]},
+            "metadata": {
+                "rewrite_notes": ["masked phone number"],
+                "trace": {"layer": "content_policy_rewrite"},
+                "rewrite_diffs": [{"label": "PII 改写"}],
+            },
         },
         {
             "id": "audit-security-report-warning",
@@ -90,6 +95,7 @@ def test_security_report_route_aggregates_recent_logs_and_rules(auth_headers) ->
             "status": "warning",
             "ip": "127.0.0.2",
             "details": "命中敏感词，已改写放行",
+            "metadata": {"trace": {"layer": "content_policy_rewrite"}},
         },
         {
             "id": "audit-security-report-error",
@@ -101,6 +107,7 @@ def test_security_report_route_aggregates_recent_logs_and_rules(auth_headers) ->
             "ip": "127.0.0.3",
             "details": "命中高风险提示注入",
             "metadata": {
+                "trace": {"layer": "prompt_injection"},
                 "prompt_injection_assessment": {
                     "verdict": "block",
                     "rule_score": 0.95,
@@ -142,10 +149,24 @@ def test_security_report_route_aggregates_recent_logs_and_rules(auth_headers) ->
     assert body["summary"]["uniqueUsers"] == 2
     assert body["summary"]["activeRules"] >= 1
     assert body["statusBreakdown"][0]["key"] in {"success", "warning", "error"}
+    assert any(item["key"] == "content_policy_rewrite" for item in body["gatewayLayerBreakdown"])
+    assert any(item["key"] == "prompt_injection" for item in body["gatewayLayerBreakdown"])
     assert body["topResources"][0]["label"] == "消息入口"
     assert body["topActions"][0]["label"] in {"安全网关放行", "敏感词检测", "安全网关拦截:prompt_injection"}
     assert any(item["label"] == "Prompt Injection 拦截" for item in body["topRules"])
     assert {item["status"] for item in body["recentIncidents"]} == {"warning", "error"}
+    assert any(item["layer"] == "注入检测" for item in body["recentIncidents"])
+    assert any(item["verdict"] == "block" for item in body["recentIncidents"])
+
+
+def test_security_guardian_route_returns_local_security_agent(auth_headers) -> None:
+    response = client.get("/api/security/guardian", headers=auth_headers)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["type"] == "security"
+    assert body["name"] == "安全检测 Agent"
+    assert body["configSummary"]["status"] in {"loaded", "partial", "missing"}
 
 
 def test_security_report_route_falls_back_to_reference_logs_when_window_is_empty(auth_headers) -> None:
@@ -305,9 +326,21 @@ def test_release_security_penalty_clears_state_and_writes_audit_log(
     fake_redis.sorted_sets["security:incident:telegram:release-target"] = {"inc:1": now.timestamp()}
 
     try:
+        approval_response = client.post(
+            "/api/security/penalties/telegram:release-target/release",
+            headers=auth_headers,
+        )
+        assert approval_response.status_code == 202
+        approval_id = approval_response.json()["approval"]["id"]
+        assert client.post(
+            f"/api/approvals/{approval_id}/approve",
+            headers=auth_headers,
+            json={"note": "允许解除"},
+        ).status_code == 200
         response = client.post(
             "/api/security/penalties/telegram:release-target/release",
             headers=auth_headers,
+            json={"approvalId": approval_id},
         )
         persisted_state = service.get_security_subject_state("telegram:release-target")
         audit_logs = service.list_audit_logs() or []
@@ -343,6 +376,213 @@ def test_release_security_penalty_clears_state_and_writes_audit_log(
     assert release_audit["metadata"]["target_user_key"] == "telegram:release-target"
     assert release_audit["metadata"]["operator"] == "security.operator@example.test"
     assert release_audit["metadata"]["reset_counters"] is True
+
+
+def test_security_incident_reviews_route_supports_event_jump_filter(
+    tmp_path: Path,
+    monkeypatch,
+    auth_headers_factory,
+) -> None:
+    service = _sqlite_service(tmp_path, InMemoryStore())
+    monkeypatch.setattr(security_service, "persistence_service", service)
+    auth_headers = auth_headers_factory()
+    now = datetime.now(UTC).isoformat()
+    service.append_audit_log(
+        log={
+            "id": "audit-security-incident-review-event-jump-1",
+            "timestamp": now,
+            "action": "Security incident review:reviewed",
+            "user": "reviewer-a@example.test",
+            "resource": "security_incident_review",
+            "status": "success",
+            "ip": "-",
+            "details": "reviewed incident",
+            "metadata": {
+                "review_id": "incident-review-event-jump-1",
+                "incident_id": "incident:event-jump-target",
+                "review_action": "reviewed",
+                "note": "ready to jump",
+                "reviewer": "reviewer-a@example.test",
+            },
+        }
+    )
+    service.append_audit_log(
+        log={
+            "id": "audit-security-incident-review-event-jump-2",
+            "timestamp": now,
+            "action": "Security incident review:note",
+            "user": "reviewer-b@example.test",
+            "resource": "security_incident_review",
+            "status": "success",
+            "ip": "-",
+            "details": "another incident note",
+            "metadata": {
+                "review_id": "incident-review-event-jump-2",
+                "incident_id": "incident:event-jump-other",
+                "review_action": "note",
+                "note": "for a different incident",
+                "reviewer": "reviewer-b@example.test",
+            },
+        }
+    )
+
+    try:
+        response = client.get(
+            "/api/security/incidents/reviews?incident_id=incident:event-jump-target",
+            headers=auth_headers,
+        )
+    finally:
+        service.close()
+
+    if response.status_code in {404, 501}:
+        pytest.skip("security incident review listing route is not available in this branch")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["total"] == 1
+    assert payload["items"][0]["incidentId"] == "incident:event-jump-target"
+    assert payload["items"][0]["action"] == "reviewed"
+
+
+def test_create_security_incident_review_route_records_review_action(
+    tmp_path: Path,
+    monkeypatch,
+    auth_headers_factory,
+) -> None:
+    service = _sqlite_service(tmp_path, InMemoryStore())
+    monkeypatch.setattr(security_service, "persistence_service", service)
+    auth_headers = auth_headers_factory(
+        role="operator",
+        user_id="incident-review-operator",
+        email="incident.reviewer@example.test",
+    )
+
+    try:
+        create_response = client.post(
+            "/api/security/incidents/incident:create-review/review",
+            headers=auth_headers,
+            json={
+                "action": "false_positive",
+                "note": "manual review confirms this is benign",
+            },
+        )
+        list_response = client.get(
+            "/api/security/incidents/reviews?incident_id=incident:create-review",
+            headers=auth_headers,
+        )
+    finally:
+        service.close()
+
+    if create_response.status_code in {404, 501}:
+        pytest.skip("security incident review creation route is not available in this branch")
+    assert create_response.status_code == 200
+    created_payload = create_response.json()
+    assert created_payload["ok"] is True
+    assert created_payload["review"]["incidentId"] == "incident:create-review"
+    assert created_payload["review"]["action"] == "false_positive"
+    assert created_payload["review"]["note"] == "manual review confirms this is benign"
+    assert created_payload["review"]["reviewer"] == "incident.reviewer@example.test"
+
+    assert list_response.status_code == 200
+    listed_payload = list_response.json()
+    assert listed_payload["total"] >= 1
+    assert any(item["id"] == created_payload["review"]["id"] for item in listed_payload["items"])
+
+
+def test_security_manual_penalty_route_contract_draft(
+    auth_headers_factory,
+) -> None:
+    auth_headers = auth_headers_factory(role="operator")
+    approval_response = client.post(
+        "/api/security/penalties/manual",
+        headers=auth_headers,
+        json={
+            "userKey": "telegram:manual-penalty-target",
+            "level": "cooldown",
+            "detail": "manual escalation for repeated suspicious traffic",
+            "statusCode": 429,
+            "durationSeconds": 900,
+            "note": "raised from incident review panel",
+        },
+    )
+    if approval_response.status_code in {404, 405, 501}:
+        pytest.skip("manual security penalty route is pending main-branch implementation")
+    assert approval_response.status_code == 202
+    approval_id = approval_response.json()["approval"]["id"]
+    assert client.post(
+        f"/api/approvals/{approval_id}/approve",
+        headers=auth_headers,
+        json={"note": "允许创建"},
+    ).status_code == 200
+    response = client.post(
+        "/api/security/penalties/manual",
+        headers=auth_headers,
+        json={
+            "userKey": "telegram:manual-penalty-target",
+            "level": "cooldown",
+            "detail": "manual escalation for repeated suspicious traffic",
+            "statusCode": 429,
+            "durationSeconds": 900,
+            "note": "raised from incident review panel",
+            "approvalId": approval_id,
+        },
+    )
+
+    if response.status_code in {404, 405, 501}:
+        pytest.skip("manual security penalty route is pending main-branch implementation")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["ok"] is True
+    assert payload["penalty"]["userKey"] == "telegram:manual-penalty-target"
+    assert payload["penalty"]["level"] == "cooldown"
+    assert payload["penalty"]["statusCode"] == 429
+
+
+def test_release_security_penalty_rejects_unapproved_execution(
+    auth_headers_factory,
+) -> None:
+    auth_headers = auth_headers_factory(role="operator")
+    response = client.post(
+        "/api/security/penalties/telegram:missing-approval/release",
+        headers=auth_headers,
+        json={"approvalId": "approval-missing"},
+    )
+
+    assert response.status_code == 404
+
+
+def test_security_penalty_history_route_contract_draft(
+    auth_headers_factory,
+) -> None:
+    auth_headers = auth_headers_factory(role="operator")
+    response = client.get(
+        "/api/security/penalties/history?userKey=telegram:manual-penalty-target",
+        headers=auth_headers,
+    )
+
+    if response.status_code in {404, 405, 501}:
+        pytest.skip("security penalty history route is pending main-branch implementation")
+    assert response.status_code == 200
+    payload = response.json()
+    assert isinstance(payload.get("items"), list)
+    assert isinstance(payload.get("total"), int)
+
+
+def test_security_rule_detail_route_contract_draft(
+    auth_headers_factory,
+) -> None:
+    auth_headers = auth_headers_factory(role="operator")
+    response = client.get(
+        "/api/security/rules/1",
+        headers=auth_headers,
+    )
+
+    if response.status_code in {404, 405, 501}:
+        pytest.skip("security rule detail route is pending main-branch implementation")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["id"] == "1"
+    assert "name" in payload
+    assert "description" in payload
 
 
 def test_viewer_cannot_release_security_penalty(

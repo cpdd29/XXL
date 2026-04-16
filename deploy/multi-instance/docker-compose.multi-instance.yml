@@ -1,0 +1,138 @@
+x-backend-runtime-base: &backend-runtime-base
+  build:
+    context: ./backend
+    dockerfile: Dockerfile
+  restart: unless-stopped
+  working_dir: /app
+  environment:
+    PYTHONUNBUFFERED: "1"
+    WORKBOT_ENVIRONMENT: ${WORKBOT_ENVIRONMENT:-docker-compose}
+    WORKBOT_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-workbot}:${POSTGRES_PASSWORD:-workbot}@postgres:5432/${POSTGRES_DB:-workbot}
+    WORKBOT_REDIS_URL: redis://redis:6379/0
+    WORKBOT_MEMORY_SQLITE_PATH: ${WORKBOT_MEMORY_SQLITE_PATH:-data/memory-midterm.sqlite3}
+    WORKBOT_NATS_URL: nats://nats:4222
+    WORKBOT_CHROMA_URL: http://chromadb:8000
+    WORKBOT_CHROMA_CLIENT_MODE: http
+    WORKBOT_CHROMA_COLLECTION_NAME: ${WORKBOT_CHROMA_COLLECTION_NAME:-workbot_long_term_memory}
+    WORKBOT_TOOL_SOURCES_MODE: ${WORKBOT_TOOL_SOURCES_MODE:-external_only}
+    WORKBOT_ENABLE_LOCAL_MCP_SOURCE: ${WORKBOT_ENABLE_LOCAL_MCP_SOURCE:-false}
+    WORKBOT_ENABLE_LOCAL_AGENT_SOURCE: ${WORKBOT_ENABLE_LOCAL_AGENT_SOURCE:-false}
+    WORKBOT_EXTERNAL_TOOL_SOURCES_FILE: ${WORKBOT_EXTERNAL_TOOL_SOURCES_FILE:-/opt/workbot/external-registry/workbot_external_sources.local.json}
+    WORKBOT_SEARCH_MCP_BASE_URL: ${WORKBOT_SEARCH_MCP_BASE_URL:-http://host.docker.internal:8093}
+    WORKBOT_PDF_MCP_BASE_URL: ${WORKBOT_PDF_MCP_BASE_URL:-http://host.docker.internal:8092}
+    WORKBOT_WRITER_MCP_BASE_URL: ${WORKBOT_WRITER_MCP_BASE_URL:-http://host.docker.internal:8094}
+    WORKBOT_WEATHER_MCP_BASE_URL: ${WORKBOT_WEATHER_MCP_BASE_URL:-http://host.docker.internal:8095}
+    WORKBOT_ORDER_MCP_BASE_URL: ${WORKBOT_ORDER_MCP_BASE_URL:-http://host.docker.internal:8096}
+    WORKBOT_CRM_MCP_BASE_URL: ${WORKBOT_CRM_MCP_BASE_URL:-http://host.docker.internal:8097}
+  volumes:
+    - ./backend:/app
+    - .:/workspace:ro
+    - ./deploy/external-registry:/opt/workbot/external-registry:ro
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+    nats:
+      condition: service_started
+    chromadb:
+      condition: service_started
+
+services:
+  dispatcher-a:
+    <<: *backend-runtime-base
+    command:
+      [
+        "python",
+        "scripts/run_dispatcher_runtime.py",
+        "--dispatcher-id",
+        "${WORKBOT_DISPATCHER_A_ID:-dispatcher-a}",
+        "--poll-interval-seconds",
+        "${WORKBOT_MULTI_INSTANCE_POLL_INTERVAL_SECONDS:-1.0}",
+        "--lease-seconds",
+        "${WORKBOT_MULTI_INSTANCE_LEASE_SECONDS:-45.0}",
+        "--scan-limit",
+        "${WORKBOT_MULTI_INSTANCE_SCAN_LIMIT:-50}",
+      ]
+
+  dispatcher-b:
+    <<: *backend-runtime-base
+    command:
+      [
+        "python",
+        "scripts/run_dispatcher_runtime.py",
+        "--dispatcher-id",
+        "${WORKBOT_DISPATCHER_B_ID:-dispatcher-b}",
+        "--poll-interval-seconds",
+        "${WORKBOT_MULTI_INSTANCE_POLL_INTERVAL_SECONDS:-1.0}",
+        "--lease-seconds",
+        "${WORKBOT_MULTI_INSTANCE_LEASE_SECONDS:-45.0}",
+        "--scan-limit",
+        "${WORKBOT_MULTI_INSTANCE_SCAN_LIMIT:-50}",
+      ]
+
+  workflow-worker-a:
+    <<: *backend-runtime-base
+    command:
+      [
+        "python",
+        "scripts/run_workflow_execution_worker_runtime.py",
+        "--worker-id",
+        "${WORKBOT_WORKFLOW_WORKER_A_ID:-workflow-worker-a}",
+        "--poll-interval-seconds",
+        "${WORKBOT_MULTI_INSTANCE_POLL_INTERVAL_SECONDS:-1.0}",
+        "--lease-seconds",
+        "${WORKBOT_MULTI_INSTANCE_LEASE_SECONDS:-45.0}",
+        "--scan-limit",
+        "${WORKBOT_MULTI_INSTANCE_SCAN_LIMIT:-50}",
+      ]
+
+  workflow-worker-b:
+    <<: *backend-runtime-base
+    command:
+      [
+        "python",
+        "scripts/run_workflow_execution_worker_runtime.py",
+        "--worker-id",
+        "${WORKBOT_WORKFLOW_WORKER_B_ID:-workflow-worker-b}",
+        "--poll-interval-seconds",
+        "${WORKBOT_MULTI_INSTANCE_POLL_INTERVAL_SECONDS:-1.0}",
+        "--lease-seconds",
+        "${WORKBOT_MULTI_INSTANCE_LEASE_SECONDS:-45.0}",
+        "--scan-limit",
+        "${WORKBOT_MULTI_INSTANCE_SCAN_LIMIT:-50}",
+      ]
+
+  agent-worker-a:
+    <<: *backend-runtime-base
+    command:
+      [
+        "python",
+        "scripts/run_agent_execution_worker_runtime.py",
+        "--worker-id",
+        "${WORKBOT_AGENT_WORKER_A_ID:-agent-worker-a}",
+        "--poll-interval-seconds",
+        "${WORKBOT_MULTI_INSTANCE_POLL_INTERVAL_SECONDS:-1.0}",
+        "--lease-seconds",
+        "${WORKBOT_MULTI_INSTANCE_LEASE_SECONDS:-45.0}",
+        "--scan-limit",
+        "${WORKBOT_MULTI_INSTANCE_SCAN_LIMIT:-50}",
+      ]
+
+  agent-worker-b:
+    <<: *backend-runtime-base
+    command:
+      [
+        "python",
+        "scripts/run_agent_execution_worker_runtime.py",
+        "--worker-id",
+        "${WORKBOT_AGENT_WORKER_B_ID:-agent-worker-b}",
+        "--poll-interval-seconds",
+        "${WORKBOT_MULTI_INSTANCE_POLL_INTERVAL_SECONDS:-1.0}",
+        "--lease-seconds",
+        "${WORKBOT_MULTI_INSTANCE_LEASE_SECONDS:-45.0}",
+        "--scan-limit",
+        "${WORKBOT_MULTI_INSTANCE_SCAN_LIMIT:-50}",
+      ]

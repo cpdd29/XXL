@@ -441,3 +441,38 @@ def test_tool_source_service_resolves_base_url_env_placeholder_for_external_regi
     registry_web_search = next(item for item in service.list_tools(refresh=False) if item["id"] == "mcp-tool-web-search")
     assert registry_web_search["config_summary"]["base_url"] == "https://mcp.env-resolved.local"
     assert registry_web_search["config_summary"]["baseUrl"] == "https://mcp.env-resolved.local"
+
+
+def test_tool_source_service_falls_back_to_local_registry_snapshot_when_env_file_is_unavailable(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    service = _build_source_service(tmp_path)
+    fallback_root = tmp_path / "brain-root"
+    registry_file = fallback_root / "deploy" / "external-registry" / "workbot_external_sources.local.json"
+    _write_text(
+        registry_file,
+        _external_registry_file_payload_with_skill(tmp_path / "external"),
+    )
+
+    monkeypatch.setattr("app.services.tool_source_service.PROJECT_ROOT", fallback_root)
+    monkeypatch.setattr(
+        "app.services.tool_source_service.DEFAULT_EXTERNAL_REGISTRY_FALLBACK_PATHS",
+        (
+            Path("/opt/workbot/external-registry/workbot_external_sources.local.json"),
+            registry_file,
+        ),
+    )
+    monkeypatch.setenv("WORKBOT_TOOL_SOURCES_MODE", "external_only")
+    monkeypatch.setenv("WORKBOT_EXTERNAL_TOOL_SOURCES_FILE", "../XXL_ExternalConnection/config/workbot_external_sources.combined.json")
+    monkeypatch.delenv("WORKBOT_EXTERNAL_TOOL_SOURCES_JSON", raising=False)
+    monkeypatch.delenv("WORKBOT_TOOL_SOURCES_REGISTRY_JSON", raising=False)
+
+    payload = service.scan_sources()
+    source_ids = {item["id"] for item in payload["items"]}
+
+    assert source_ids == {"registered-agent-reach", "registered-mcp"}
+    tools = service.list_tools(refresh=False)
+    tool_names = {item["name"] for item in tools}
+    assert "external_skill_router" in tool_names
+    assert "registry_search" in tool_names

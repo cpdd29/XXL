@@ -78,6 +78,7 @@ class FakePersistence:
             "created_at": kwargs["queued_at"],
             "updated_at": kwargs["queued_at"],
         }
+        protocol: dict[str, object] = {}
         for key in (
             "spec_version",
             "message_id",
@@ -95,6 +96,9 @@ class FakePersistence:
         ):
             if key in kwargs:
                 payload[key] = kwargs.get(key)
+                protocol[key] = kwargs.get(key)
+        if protocol:
+            payload["protocol"] = dict(protocol)
         self.jobs[run_id] = dict(payload)
         self.upserted_jobs.append(dict(payload))
         return payload
@@ -202,6 +206,9 @@ def test_workflow_execution_worker_service_consumes_payload_and_executes_locally
     )
 
     assert execute_calls == ["run-worker-1"]
+    assert any(item[0] == "brain.workflow.execution.claimed" for item in event_bus.published)
+    assert any(item[0] == "brain.workflow.execution.started" for item in event_bus.published)
+    assert any(item[0] == "brain.workflow.execution.completed" for item in event_bus.published)
     result_events = [item for item in event_bus.published if item[0] == worker_module.WORKFLOW_EXECUTION_RESULT_SUBJECT]
     assert len(result_events) == 1
     result_payload = result_events[0][1]
@@ -320,10 +327,152 @@ def test_workflow_execution_worker_service_defers_and_releases_claim_when_execut
 
     assert deferred == [("run-worker-failure", 0.5, 0.2, "dispatcher-a")]
     assert released == ["run-worker-failure"]
-    deferred_events = [item for item in event_bus.published if item[0] == worker_module.WORKFLOW_EXECUTION_EVENT_SUBJECT]
+    deferred_events = [
+        item
+        for item in event_bus.published
+        if item[0] == worker_module.WORKFLOW_EXECUTION_EVENT_SUBJECT
+        and item[1]["message_name"] == "workflow.execution.deferred"
+    ]
     assert len(deferred_events) == 1
     assert deferred_events[0][1]["message_name"] == "workflow.execution.deferred"
     assert deferred_events[0][1]["request_id"] == "req-worker-failure"
+
+
+def test_workflow_execution_worker_service_increments_protocol_attempt_when_retrying(monkeypatch) -> None:
+    event_bus = FakeEventBus()
+    persistence = FakePersistence(
+        due_jobs=[
+            {
+                "run_id": "run-worker-retry",
+                "available_at": "2026-04-09T10:00:00+00:00",
+                "step_delay_seconds": 0.4,
+                "claimed_at": "2026-04-09T10:00:00+00:00",
+                "lease_expires_at": "2026-04-09T10:00:30+00:00",
+                "request_id": "req-worker-retry",
+                "correlation_id": "msg-worker-retry-1",
+                "message_id": "msg-worker-retry-1",
+                "attempt": 1,
+                "max_attempts": 3,
+            }
+        ],
+        runs=[
+            {
+                "id": "run-worker-retry",
+                "status": "running",
+                "dispatcher_id": "dispatcher-retry",
+                "dispatch_context": {},
+            }
+        ],
+    )
+    service = _build_worker_service(event_bus, persistence=persistence)
+    deferred: list[tuple[str, float, float, str | None]] = []
+    released: list[str] = []
+
+    monkeypatch.setattr(
+        workflow_execution_service,
+        "execute_workflow_run",
+        lambda _run_id: (_ for _ in ()).throw(RuntimeError("retry boom")),
+    )
+    monkeypatch.setattr(
+        "app.services.workflow_scheduler_service.workflow_scheduler_service.defer",
+        lambda run_id, *, delay, step_delay=None, dispatcher_id=None: deferred.append(
+            (run_id, delay, step_delay, dispatcher_id)
+        ),
+    )
+    monkeypatch.setattr(
+        "app.services.workflow_dispatcher_service.workflow_dispatcher_service.release_run_claim",
+        lambda run_id: released.append(run_id),
+    )
+
+    summary = service.poll_once()
+
+    assert summary["skipped_claimed"] == 1
+    assert deferred == [("run-worker-retry", 0.5, 0.4, "dispatcher-retry")]
+    assert released == ["run-worker-retry"]
+    persisted_run = persistence.get_workflow_run("run-worker-retry")
+    assert persisted_run is not None
+    assert persisted_run["dispatch_context"]["protocol"]["attempt"] == 2
+    assert persisted_run["dispatch_context"]["protocol"]["last_error"] == "retry boom"
+    assert any(item[0] == "brain.workflow.execution.claimed" for item in event_bus.published)
+    assert any(item[0] == "brain.workflow.execution.started" for item in event_bus.published)
+    deferred_events = [
+        item
+        for item in event_bus.published
+        if item[0] == worker_module.WORKFLOW_EXECUTION_EVENT_SUBJECT
+        and item[1]["message_name"] == "workflow.execution.deferred"
+    ]
+    assert len(deferred_events) == 1
+    assert deferred_events[0][1]["status"] == "retry_scheduled"
+    assert deferred_events[0][1]["request_id"] == "req-worker-retry"
+
+
+def test_workflow_execution_worker_service_marks_dead_letter_after_max_attempts(monkeypatch) -> None:
+    event_bus = FakeEventBus()
+    persistence = FakePersistence(
+        due_jobs=[
+            {
+                "run_id": "run-worker-dead-letter",
+                "available_at": "2026-04-09T10:00:00+00:00",
+                "step_delay_seconds": 0.4,
+                "claimed_at": "2026-04-09T10:00:00+00:00",
+                "lease_expires_at": "2026-04-09T10:00:30+00:00",
+                "request_id": "req-worker-dead-letter",
+                "correlation_id": "msg-worker-dead-letter-3",
+                "message_id": "msg-worker-dead-letter-3",
+                "attempt": 3,
+                "max_attempts": 3,
+            }
+        ],
+        runs=[
+            {
+                "id": "run-worker-dead-letter",
+                "status": "running",
+                "dispatcher_id": "dispatcher-dead-letter",
+                "dispatch_context": {},
+            }
+        ],
+    )
+    service = _build_worker_service(event_bus, persistence=persistence)
+    failures: list[tuple[str, str]] = []
+    released: list[str] = []
+
+    monkeypatch.setattr(
+        workflow_execution_service,
+        "execute_workflow_run",
+        lambda _run_id: (_ for _ in ()).throw(RuntimeError("dead letter boom")),
+    )
+    monkeypatch.setattr(
+        workflow_execution_service,
+        "fail_workflow_run_due_agent_execution_error",
+        lambda run_id, *, failure_message: failures.append((run_id, failure_message))
+        or {"id": run_id, "status": "failed"},
+    )
+    monkeypatch.setattr(
+        "app.services.workflow_dispatcher_service.workflow_dispatcher_service.release_run_claim",
+        lambda run_id: released.append(run_id),
+    )
+
+    summary = service.poll_once()
+
+    assert summary["skipped_claimed"] == 1
+    assert failures == [("run-worker-dead-letter", "工作流执行失败并进入死信：dead letter boom")]
+    assert released == ["run-worker-dead-letter"]
+    assert persistence.get_workflow_execution_job("run-worker-dead-letter") is None
+    persisted_run = persistence.get_workflow_run("run-worker-dead-letter")
+    assert persisted_run is not None
+    assert persisted_run["dispatch_context"]["protocol"]["dead_letter"] is True
+    assert persisted_run["dispatch_context"]["protocol"]["dead_letter_reason"] == "dead letter boom"
+    assert any(item[0] == "brain.workflow.execution.failed" for item in event_bus.published)
+    dead_letter_events = [
+        item
+        for item in event_bus.published
+        if item[0] == worker_module.WORKFLOW_EXECUTION_EVENT_SUBJECT
+        and item[1]["message_name"] == "workflow.execution.dead_lettered"
+    ]
+    assert len(dead_letter_events) == 1
+    assert dead_letter_events[0][1]["dead_letter"] is True
+    assert dead_letter_events[0][1]["dead_letter_reason"] == "dead letter boom"
+    assert dead_letter_events[0][1]["request_id"] == "req-worker-dead-letter"
 
 
 def test_workflow_execution_worker_service_polls_due_execution_jobs(monkeypatch) -> None:

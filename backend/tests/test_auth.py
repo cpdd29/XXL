@@ -357,6 +357,21 @@ def test_auth_refresh_route_returns_new_token_pair(
     assert payload["user"]["email"] == "admin@workbot.ai"
 
 
+def test_auth_session_route_returns_permission_snapshot(auth_headers_factory) -> None:
+    response = client.get(
+        "/api/auth/session",
+        headers=auth_headers_factory(role="operator", email="ops@example.com"),
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["user"]["email"] == "ops@example.com"
+    assert payload["roleSummary"]["key"] == "operator"
+    assert "workflows:definition:write" in payload["permissions"]
+    assert "settings:security-policy:write" in payload["permissions"]
+    assert any(group["key"] == "security" for group in payload["permissionGroups"])
+
+
 def test_login_fails_closed_when_database_user_lookup_is_unavailable(
     tmp_path: Path,
     monkeypatch,

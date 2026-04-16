@@ -131,6 +131,7 @@ class WorkflowDispatchJobRecord(Base):
     run_id: Mapped[str] = mapped_column(String(128), primary_key=True)
     available_at: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
     step_delay_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
+    protocol: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     dispatcher_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     claimed_at: Mapped[str | None] = mapped_column(String(128), nullable=True)
     lease_expires_at: Mapped[str | None] = mapped_column(String(128), nullable=True)
@@ -144,6 +145,7 @@ class WorkflowExecutionJobRecord(Base):
     run_id: Mapped[str] = mapped_column(String(128), primary_key=True)
     available_at: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
     step_delay_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
+    protocol: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     worker_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     claimed_at: Mapped[str | None] = mapped_column(String(128), nullable=True)
     lease_expires_at: Mapped[str | None] = mapped_column(String(128), nullable=True)
@@ -160,6 +162,7 @@ class AgentExecutionJobRecord(Base):
     execution_agent_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     available_at: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
     step_delay_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
+    protocol: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     worker_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     claimed_at: Mapped[str | None] = mapped_column(String(128), nullable=True)
     lease_expires_at: Mapped[str | None] = mapped_column(String(128), nullable=True)
@@ -300,3 +303,45 @@ class SecuritySubjectStateRecord(Base):
     incident_timestamps: Mapped[list[Any]] = mapped_column(JSON, nullable=False, default=list)
     active_penalty: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     updated_at: Mapped[str] = mapped_column(String(128), nullable=False)
+
+
+class SecurityEventReviewRecord(Base):
+    __tablename__ = "security_event_reviews"
+
+    id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    sort_index: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    event_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    user_key: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
+    action: Mapped[str] = mapped_column(String(64), nullable=False)
+    operator: Mapped[str] = mapped_column(String(255), nullable=False)
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    related_penalty_action_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    metadata_payload: Mapped[dict[str, Any] | None] = mapped_column(
+        "metadata",
+        JSON,
+        nullable=True,
+    )
+    created_at: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+
+
+class SecurityPenaltyActionRecord(Base):
+    __tablename__ = "security_penalty_actions"
+
+    id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    sort_index: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    user_key: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    action: Mapped[str] = mapped_column(String(64), nullable=False)
+    level: Mapped[str] = mapped_column(String(64), nullable=False)
+    detail: Mapped[str] = mapped_column(Text, nullable=False)
+    status_code: Mapped[int] = mapped_column(Integer, nullable=False, default=429)
+    until: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    operator: Mapped[str] = mapped_column(String(255), nullable=False)
+    source: Mapped[str] = mapped_column(String(64), nullable=False, default="manual")
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    related_event_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    metadata_payload: Mapped[dict[str, Any] | None] = mapped_column(
+        "metadata",
+        JSON,
+        nullable=True,
+    )
+    created_at: Mapped[str] = mapped_column(String(128), nullable=False, index=True)

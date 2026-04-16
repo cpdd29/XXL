@@ -1,0 +1,109 @@
+from __future__ import annotations
+
+import argparse
+import json
+import signal
+import sys
+import time
+from pathlib import Path
+from threading import Event
+from typing import Any
+
+
+BACKEND_ROOT = Path(__file__).resolve().parents[1]
+if str(BACKEND_ROOT) not in sys.path:
+    sys.path.insert(0, str(BACKEND_ROOT))
+
+from app.services.workflow_dispatch_poller_service import workflow_dispatch_poller_service  # noqa: E402
+from app.services.workflow_dispatcher_service import workflow_dispatcher_service  # noqa: E402
+
+
+def _configure_dispatcher_runtime(
+    *,
+    dispatcher_id: str,
+    poll_interval_seconds: float | None,
+    lease_seconds: float | None,
+    scan_limit: int | None,
+) -> dict[str, Any]:
+    workflow_dispatcher_service.dispatcher_id = dispatcher_id
+    if lease_seconds is not None:
+        workflow_dispatcher_service._lease_seconds = max(float(lease_seconds), 1.0)
+    if poll_interval_seconds is not None:
+        workflow_dispatch_poller_service._poll_interval_seconds = max(float(poll_interval_seconds), 0.1)
+    if scan_limit is not None:
+        workflow_dispatch_poller_service._scan_limit = max(int(scan_limit), 1)
+    return {
+        "dispatcher_id": workflow_dispatcher_service.dispatcher_id,
+        "lease_seconds": float(getattr(workflow_dispatcher_service, "_lease_seconds", 0.0)),
+        "poll_interval_seconds": float(getattr(workflow_dispatch_poller_service, "_poll_interval_seconds", 0.0)),
+        "scan_limit": int(getattr(workflow_dispatch_poller_service, "_scan_limit", 0)),
+    }
+
+
+def run_dispatcher_runtime(
+    *,
+    dispatcher_id: str,
+    poll_interval_seconds: float | None = None,
+    lease_seconds: float | None = None,
+    scan_limit: int | None = None,
+    run_once: bool = False,
+    shutdown_after_seconds: float | None = None,
+) -> dict[str, Any]:
+    runtime = _configure_dispatcher_runtime(
+        dispatcher_id=dispatcher_id,
+        poll_interval_seconds=poll_interval_seconds,
+        lease_seconds=lease_seconds,
+        scan_limit=scan_limit,
+    )
+    if run_once:
+        runtime["mode"] = "run_once"
+        runtime["summary"] = workflow_dispatch_poller_service.poll_once()
+        return runtime
+
+    stop_event = Event()
+
+    def _stop(_: int, __) -> None:
+        stop_event.set()
+
+    signal.signal(signal.SIGINT, _stop)
+    signal.signal(signal.SIGTERM, _stop)
+
+    workflow_dispatch_poller_service.start()
+    started_at = time.time()
+    runtime["mode"] = "daemon"
+    runtime["started_at_epoch"] = started_at
+    try:
+        while not stop_event.wait(timeout=0.5):
+            if shutdown_after_seconds is not None and time.time() - started_at >= shutdown_after_seconds:
+                break
+    finally:
+        workflow_dispatch_poller_service.stop()
+    runtime["stopped"] = True
+    runtime["ran_for_seconds"] = round(time.time() - started_at, 3)
+    return runtime
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Run a standalone workflow dispatcher poller runtime.")
+    parser.add_argument("--dispatcher-id", required=True)
+    parser.add_argument("--poll-interval-seconds", type=float, default=None)
+    parser.add_argument("--lease-seconds", type=float, default=None)
+    parser.add_argument("--scan-limit", type=int, default=None)
+    parser.add_argument("--run-once", action="store_true")
+    parser.add_argument("--shutdown-after-seconds", type=float, default=None)
+    args = parser.parse_args()
+
+    payload = run_dispatcher_runtime(
+        dispatcher_id=str(args.dispatcher_id).strip(),
+        poll_interval_seconds=args.poll_interval_seconds,
+        lease_seconds=args.lease_seconds,
+        scan_limit=args.scan_limit,
+        run_once=bool(args.run_once),
+        shutdown_after_seconds=args.shutdown_after_seconds,
+    )
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

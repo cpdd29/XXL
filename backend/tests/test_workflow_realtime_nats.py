@@ -86,16 +86,13 @@ def test_nats_event_bus_publish_round_trips_to_wildcard_subscribers() -> None:
         )
 
         assert published is True
-        assert received == [
-            (
-                "workflow.runs.workflow-1",
-                {
-                    "type": "workflow_run.updated",
-                    "workflowId": "workflow-1",
-                    "run": {"id": "run-1"},
-                },
-            )
-        ]
+        assert len(received) == 1
+        assert received[0][0] == "workflow.runs.workflow-1"
+        assert received[0][1]["type"] == "workflow_run.updated"
+        assert received[0][1]["workflowId"] == "workflow-1"
+        assert received[0][1]["run"] == {"id": "run-1"}
+        assert received[0][1]["event_name"] == "workflow_run.updated"
+        assert received[0][1]["subject"] == "workflow.runs.workflow-1"
         assert fake_client.published[0][0] == "workflow.runs.workflow-1"
     finally:
         event_bus.close()
@@ -138,9 +135,57 @@ def test_workflow_realtime_service_uses_nats_bus_when_available() -> None:
         assert payload["type"] == "workflow_run.created"
         assert payload["workflowId"] == "workflow-1"
         assert payload["run"]["id"] == "run-nats-1"
+        assert payload["run"].get("nodes") == []
         assert fake_client.published[0][0] == "workflow.runs.workflow-1"
+        assert fake_client.published[1][0] == "brain.workflow.run.created"
+        bus_payload = fake_client.published[0][1]
+        assert bus_payload["run"]["summaryOnly"] is True
+        assert bus_payload["run"]["id"] == "run-nats-1"
+        assert "nodes" not in bus_payload["run"]
     finally:
         realtime_service._unsubscribe("workflow-1", subscriber)
+        event_bus.close()
+
+
+def test_workflow_realtime_service_redacts_dispatch_context_on_nats_bus() -> None:
+    fake_client = FakeNatsClient()
+    event_bus = NatsEventBus(
+        retry_interval_seconds=0,
+        client_factory_override=lambda: fake_client,
+    )
+    realtime_service = WorkflowRealtimeService(event_bus=event_bus)
+    created_at = store.now_string()
+    run = {
+        "id": "run-redacted-1",
+        "workflow_id": "workflow-1",
+        "workflow_name": "工作流一",
+        "task_id": "task-1",
+        "trigger": "manual",
+        "intent": "search",
+        "status": "running",
+        "created_at": created_at,
+        "updated_at": created_at,
+        "started_at": created_at,
+        "completed_at": None,
+        "current_stage": "执行中",
+        "active_edges": [],
+        "nodes": [{"id": "node-1", "status": "running"}],
+        "logs": [{"id": "log-1", "message": "secret"}],
+        "dispatch_context": {
+            "type": "message",
+            "manager_packet": {"secret": "should-not-leak"},
+            "memory": {"raw": "memory"},
+            "audit": {"raw": "audit"},
+        },
+    }
+
+    try:
+        realtime_service.publish_run_event(run, "workflow_run.updated")
+        bus_payload = fake_client.published[0][1]
+        assert bus_payload["run"]["dispatchContext"]["managerPacket"]["redacted"] is True
+        assert bus_payload["run"]["dispatchContext"]["memory"]["redacted"] is True
+        assert bus_payload["run"]["dispatchContext"]["audit"]["redacted"] is True
+    finally:
         event_bus.close()
 
 

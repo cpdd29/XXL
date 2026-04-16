@@ -188,6 +188,7 @@ def test_agent_execution_worker_service_enqueues_and_publishes() -> None:
     assert payload["max_attempts"] == 3
     assert persistence.upserted_jobs[0]["request_id"] == payload["request_id"]
     assert persistence.upserted_jobs[0]["message_type"] == "command"
+    assert any(item[0] == "brain.agent.execution.request" for item in event_bus.published)
 
 
 def test_agent_execution_worker_service_consumes_payload_and_completes_job(monkeypatch) -> None:
@@ -242,6 +243,9 @@ def test_agent_execution_worker_service_consumes_payload_and_completes_job(monke
     assert persistence.get_agent_execution_job("run-agent-1") is None
     result_events = [item for item in event_bus.published if item[0] == worker_module.AGENT_EXECUTION_RESULT_SUBJECT]
     assert len(result_events) == 1
+    assert any(item[0] == "brain.agent.execution.claimed" for item in event_bus.published)
+    assert any(item[0] == "brain.agent.execution.started" for item in event_bus.published)
+    assert any(item[0] == "brain.agent.execution.completed" for item in event_bus.published)
     result_payload = result_events[0][1]
     assert result_payload["message_type"] == "result"
     assert result_payload["message_name"] == "agent.execution.completed"
@@ -296,10 +300,16 @@ def test_agent_execution_worker_service_marks_failure_when_completion_raises(mon
     command_events = [item for item in event_bus.published if item[0] == worker_module.AGENT_EXECUTION_SUBJECT]
     assert len(command_events) == 1
     assert command_events[0][1]["attempt"] == 2
-    retry_events = [item for item in event_bus.published if item[0] == worker_module.AGENT_EXECUTION_EVENT_SUBJECT]
+    retry_events = [
+        item
+        for item in event_bus.published
+        if item[0] == worker_module.AGENT_EXECUTION_EVENT_SUBJECT
+        and item[1]["message_name"] == "agent.execution.retry_scheduled"
+    ]
     assert len(retry_events) == 1
-    assert retry_events[0][1]["message_name"] == "agent.execution.retry_scheduled"
     assert retry_events[0][1]["request_id"] == "req-agent-failure"
+    assert any(item[0] == "brain.agent.execution.claimed" for item in event_bus.published)
+    assert any(item[0] == "brain.agent.execution.started" for item in event_bus.published)
 
 
 def test_agent_execution_worker_service_marks_dead_letter_after_max_attempts(monkeypatch) -> None:
@@ -342,10 +352,16 @@ def test_agent_execution_worker_service_marks_dead_letter_after_max_attempts(mon
     assert summary["skipped_claimed"] == 1
     assert failures == [("run-agent-dead-letter", "Agent 执行失败并进入死信：boom")]
     assert persistence.get_agent_execution_job("run-agent-dead-letter") is None
-    dead_letter_events = [item for item in event_bus.published if item[0] == worker_module.AGENT_EXECUTION_EVENT_SUBJECT]
+    dead_letter_events = [
+        item
+        for item in event_bus.published
+        if item[0] == worker_module.AGENT_EXECUTION_EVENT_SUBJECT
+        and item[1]["message_name"] == "agent.execution.dead_lettered"
+    ]
     assert len(dead_letter_events) == 1
     dead_letter_payload = dead_letter_events[0][1]
     assert dead_letter_payload["message_name"] == "agent.execution.dead_lettered"
     assert dead_letter_payload["dead_letter"] is True
     assert dead_letter_payload["dead_letter_reason"] == "boom"
     assert dead_letter_payload["request_id"] == "req-agent-dead-letter"
+    assert any(item[0] == "brain.agent.execution.failed" for item in event_bus.published)

@@ -52,6 +52,25 @@ class SQLiteMidTermMemoryStore:
                 preferences_json TEXT NOT NULL DEFAULT '[]',
                 decisions_json TEXT NOT NULL DEFAULT '[]',
                 task_results_json TEXT NOT NULL DEFAULT '[]',
+                memory_scope TEXT NOT NULL DEFAULT 'tenant',
+                memory_layer_kind TEXT NOT NULL DEFAULT 'working',
+                write_source TEXT NOT NULL DEFAULT 'brain_internal',
+                trust_level TEXT NOT NULL DEFAULT 'trusted',
+                memory_status TEXT NOT NULL DEFAULT 'active',
+                review_status TEXT NOT NULL DEFAULT 'approved',
+                reviewed_by TEXT,
+                reviewed_at TEXT,
+                review_note TEXT,
+                tenant_id TEXT NOT NULL DEFAULT 'default',
+                project_id TEXT NOT NULL DEFAULT 'default',
+                environment TEXT NOT NULL DEFAULT 'development',
+                expires_at TEXT,
+                archived_at TEXT,
+                deleted_at TEXT,
+                corrected_at TEXT,
+                retention_policy TEXT NOT NULL DEFAULT 'default',
+                local_only_reasons_json TEXT NOT NULL DEFAULT '[]',
+                local_only_filtered_count INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL
             )
             """
@@ -60,16 +79,46 @@ class SQLiteMidTermMemoryStore:
             row["name"]
             for row in connection.execute("PRAGMA table_info(mid_term_summaries)").fetchall()
         }
-        for column_name in ("preferences_json", "decisions_json", "task_results_json"):
+        missing_columns = {
+            "preferences_json": "TEXT NOT NULL DEFAULT '[]'",
+            "decisions_json": "TEXT NOT NULL DEFAULT '[]'",
+            "task_results_json": "TEXT NOT NULL DEFAULT '[]'",
+            "memory_scope": "TEXT NOT NULL DEFAULT 'tenant'",
+            "memory_layer_kind": "TEXT NOT NULL DEFAULT 'working'",
+            "write_source": "TEXT NOT NULL DEFAULT 'brain_internal'",
+            "trust_level": "TEXT NOT NULL DEFAULT 'trusted'",
+            "memory_status": "TEXT NOT NULL DEFAULT 'active'",
+            "review_status": "TEXT NOT NULL DEFAULT 'approved'",
+            "reviewed_by": "TEXT",
+            "reviewed_at": "TEXT",
+            "review_note": "TEXT",
+            "tenant_id": "TEXT NOT NULL DEFAULT 'default'",
+            "project_id": "TEXT NOT NULL DEFAULT 'default'",
+            "environment": "TEXT NOT NULL DEFAULT 'development'",
+            "expires_at": "TEXT",
+            "archived_at": "TEXT",
+            "deleted_at": "TEXT",
+            "corrected_at": "TEXT",
+            "retention_policy": "TEXT NOT NULL DEFAULT 'default'",
+            "local_only_reasons_json": "TEXT NOT NULL DEFAULT '[]'",
+            "local_only_filtered_count": "INTEGER NOT NULL DEFAULT 0",
+        }
+        for column_name, column_ddl in missing_columns.items():
             if column_name in existing_columns:
                 continue
             connection.execute(
-                f"ALTER TABLE mid_term_summaries ADD COLUMN {column_name} TEXT NOT NULL DEFAULT '[]'"
+                f"ALTER TABLE mid_term_summaries ADD COLUMN {column_name} {column_ddl}"
             )
         connection.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_mid_term_summaries_user_created
             ON mid_term_summaries (user_id, created_at)
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_mid_term_summaries_scope_status
+            ON mid_term_summaries (user_id, tenant_id, project_id, environment, memory_status, created_at)
             """
         )
         connection.commit()
@@ -96,8 +145,27 @@ class SQLiteMidTermMemoryStore:
                         preferences_json,
                         decisions_json,
                         task_results_json,
+                        memory_scope,
+                        memory_layer_kind,
+                        write_source,
+                        trust_level,
+                        memory_status,
+                        review_status,
+                        reviewed_by,
+                        reviewed_at,
+                        review_note,
+                        tenant_id,
+                        project_id,
+                        environment,
+                        expires_at,
+                        archived_at,
+                        deleted_at,
+                        corrected_at,
+                        retention_policy,
+                        local_only_reasons_json,
+                        local_only_filtered_count,
                         created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         summary["id"],
@@ -136,6 +204,32 @@ class SQLiteMidTermMemoryStore:
                                 json.dumps(summary.get("task_results", []), ensure_ascii=False)
                             )
                         ),
+                        str(summary.get("memory_scope") or "tenant"),
+                        str(summary.get("memory_layer_kind") or "working"),
+                        str(summary.get("write_source") or "brain_internal"),
+                        str(summary.get("trust_level") or "trusted"),
+                        str(summary.get("memory_status") or "active"),
+                        str(summary.get("review_status") or "approved"),
+                        summary.get("reviewed_by"),
+                        summary.get("reviewed_at"),
+                        summary.get("review_note"),
+                        str(summary.get("tenant_id") or "default"),
+                        str(summary.get("project_id") or "default"),
+                        str(summary.get("environment") or "development"),
+                        summary.get("expires_at"),
+                        summary.get("archived_at"),
+                        summary.get("deleted_at"),
+                        summary.get("corrected_at"),
+                        str(summary.get("retention_policy") or "default"),
+                        str(
+                            encryption_service.encrypt_text(
+                                json.dumps(
+                                    summary.get("local_only_reasons", []),
+                                    ensure_ascii=False,
+                                )
+                            )
+                        ),
+                        int(summary.get("local_only_filtered_count") or 0),
                         summary["created_at"],
                     ),
                 )
@@ -168,6 +262,25 @@ class SQLiteMidTermMemoryStore:
                     preferences_json,
                     decisions_json,
                     task_results_json,
+                    memory_scope,
+                    memory_layer_kind,
+                    write_source,
+                    trust_level,
+                    memory_status,
+                    review_status,
+                    reviewed_by,
+                    reviewed_at,
+                    review_note,
+                    tenant_id,
+                    project_id,
+                    environment,
+                    expires_at,
+                    archived_at,
+                    deleted_at,
+                    corrected_at,
+                    retention_policy,
+                    local_only_reasons_json,
+                    local_only_filtered_count,
                     created_at
                 FROM mid_term_summaries
                 WHERE user_id = ?
@@ -191,6 +304,25 @@ class SQLiteMidTermMemoryStore:
                     "preferences": self._decode_json_field(row["preferences_json"]),
                     "decisions": self._decode_json_field(row["decisions_json"]),
                     "task_results": self._decode_json_field(row["task_results_json"]),
+                    "memory_scope": row["memory_scope"],
+                    "memory_layer_kind": row["memory_layer_kind"],
+                    "write_source": row["write_source"],
+                    "trust_level": row["trust_level"],
+                    "memory_status": row["memory_status"],
+                    "review_status": row["review_status"],
+                    "reviewed_by": row["reviewed_by"],
+                    "reviewed_at": row["reviewed_at"],
+                    "review_note": row["review_note"],
+                    "tenant_id": row["tenant_id"],
+                    "project_id": row["project_id"],
+                    "environment": row["environment"],
+                    "expires_at": row["expires_at"],
+                    "archived_at": row["archived_at"],
+                    "deleted_at": row["deleted_at"],
+                    "corrected_at": row["corrected_at"],
+                    "retention_policy": row["retention_policy"] or "default",
+                    "local_only_reasons": self._decode_json_field(row["local_only_reasons_json"]),
+                    "local_only_filtered_count": int(row["local_only_filtered_count"] or 0),
                     "created_at": row["created_at"],
                 }
                 for row in rows

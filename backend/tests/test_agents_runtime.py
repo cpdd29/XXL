@@ -141,3 +141,107 @@ def test_resolve_direct_execution_agent_falls_back_to_degraded() -> None:
     selected = workflow_execution_service.resolve_direct_execution_agent("search")
     assert selected is not None
     assert selected["id"] == "search-degraded-only"
+
+
+def test_resolve_agent_dispatch_execution_agent_keeps_direct_wrapper_compatible() -> None:
+    now = datetime.now(UTC)
+    store.agents = [
+        _build_agent(
+            agent_id="search-online",
+            agent_type="search",
+            config_snapshot={
+                "runtime": {
+                    "last_heartbeat_at": now.isoformat(),
+                    "heartbeat_interval_seconds": 10,
+                    "heartbeat_timeout_seconds": 60,
+                }
+            },
+        )
+    ]
+
+    selected = workflow_execution_service.resolve_agent_dispatch_execution_agent("search")
+    wrapped = workflow_execution_service.resolve_direct_execution_agent("search")
+
+    assert selected is not None
+    assert wrapped is not None
+    assert selected["id"] == "search-online"
+    assert wrapped["id"] == selected["id"]
+
+
+def test_agent_dispatch_run_detection_accepts_canonical_type() -> None:
+    assert workflow_execution_service._is_agent_dispatch_run(
+        {
+            "workflow_id": "workflow-1",
+            "dispatch_context": {"type": "agent_dispatch"},
+        }
+    )
+
+
+def test_agent_dispatch_run_detection_accepts_legacy_type_alias() -> None:
+    assert workflow_execution_service._is_agent_dispatch_run(
+        {
+            "workflow_id": "workflow-1",
+            "dispatch_context": {"type": "direct_agent_dispatch"},
+        }
+    )
+    assert workflow_execution_service._is_agent_dispatch_run(
+        {
+            "workflow_id": workflow_execution_service.AGENT_DISPATCH_WORKFLOW_ID,
+            "dispatch_context": {"type": "workflow_dispatch"},
+        }
+    )
+    assert workflow_execution_service._is_agent_dispatch_run(
+        {
+            "workflow_id": workflow_execution_service.LEGACY_AGENT_DISPATCH_WORKFLOW_ID,
+            "dispatch_context": {"type": "workflow_dispatch"},
+        }
+    )
+
+
+def test_dispatch_type_alias_normalization_maps_legacy_direct_name() -> None:
+    assert workflow_execution_service._normalize_dispatch_context_type("agent_dispatch") == "agent_dispatch"
+    assert (
+        workflow_execution_service._normalize_dispatch_context_type("direct_agent_dispatch")
+        == "agent_dispatch"
+    )
+
+
+def test_fallback_policy_canonical_mode_resolves_agent_execution_recovery_action() -> None:
+    assert workflow_execution_service._resolved_fallback_action(
+        fallback_policy={"mode": "agent_dispatch_fallback"},
+        reason="executor_unavailable",
+    ) == "reroute_agent_execution"
+
+
+def test_fallback_policy_legacy_mode_alias_resolves_agent_execution_recovery_action() -> None:
+    assert workflow_execution_service._resolved_fallback_action(
+        fallback_policy={"mode": "direct_agent_fallback"},
+        reason="executor_unavailable",
+    ) == "reroute_agent_execution"
+
+
+def test_fallback_policy_canonical_mode_allows_auto_recovery_gate() -> None:
+    dispatch_context = {"state_machine": {"fallback_attempt_count": 0}}
+    assert workflow_execution_service._should_auto_recover_fallback(
+        fallback_policy={"mode": "agent_dispatch_fallback"},
+        reason="dispatch_failure",
+        dispatch_context=dispatch_context,
+    )
+
+
+def test_fallback_policy_legacy_mode_alias_allows_auto_recovery_gate() -> None:
+    dispatch_context = {"state_machine": {"fallback_attempt_count": 0}}
+    assert workflow_execution_service._should_auto_recover_fallback(
+        fallback_policy={"mode": "direct_agent_fallback"},
+        reason="dispatch_failure",
+        dispatch_context=dispatch_context,
+    )
+
+
+def test_fallback_mode_alias_normalization_maps_legacy_direct_name() -> None:
+    assert workflow_execution_service._normalize_fallback_policy_mode("direct_agent_fallback") == (
+        "agent_dispatch_fallback"
+    )
+    assert workflow_execution_service._normalize_fallback_policy_mode("agent_dispatch_fallback") == (
+        "agent_dispatch_fallback"
+    )

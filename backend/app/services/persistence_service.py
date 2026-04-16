@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 import logging
 from typing import Any
 
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import delete, func, inspect, select, update
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.config import get_settings
@@ -38,6 +38,38 @@ from app.services.store import store
 
 logger = logging.getLogger(__name__)
 TERMINAL_WORKFLOW_RUN_STATUSES = {"completed", "failed", "cancelled"}
+JOB_PROTOCOL_KEYS = (
+    "spec_version",
+    "message_id",
+    "message_type",
+    "message_name",
+    "request_id",
+    "correlation_id",
+    "causation_id",
+    "idempotency_key",
+    "attempt",
+    "max_attempts",
+    "emitted_at",
+    "available_at",
+    "deadline_at",
+    "dead_letter",
+    "dead_letter_reason",
+    "source",
+    "target",
+    "last_error",
+)
+
+RUNTIME_SCHEMA_COMPAT_COLUMNS: dict[str, dict[str, str]] = {
+    "workflow_dispatch_jobs": {
+        "protocol": "JSON",
+    },
+    "workflow_execution_jobs": {
+        "protocol": "JSON",
+    },
+    "agent_execution_jobs": {
+        "protocol": "JSON",
+    },
+}
 
 
 def _parse_datetime(value: str | None) -> datetime | None:
@@ -50,6 +82,28 @@ def _parse_datetime(value: str | None) -> datetime | None:
     if parsed.tzinfo is None:
         return parsed.replace(tzinfo=UTC)
     return parsed
+
+
+def _extract_job_protocol_snapshot(payload: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(payload, dict):
+        return None
+
+    nested_protocol = payload.get("protocol")
+    nested = nested_protocol if isinstance(nested_protocol, dict) else {}
+    snapshot: dict[str, Any] = {}
+    for key in JOB_PROTOCOL_KEYS:
+        if key in payload and payload.get(key) is not None:
+            snapshot[key] = deepcopy(payload[key])
+            continue
+        if key in nested and nested.get(key) is not None:
+            snapshot[key] = deepcopy(nested[key])
+    return snapshot or None
+
+
+def _flatten_job_protocol_snapshot(protocol: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(protocol, dict):
+        return {}
+    return {key: deepcopy(value) for key, value in protocol.items()}
 
 
 class StatePersistenceService:
@@ -65,6 +119,7 @@ class StatePersistenceService:
             self._engine = create_engine_for_url(self.database_url)
             self._session_factory = create_session_factory(self._engine)
             Base.metadata.create_all(self._engine)
+            self._ensure_runtime_schema_compatibility()
             self.enabled = True
             self._bootstrap_runtime_state()
             return True
@@ -79,6 +134,36 @@ class StatePersistenceService:
         self._engine = None
         self._session_factory = None
         self.enabled = False
+
+    def _ensure_runtime_schema_compatibility(self) -> None:
+        if self._engine is None:
+            return
+
+        inspector = inspect(self._engine)
+        existing_tables = set(inspector.get_table_names())
+        pending_repairs: list[tuple[str, str, str]] = []
+        for table_name, column_map in RUNTIME_SCHEMA_COMPAT_COLUMNS.items():
+            if table_name not in existing_tables:
+                continue
+            existing_columns = {column["name"] for column in inspector.get_columns(table_name)}
+            for column_name, ddl in column_map.items():
+                if column_name in existing_columns:
+                    continue
+                pending_repairs.append((table_name, column_name, ddl))
+
+        if not pending_repairs:
+            return
+
+        with self._engine.begin() as connection:
+            for table_name, column_name, ddl in pending_repairs:
+                connection.exec_driver_sql(
+                    f"ALTER TABLE {table_name} ADD COLUMN {column_name} {ddl}"
+                )
+                logger.info(
+                    "Applied runtime schema compatibility patch: added %s.%s",
+                    table_name,
+                    column_name,
+                )
 
     def persist_all(self) -> bool:
         return self._persist(
@@ -632,6 +717,23 @@ class StatePersistenceService:
             )
             return None
 
+    def list_workflow_dispatch_jobs(self) -> list[dict[str, Any]] | None:
+        if not self.enabled or self._session_factory is None:
+            return None
+
+        try:
+            with self._session_factory() as session:
+                rows = session.scalars(
+                    select(WorkflowDispatchJobRecord).order_by(
+                        WorkflowDispatchJobRecord.available_at,
+                        WorkflowDispatchJobRecord.run_id,
+                    )
+                ).all()
+                return [self._workflow_dispatch_job_record_to_payload(row) for row in rows]
+        except SQLAlchemyError as exc:
+            logger.warning("Failed to load workflow dispatch jobs from database: %s", exc)
+            return None
+
     def get_workflow_execution_job(self, run_id: str) -> dict[str, Any] | None:
         if not self.enabled or self._session_factory is None:
             return None
@@ -650,6 +752,23 @@ class StatePersistenceService:
             )
             return None
 
+    def list_workflow_execution_jobs(self) -> list[dict[str, Any]] | None:
+        if not self.enabled or self._session_factory is None:
+            return None
+
+        try:
+            with self._session_factory() as session:
+                rows = session.scalars(
+                    select(WorkflowExecutionJobRecord).order_by(
+                        WorkflowExecutionJobRecord.available_at,
+                        WorkflowExecutionJobRecord.run_id,
+                    )
+                ).all()
+                return [self._workflow_execution_job_record_to_payload(row) for row in rows]
+        except SQLAlchemyError as exc:
+            logger.warning("Failed to load workflow execution jobs from database: %s", exc)
+            return None
+
     def get_agent_execution_job(self, run_id: str) -> dict[str, Any] | None:
         if not self.enabled or self._session_factory is None:
             return None
@@ -666,6 +785,23 @@ class StatePersistenceService:
                 run_id,
                 exc,
             )
+            return None
+
+    def list_agent_execution_jobs(self) -> list[dict[str, Any]] | None:
+        if not self.enabled or self._session_factory is None:
+            return None
+
+        try:
+            with self._session_factory() as session:
+                rows = session.scalars(
+                    select(AgentExecutionJobRecord).order_by(
+                        AgentExecutionJobRecord.available_at,
+                        AgentExecutionJobRecord.run_id,
+                    )
+                ).all()
+                return [self._agent_execution_job_record_to_payload(row) for row in rows]
+        except SQLAlchemyError as exc:
+            logger.warning("Failed to load agent execution jobs from database: %s", exc)
             return None
 
     def get_internal_event_delivery(self, delivery_id: str) -> dict[str, Any] | None:
@@ -906,6 +1042,7 @@ class StatePersistenceService:
         )
         normalized_queued_at = queued_at if queued_at and _parse_datetime(queued_at) else None
         timestamp = normalized_queued_at or datetime.now(UTC).isoformat()
+        protocol_snapshot = _extract_job_protocol_snapshot(_)
         resolved_step_delay = (
             max(float(step_delay_seconds), 0.0)
             if step_delay_seconds is not None
@@ -920,6 +1057,7 @@ class StatePersistenceService:
                         run_id=normalized_run_id,
                         available_at=available_at,
                         step_delay_seconds=resolved_step_delay,
+                        protocol=protocol_snapshot,
                         dispatcher_id=normalized_dispatcher_id,
                         claimed_at=normalized_claimed_at,
                         lease_expires_at=normalized_lease_expires_at,
@@ -930,6 +1068,8 @@ class StatePersistenceService:
                 else:
                     row.available_at = available_at
                     row.step_delay_seconds = resolved_step_delay
+                    if protocol_snapshot is not None:
+                        row.protocol = protocol_snapshot
                     row.dispatcher_id = normalized_dispatcher_id
                     row.claimed_at = normalized_claimed_at
                     row.lease_expires_at = normalized_lease_expires_at
@@ -1161,6 +1301,7 @@ class StatePersistenceService:
         normalized_worker_id = str(worker_id or "").strip() or None
         normalized_claimed_at = str(claimed_at or "").strip() or None
         normalized_lease_expires_at = str(lease_expires_at or "").strip() or None
+        protocol_snapshot = _extract_job_protocol_snapshot(_)
         resolved_step_delay = (
             float(step_delay_seconds)
             if step_delay_seconds is not None
@@ -1175,6 +1316,7 @@ class StatePersistenceService:
                         run_id=normalized_run_id,
                         available_at=available_at,
                         step_delay_seconds=resolved_step_delay,
+                        protocol=protocol_snapshot,
                         worker_id=normalized_worker_id,
                         claimed_at=normalized_claimed_at,
                         lease_expires_at=normalized_lease_expires_at,
@@ -1185,6 +1327,8 @@ class StatePersistenceService:
                 else:
                     row.available_at = available_at
                     row.step_delay_seconds = resolved_step_delay
+                    if protocol_snapshot is not None:
+                        row.protocol = protocol_snapshot
                     row.worker_id = normalized_worker_id
                     row.claimed_at = normalized_claimed_at
                     row.lease_expires_at = normalized_lease_expires_at
@@ -1428,6 +1572,7 @@ class StatePersistenceService:
         normalized_worker_id = str(worker_id or "").strip() or None
         normalized_claimed_at = str(claimed_at or "").strip() or None
         normalized_lease_expires_at = str(lease_expires_at or "").strip() or None
+        protocol_snapshot = _extract_job_protocol_snapshot(_)
         resolved_step_delay = float(step_delay_seconds) if step_delay_seconds is not None else None
 
         try:
@@ -1441,6 +1586,7 @@ class StatePersistenceService:
                         execution_agent_id=normalized_execution_agent_id,
                         available_at=available_at,
                         step_delay_seconds=resolved_step_delay,
+                        protocol=protocol_snapshot,
                         worker_id=normalized_worker_id,
                         claimed_at=normalized_claimed_at,
                         lease_expires_at=normalized_lease_expires_at,
@@ -1454,6 +1600,8 @@ class StatePersistenceService:
                     row.execution_agent_id = normalized_execution_agent_id
                     row.available_at = available_at
                     row.step_delay_seconds = resolved_step_delay
+                    if protocol_snapshot is not None:
+                        row.protocol = protocol_snapshot
                     row.worker_id = normalized_worker_id
                     row.claimed_at = normalized_claimed_at
                     row.lease_expires_at = normalized_lease_expires_at
@@ -2294,7 +2442,7 @@ class StatePersistenceService:
     def _workflow_dispatch_job_record_to_payload(
         row: WorkflowDispatchJobRecord,
     ) -> dict[str, Any]:
-        return {
+        payload = {
             "run_id": row.run_id,
             "available_at": row.available_at,
             "step_delay_seconds": row.step_delay_seconds,
@@ -2306,12 +2454,16 @@ class StatePersistenceService:
             "created_at": row.created_at,
             "updated_at": row.updated_at,
         }
+        if row.protocol is not None:
+            payload["protocol"] = deepcopy(row.protocol)
+            payload.update(_flatten_job_protocol_snapshot(row.protocol))
+        return payload
 
     @staticmethod
     def _workflow_execution_job_record_to_payload(
         row: WorkflowExecutionJobRecord,
     ) -> dict[str, Any]:
-        return {
+        payload = {
             "run_id": row.run_id,
             "available_at": row.available_at,
             "step_delay_seconds": row.step_delay_seconds,
@@ -2321,12 +2473,16 @@ class StatePersistenceService:
             "created_at": row.created_at,
             "updated_at": row.updated_at,
         }
+        if row.protocol is not None:
+            payload["protocol"] = deepcopy(row.protocol)
+            payload.update(_flatten_job_protocol_snapshot(row.protocol))
+        return payload
 
     @staticmethod
     def _agent_execution_job_record_to_payload(
         row: AgentExecutionJobRecord,
     ) -> dict[str, Any]:
-        return {
+        payload = {
             "run_id": row.run_id,
             "task_id": row.task_id,
             "workflow_id": row.workflow_id,
@@ -2339,6 +2495,10 @@ class StatePersistenceService:
             "created_at": row.created_at,
             "updated_at": row.updated_at,
         }
+        if row.protocol is not None:
+            payload["protocol"] = deepcopy(row.protocol)
+            payload.update(_flatten_job_protocol_snapshot(row.protocol))
+        return payload
 
     @staticmethod
     def _internal_event_delivery_record_to_payload(

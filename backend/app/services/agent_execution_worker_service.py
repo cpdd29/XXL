@@ -14,8 +14,17 @@ from app.core.agent_protocol import (
     protocol_from_dispatch_context,
     protocol_from_message,
 )
+from app.core.event_protocol import summarize_payload_for_bus
+from app.core.event_subjects import (
+    AGENT_EXECUTION_CLAIMED_SUBJECT,
+    AGENT_EXECUTION_COMPLETED_SUBJECT,
+    AGENT_EXECUTION_FAILED_SUBJECT,
+    AGENT_EXECUTION_REQUEST_SUBJECT,
+    AGENT_EXECUTION_STARTED_SUBJECT,
+)
 from app.core.nats_event_bus import nats_event_bus
 from app.services.persistence_service import persistence_service
+from app.services.scheduler_guard_service import scheduler_guard_service
 from app.services.store import store
 
 
@@ -160,7 +169,19 @@ class AgentExecutionWorkerService:
             step_delay=step_delay,
             protocol=resolved_protocol,
         )
-        published = self._event_bus.publish_json(AGENT_EXECUTION_SUBJECT, envelope)
+        published = self._publish_to_subjects(
+            (AGENT_EXECUTION_SUBJECT, AGENT_EXECUTION_REQUEST_SUBJECT),
+            envelope,
+        )
+        if durable and not published:
+            try:
+                self.poll_once()
+            except Exception as exc:
+                logger.warning(
+                    "Agent execution eager fallback failed for run %s: %s",
+                    normalized_run_id,
+                    exc,
+                )
         return durable or published
 
     def poll_once(self) -> dict[str, int]:
@@ -169,6 +190,10 @@ class AgentExecutionWorkerService:
             "skipped_terminal": 0,
             "skipped_claimed": 0,
         }
+        scheduler_guard_service.guard_agent_execution_runtime(
+            now=_utc_now(),
+            persistence=self._persistence,
+        )
 
         due_jobs = self._load_due_execution_jobs()
         if due_jobs is None:
@@ -281,12 +306,39 @@ class AgentExecutionWorkerService:
         task = self._find_task(task_id)
         run = self._find_run(run_id)
         protocol = self._resolve_protocol(job, run)
+        if str(job.get("claimed_at") or "").strip():
+            self._publish_execution_event(
+                run_id=run_id,
+                task_id=task_id,
+                workflow_id=str(job.get("workflow_id") or "").strip() or None,
+                execution_agent_id=str(job.get("execution_agent_id") or "").strip() or None,
+                protocol=protocol,
+                message_name="agent.execution.claimed",
+                emitted_at=str(job.get("claimed_at") or "").strip() or _utc_now().isoformat(),
+                status="claimed",
+                lease_until=str(job.get("lease_expires_at") or "").strip() or None,
+                subject=AGENT_EXECUTION_CLAIMED_SUBJECT,
+                legacy_subject=AGENT_EXECUTION_EVENT_SUBJECT,
+            )
         if task is None:
             self._delete_execution_job(run_id, claimed_at=job.get("claimed_at"))
             return "skipped_terminal"
         if str(task.get("status") or "").strip().lower() in TERMINAL_TASK_STATUSES:
             self._delete_execution_job(run_id, claimed_at=job.get("claimed_at"))
             return "skipped_terminal"
+        self._publish_execution_event(
+            run_id=run_id,
+            task_id=task_id,
+            workflow_id=str(job.get("workflow_id") or "").strip() or None,
+            execution_agent_id=str(job.get("execution_agent_id") or "").strip() or None,
+            protocol=protocol,
+            message_name="agent.execution.started",
+            emitted_at=_utc_now().isoformat(),
+            status="started",
+            lease_until=str(job.get("lease_expires_at") or "").strip() or None,
+            subject=AGENT_EXECUTION_STARTED_SUBJECT,
+            legacy_subject=AGENT_EXECUTION_EVENT_SUBJECT,
+        )
 
         try:
             completed_run = workflow_execution_service.complete_agent_execution_job(
@@ -327,6 +379,7 @@ class AgentExecutionWorkerService:
                     message_name="agent.execution.retry_scheduled",
                     emitted_at=requeued_at,
                     error_message=f"Agent 执行失败，准备第 {current_attempt + 1} 次重试：{exc}",
+                    legacy_subject=AGENT_EXECUTION_EVENT_SUBJECT,
                 )
                 return "skipped_claimed"
 
@@ -351,6 +404,8 @@ class AgentExecutionWorkerService:
                 error_message=str(exc),
                 dead_letter=True,
                 dead_letter_reason=str(exc),
+                subject=AGENT_EXECUTION_FAILED_SUBJECT,
+                legacy_subject=AGENT_EXECUTION_EVENT_SUBJECT,
             )
             workflow_execution_service.fail_workflow_run_due_agent_execution_error(
                 run_id,
@@ -370,7 +425,8 @@ class AgentExecutionWorkerService:
                 message_name="agent.execution.completed",
                 emitted_at=_utc_now().isoformat(),
                 status=str(refreshed_run.get("status") or "").strip() or None,
-                subject=AGENT_EXECUTION_RESULT_SUBJECT,
+                subject=AGENT_EXECUTION_COMPLETED_SUBJECT,
+                legacy_subject=AGENT_EXECUTION_RESULT_SUBJECT,
                 message_type="result",
             )
         self._delete_execution_job(run_id, claimed_at=job.get("claimed_at"))
@@ -484,7 +540,9 @@ class AgentExecutionWorkerService:
         dead_letter: bool = False,
         dead_letter_reason: str | None = None,
         status: str | None = None,
+        lease_until: str | None = None,
         subject: str = AGENT_EXECUTION_EVENT_SUBJECT,
+        legacy_subject: str | None = None,
         message_type: str = "event",
     ) -> None:
         run = self._find_run(run_id)
@@ -495,12 +553,14 @@ class AgentExecutionWorkerService:
             "execution_agent_id": execution_agent_id,
             "status": status,
         }
+        if lease_until:
+            payload["lease_until"] = lease_until
         if error_message:
             payload["error_message"] = error_message
         envelope, resolved_protocol = build_protocol_envelope(
             message_name=message_name,
             message_type=message_type,
-            payload=payload,
+            payload=summarize_payload_for_bus(payload),
             protocol=protocol,
             dispatch_context=(run or {}).get("dispatch_context") if isinstance(run, dict) else None,
             run_id=run_id,
@@ -516,7 +576,25 @@ class AgentExecutionWorkerService:
         if run is not None:
             apply_protocol_to_run(run, resolved_protocol)
             self._persist_run(run)
-        self._event_bus.publish_json(subject, envelope)
+        subjects = [subject]
+        if legacy_subject:
+            subjects.append(legacy_subject)
+        self._publish_to_subjects(subjects, envelope)
+
+    def _publish_to_subjects(self, subjects: tuple[str, ...] | list[str], payload: dict) -> bool:
+        if not getattr(self._persistence, "enabled", False):
+            return False
+        if not bool(getattr(self._event_bus, "is_connected", lambda: False)()):
+            return False
+        published = False
+        seen: set[str] = set()
+        for subject in subjects:
+            normalized = str(subject or "").strip()
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            published = self._event_bus.publish_json(normalized, payload) or published
+        return published
 
 
 agent_execution_worker_service = AgentExecutionWorkerService()

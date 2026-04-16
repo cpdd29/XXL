@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from fastapi import HTTPException, status
 
+from app.brain_core.task_view import task_view_service
 from app.services.persistence_service import persistence_service
 from app.services.store import store
-from app.services.task_service import enrich_task_payload
+from app.services.tenancy_service import attach_scope
 from app.services.workflow_execution_service import get_workflow_run
 
 SEARCH_KEYWORDS = ("搜索", "文档", "知识库", "规格", "检索")
@@ -19,6 +20,22 @@ NODE_AGENT_TYPES = {
     "搜索 Agent": "search",
     "写作 Agent": "write",
 }
+
+
+def _project_task(task: dict, *, run: dict | None = None) -> dict:
+    return task_view_service.build_scoped_task_projection(
+        task,
+        run=run,
+        attach_scope_fn=attach_scope,
+    )
+
+
+def _session_execution_plan(task: dict, run: dict | None = None) -> dict | None:
+    return task_view_service.build_session_execution_plan(task, run=run)
+
+
+def _session_fallback_history(task: dict, run: dict | None = None) -> list[dict]:
+    return task_view_service.build_session_fallback_history(task, run=run)
 
 
 def _load_tasks() -> list[dict]:
@@ -394,10 +411,10 @@ def _current_stage(task: dict, nodes: list[dict]) -> str:
 
 
 def get_collaboration_overview(task_id: str | None = None) -> dict:
-    task = enrich_task_payload(_get_selected_task(task_id))
+    task = _project_task(_get_selected_task(task_id))
     if task.get("workflow_run_id"):
         run = get_workflow_run(task["workflow_run_id"])
-        task = enrich_task_payload(task, run=run)
+        task = _project_task(task, run=run)
         workflow = _get_workflow_by_id(task.get("workflow_id") or run["workflow_id"])
         session = {
             "task_id": task["id"],
@@ -421,6 +438,19 @@ def get_collaboration_overview(task_id: str | None = None) -> dict:
             "completed_steps": len([node for node in run["nodes"] if node["status"] == "completed"]),
             "total_steps": len(run["nodes"]),
             "workflow_run_id": run["id"],
+            "route_decision": task.get("route_decision"),
+            "manager_packet": task.get("manager_packet")
+            or (run.get("dispatch_context") or {}).get("manager_packet"),
+            "brain_dispatch_summary": task.get("brain_dispatch_summary")
+            or (run.get("dispatch_context") or {}).get("brain_dispatch_summary")
+            or (run.get("dispatch_context") or {}).get("brainDispatchSummary"),
+            "execution_plan": _session_execution_plan(task, run=run),
+            "fallback_history": _session_fallback_history(task, run=run),
+            "memory_injection_summary": task.get("memory_injection_summary")
+            or (run.get("dispatch_context") or {}).get("memory_injection"),
+            "context_patch_audit": task.get("context_patch_audit") or [],
+            "state_machine": task.get("state_machine")
+            or (run.get("dispatch_context") or {}).get("state_machine"),
         }
         return {
             "session": session,
@@ -468,6 +498,14 @@ def get_collaboration_overview(task_id: str | None = None) -> dict:
         "completed_steps": completed_steps,
         "total_steps": len(nodes),
         "workflow_run_id": task.get("workflow_run_id"),
+        "route_decision": task.get("route_decision"),
+        "manager_packet": task.get("manager_packet"),
+        "brain_dispatch_summary": task.get("brain_dispatch_summary"),
+        "execution_plan": _session_execution_plan(task),
+        "fallback_history": _session_fallback_history(task),
+        "memory_injection_summary": task.get("memory_injection_summary"),
+        "context_patch_audit": task.get("context_patch_audit") or [],
+        "state_machine": task.get("state_machine"),
     }
 
     return {

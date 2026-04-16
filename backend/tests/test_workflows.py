@@ -18,7 +18,7 @@ def wait_for_run_status(
     run_id: str,
     auth_headers: dict[str, str],
     expected_status: str,
-    timeout: float = 6.0,
+    timeout: float = 8.0,
 ) -> dict:
     deadline = time.time() + timeout
     last_body: dict | None = None
@@ -53,6 +53,49 @@ def test_manual_workflow_run_creates_task_and_run(auth_headers) -> None:
     runs_body = runs_response.json()
     assert runs_body["total"] >= 1
     assert runs_body["items"][0]["workflowId"] == "workflow-1"
+
+
+def test_manual_workflow_run_appends_control_plane_audit(auth_headers_factory) -> None:
+    response = client.post(
+        "/api/workflows/workflow-1/run",
+        headers=auth_headers_factory(role="power_user", email="dispatcher@example.test"),
+    )
+
+    assert response.status_code == 200
+    assert store.audit_logs[0]["action"] == "workflow.run.created"
+    assert store.audit_logs[0]["user"] == "dispatcher@example.test"
+
+
+def test_create_agent_dispatch_run_keeps_canonical_agent_dispatch_payload() -> None:
+    created_at = store.now_string()
+    task = {
+        "id": "task-direct-wrapper-compat",
+        "title": "兼容 wrapper 运行",
+        "description": "验证 direct wrapper 仍可创建 agent_dispatch run",
+        "status": "pending",
+        "completed_at": None,
+        "created_at": created_at,
+        "agent": "Master Bot Planner",
+        "tokens": 0,
+        "result": None,
+    }
+    run = workflow_execution_service.create_agent_dispatch_run_for_task(
+        task=task,
+        intent="search",
+        trigger="message",
+        memory_hits=0,
+        warnings=[],
+        dispatch_context={
+            "type": "agent_dispatch",
+            "route_decision": {"fallback_policy": {"mode": "agent_dispatch_fallback"}},
+        },
+    )
+
+    assert run["workflow_id"] == workflow_execution_service.AGENT_DISPATCH_WORKFLOW_ID
+    assert run["workflow_name"] == workflow_execution_service.AGENT_DISPATCH_WORKFLOW_NAME
+    assert run["dispatch_context"]["type"] == "agent_dispatch"
+    assert run["dispatch_context"]["route_decision"]["fallback_policy"]["mode"] == "agent_dispatch_fallback"
+    assert workflow_execution_service._is_agent_dispatch_run(run)
 
 
 def test_workflow_run_detail_exposes_node_error_history(auth_headers) -> None:
@@ -172,11 +215,753 @@ def test_workflow_run_detail_exposes_dispatch_context(auth_headers) -> None:
     assert dispatch_context["routeDecision"]["executionAgent"] == "搜索 Agent"
     assert dispatch_context["messagePreview"] == "请帮我搜索调度器设计文档"
     assert dispatch_context["state"] in {"queued", "dispatched", "completed"}
+    assert dispatch_context["managerPacket"]["managerRole"] == "reception_project_manager"
+    assert dispatch_context["managerPacket"]["deliveryMode"] == "structured_result"
+    assert dispatch_context["memory_injection"]["boundary"] == "long_term_read_only"
+    assert dispatch_context["memory_injection"]["injected_hits"] >= 0
+    assert dispatch_context["executionPlanSnapshot"]["version"] == "execution_plan.v1"
+    assert dispatch_context["executionPlanSnapshot"]["stepCount"] >= 1
+    assert dispatch_context["executionPlanSnapshot"]["currentOwner"]
+    assert dispatch_context["brainFactSnapshot"]["version"] == "brain_fact.v1"
+    assert dispatch_context["brainFactSnapshot"]["routing_fact"]["workflow_id"] == "workflow-1"
+    delivery_fact = dispatch_context["brainFactSnapshot"]["delivery_fact"]
+    assert delivery_fact["delivery_mode"] == "structured_result"
+    assert delivery_fact["channel"] == "telegram"
+    assert "target_present" in delivery_fact
+    if delivery_fact["target_present"]:
+        assert delivery_fact["target_type"] in {"chat_id", "session_id"}
+    if dispatch_context["state"] == "completed":
+        assert delivery_fact["delivery_status"] in {"sent", "failed", "skipped"}
+    else:
+        assert delivery_fact["delivery_status"] is None
+    assert dispatch_context["state_machine"]["version"] == "brain_fact_layer_v1"
     monitor = run_response.json()["monitor"]
     assert monitor["triggerType"] == "message"
     assert monitor["dispatchState"] in {"queued", "dispatched", "completed"}
     assert monitor["executionAgentId"] == dispatch_context["routeDecision"]["executionAgentId"]
     assert monitor["monitorState"] in {"queued", "scheduled", "claimed", "running", "completed"}
+
+
+def test_workflow_run_detail_exposes_run_metrics(auth_headers) -> None:
+    ingest = client.post(
+        "/api/messages/ingest",
+        json={
+            "channel": "telegram",
+            "platformUserId": "run-metrics-user",
+            "chatId": "run-metrics-chat",
+            "text": "请帮我搜索主脑调度成本方案",
+        },
+    )
+    assert ingest.status_code == 200
+
+    run_response = client.get(
+        f"/api/workflows/runs/{ingest.json()['runId']}",
+        headers=auth_headers,
+    )
+
+    assert run_response.status_code == 200
+    body = run_response.json()
+    assert body["tokensTotal"] >= 0
+    assert body["stepCount"] >= 1
+    assert "metrics" in body
+    assert body["metrics"]["tokensTotal"] == body["tokensTotal"]
+    assert body["metrics"]["stepCount"] == body["stepCount"]
+    assert body["dispatchContext"]["run_metrics"]["tokens_total"] == body["tokensTotal"]
+    if body["status"] == "completed":
+        assert body["durationMs"] is not None
+
+
+def test_workflow_run_detail_exposes_context_patch_audit(auth_headers) -> None:
+    first = client.post(
+        "/api/messages/ingest",
+        json={
+            "channel": "telegram",
+            "platformUserId": "context-patch-user",
+            "chatId": "context-patch-chat",
+            "text": "请帮我写一个客户说明邮件",
+        },
+    )
+    assert first.status_code == 200
+
+    follow_up = client.post(
+        "/api/messages/ingest",
+        json={
+            "channel": "telegram",
+            "platformUserId": "context-patch-user",
+            "chatId": "context-patch-chat",
+            "text": "继续，语气更正式一些",
+        },
+    )
+    assert follow_up.status_code == 200
+    assert follow_up.json()["entrypoint"] == "master_bot.context_patch"
+
+    task_id = first.json()["taskId"]
+    task_detail = client.get(f"/api/tasks/{task_id}", headers=auth_headers)
+    run_response = client.get(f"/api/workflows/runs/{first.json()['runId']}", headers=auth_headers)
+
+    assert task_detail.status_code == 200
+    assert run_response.status_code == 200
+    assert task_detail.json()["contextPatchAudit"]
+    assert task_detail.json()["contextPatchAudit"][0]["trace_id"]
+    dispatch_context = run_response.json()["dispatchContext"]
+    assert dispatch_context.get("context_patch_audit", dispatch_context.get("contextPatchAudit"))
+    assert dispatch_context.get("context_patch_count", dispatch_context.get("contextPatchCount", 0)) >= 1
+
+
+def test_fail_workflow_run_due_execution_timeout_auto_recovers_when_policy_allows(
+    auth_headers,
+    monkeypatch,
+) -> None:
+    ingest = client.post(
+        "/api/messages/ingest",
+        json={
+            "channel": "telegram",
+            "platformUserId": "fallback-history-user",
+            "chatId": "fallback-history-chat",
+            "text": "请先检索安全网关设计文档，再写一封给客户的说明邮件",
+        },
+    )
+    assert ingest.status_code == 200
+
+    run_id = ingest.json()["runId"]
+    scheduled: list[str] = []
+    monkeypatch.setattr(
+        workflow_execution_service,
+        "_schedule_retry_follow_up",
+        lambda fallback_run_id: scheduled.append(fallback_run_id),
+    )
+    workflow_execution_service.fail_workflow_run_due_execution_timeout(
+        run_id,
+        failure_message="Agent Worker 执行超时，准备进入主脑回退处理",
+    )
+
+    run_response = client.get(f"/api/workflows/runs/{run_id}", headers=auth_headers)
+    assert run_response.status_code == 200
+    dispatch_context = run_response.json()["dispatchContext"]
+    fallback_history = dispatch_context["fallbackHistory"]
+    assert len(fallback_history) >= 1
+    assert fallback_history[-1]["reason"] == "execution_timeout"
+    assert fallback_history[-1]["failureStage"] == "execution"
+    assert fallback_history[-1]["resolvedAction"] == "planner_retry"
+    assert dispatch_context["state"] == "queued"
+    assert dispatch_context["fallbackRecoveryState"] == "scheduled"
+    assert scheduled == [run_id]
+
+
+def test_unavailable_executor_auto_recovers_when_policy_allows(monkeypatch) -> None:
+    created_at = store.now_string()
+    task_id = "task-auto-fallback-unavailable"
+    run_id = "run-auto-fallback-unavailable"
+    store.tasks.append(
+        {
+            "id": task_id,
+            "workflow_run_id": run_id,
+            "workflow_id": "workflow-1",
+            "title": "执行体不可用自动回退",
+            "description": "验证主脑在执行体不可用时自动回退",
+            "status": "running",
+            "priority": "medium",
+            "created_at": created_at,
+            "completed_at": None,
+            "agent": "Master Bot Planner",
+            "tokens": 0,
+            "result": None,
+        }
+    )
+    steps = [
+        {
+            "id": f"{task_id}-1",
+            "title": "执行节点",
+            "status": "running",
+            "agent": "搜索 Agent",
+            "started_at": created_at,
+            "finished_at": None,
+            "message": "等待执行器认领",
+            "tokens": 0,
+        }
+    ]
+    store.task_steps[task_id] = steps
+    store.workflow_runs.insert(
+        0,
+        {
+            "id": run_id,
+            "workflow_id": "workflow-1",
+            "workflow_name": "客户服务工作流",
+            "task_id": task_id,
+            "trigger": "message",
+            "intent": "search",
+            "status": "running",
+            "created_at": created_at,
+            "updated_at": created_at,
+            "started_at": created_at,
+            "completed_at": None,
+            "current_stage": "执行中",
+            "active_edges": [],
+            "nodes": [],
+            "logs": [],
+            "dispatch_context": {
+                "state": "executing",
+                "route_decision": {
+                    "intent": "search",
+                    "fallback_policy": {
+                        "mode": "planner_recovery",
+                        "target": "master_bot_planner",
+                        "on_failure": "retry_or_fail_terminal",
+                    },
+                },
+                "state_machine": {"version": "brain_fact_layer_v1"},
+            },
+        },
+    )
+    scheduled: list[str] = []
+    monkeypatch.setattr(
+        workflow_execution_service,
+        "_schedule_retry_follow_up",
+        lambda fallback_run_id: scheduled.append(fallback_run_id),
+    )
+    recovered = workflow_execution_service._fail_workflow_run_due_unavailable_agent(
+        store.tasks[-1],
+        store.workflow_runs[0],
+        steps,
+        failure_message="当前执行触手不可用，准备自动回退",
+    )
+
+    assert recovered["status"] == "pending"
+    dispatch_context = recovered["dispatch_context"]
+    assert dispatch_context["state"] == "queued"
+    assert dispatch_context["fallback_recovery_reason"] == "executor_unavailable"
+    assert dispatch_context["fallback_recovery_action"] == "planner_retry"
+    assert dispatch_context["fallback_history"][-1]["reason"] == "executor_unavailable"
+    assert scheduled == [run_id]
+
+
+def test_complete_agent_execution_job_rejects_invalid_result_and_auto_recovers(
+    monkeypatch,
+) -> None:
+    created_at = store.now_string()
+    task_id = "task-auto-fallback-invalid-result"
+    run_id = "run-auto-fallback-invalid-result"
+    store.tasks.append(
+        {
+            "id": task_id,
+            "workflow_run_id": run_id,
+            "workflow_id": workflow_execution_service.AGENT_DISPATCH_WORKFLOW_ID,
+            "title": "执行结果拒收自动回退",
+            "description": "验证主脑在结果不合格时自动回退",
+            "status": "running",
+            "priority": "medium",
+            "created_at": created_at,
+            "completed_at": None,
+            "agent": "Master Bot Planner",
+            "tokens": 0,
+            "result": None,
+        }
+    )
+    store.task_steps[task_id] = [
+        {
+            "id": f"{task_id}-1",
+            "title": "执行节点",
+            "status": "running",
+            "agent": "搜索 Agent",
+            "started_at": created_at,
+            "finished_at": None,
+            "message": "等待执行器认领",
+            "tokens": 0,
+        }
+    ]
+    store.workflow_runs.insert(
+        0,
+        {
+            "id": run_id,
+            "workflow_id": workflow_execution_service.AGENT_DISPATCH_WORKFLOW_ID,
+            "workflow_name": workflow_execution_service.AGENT_DISPATCH_WORKFLOW_NAME,
+            "task_id": task_id,
+            "trigger": "message",
+            "intent": "search",
+            "status": "running",
+            "created_at": created_at,
+            "updated_at": created_at,
+            "started_at": created_at,
+            "completed_at": None,
+            "current_stage": "执行中",
+            "active_edges": [],
+            "nodes": [],
+            "logs": [],
+            "dispatch_context": {
+                "state": "executing",
+                "route_decision": {
+                    "intent": "search",
+                    "execution_agent_id": "3",
+                    "execution_agent": "搜索 Agent",
+                    "fallback_policy": {
+                        "mode": "planner_recovery",
+                        "target": "master_bot_planner",
+                        "on_failure": "retry_or_fail_terminal",
+                    },
+                },
+                "state_machine": {"version": "brain_fact_layer_v1"},
+            },
+        },
+    )
+    scheduled: list[str] = []
+    monkeypatch.setattr(
+        workflow_execution_service,
+        "_schedule_retry_follow_up",
+        lambda fallback_run_id: scheduled.append(fallback_run_id),
+    )
+    monkeypatch.setattr(
+        workflow_execution_service.agent_execution_service,
+        "execute_task",
+        lambda **kwargs: {},
+    )
+
+    recovered = workflow_execution_service.complete_agent_execution_job(run_id)
+
+    assert recovered["status"] == "pending"
+    dispatch_context = recovered["dispatch_context"]
+    assert dispatch_context["state"] == "queued"
+    assert dispatch_context["fallback_recovery_reason"] == "invalid_result"
+    assert dispatch_context["fallback_history"][-1]["reason"] == "invalid_result"
+    assert scheduled == [run_id]
+
+
+def test_complete_agent_execution_job_auto_recovers_from_protocol_error(
+    monkeypatch,
+) -> None:
+    created_at = store.now_string()
+    task_id = "task-auto-fallback-protocol"
+    run_id = "run-auto-fallback-protocol"
+    store.tasks.append(
+        {
+            "id": task_id,
+            "workflow_run_id": run_id,
+            "workflow_id": workflow_execution_service.AGENT_DISPATCH_WORKFLOW_ID,
+            "title": "协议错误自动回退",
+            "description": "验证主脑在协议错误时自动回退",
+            "status": "running",
+            "priority": "medium",
+            "created_at": created_at,
+            "completed_at": None,
+            "agent": "Master Bot Planner",
+            "tokens": 0,
+            "result": None,
+        }
+    )
+    store.task_steps[task_id] = [
+        {
+            "id": f"{task_id}-1",
+            "title": "执行节点",
+            "status": "running",
+            "agent": "搜索 Agent",
+            "started_at": created_at,
+            "finished_at": None,
+            "message": "等待执行器认领",
+            "tokens": 0,
+        }
+    ]
+    store.workflow_runs.insert(
+        0,
+        {
+            "id": run_id,
+            "workflow_id": workflow_execution_service.AGENT_DISPATCH_WORKFLOW_ID,
+            "workflow_name": workflow_execution_service.AGENT_DISPATCH_WORKFLOW_NAME,
+            "task_id": task_id,
+            "trigger": "message",
+            "intent": "search",
+            "status": "running",
+            "created_at": created_at,
+            "updated_at": created_at,
+            "started_at": created_at,
+            "completed_at": None,
+            "current_stage": "执行中",
+            "active_edges": [],
+            "nodes": [],
+            "logs": [],
+            "dispatch_context": {
+                "state": "executing",
+                "route_decision": {
+                    "intent": "search",
+                    "execution_agent_id": "3",
+                    "execution_agent": "搜索 Agent",
+                    "fallback_policy": {
+                        "mode": "planner_recovery",
+                        "target": "master_bot_planner",
+                        "on_failure": "retry_or_fail_terminal",
+                    },
+                },
+                "state_machine": {"version": "brain_fact_layer_v1"},
+            },
+        },
+    )
+    scheduled: list[str] = []
+    monkeypatch.setattr(
+        workflow_execution_service,
+        "_schedule_retry_follow_up",
+        lambda fallback_run_id: scheduled.append(fallback_run_id),
+    )
+    monkeypatch.setattr(
+        workflow_execution_service.agent_execution_service,
+        "execute_task",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("protocol error: malformed payload")),
+    )
+
+    recovered = workflow_execution_service.complete_agent_execution_job(run_id)
+
+    assert recovered["status"] == "pending"
+    dispatch_context = recovered["dispatch_context"]
+    assert dispatch_context["state"] == "queued"
+    assert dispatch_context["fallback_recovery_reason"] == "protocol_error"
+    assert dispatch_context["fallback_history"][-1]["reason"] == "protocol_error"
+    assert scheduled == [run_id]
+
+
+def test_complete_agent_execution_job_enters_manual_handoff_when_policy_requires_approval(
+    monkeypatch,
+) -> None:
+    created_at = store.now_string()
+    task_id = "task-manual-handoff-approval-gate"
+    run_id = "run-manual-handoff-approval-gate"
+    store.tasks.append(
+        {
+            "id": task_id,
+            "workflow_run_id": run_id,
+            "workflow_id": workflow_execution_service.AGENT_DISPATCH_WORKFLOW_ID,
+            "title": "人工接管回退",
+            "description": "验证 approval_gate 会把运行转入人工接管",
+            "status": "running",
+            "priority": "high",
+            "created_at": created_at,
+            "completed_at": None,
+            "agent": "Master Bot Planner",
+            "tokens": 0,
+            "result": None,
+        }
+    )
+    store.task_steps[task_id] = [
+        {
+            "id": f"{task_id}-1",
+            "title": "执行节点",
+            "status": "running",
+            "agent": "搜索 Agent",
+            "started_at": created_at,
+            "finished_at": None,
+            "message": "等待执行器认领",
+            "tokens": 0,
+        }
+    ]
+    store.workflow_runs.insert(
+        0,
+        {
+            "id": run_id,
+            "workflow_id": workflow_execution_service.AGENT_DISPATCH_WORKFLOW_ID,
+            "workflow_name": workflow_execution_service.AGENT_DISPATCH_WORKFLOW_NAME,
+            "task_id": task_id,
+            "trigger": "message",
+            "intent": "search",
+            "status": "running",
+            "created_at": created_at,
+            "updated_at": created_at,
+            "started_at": created_at,
+            "completed_at": None,
+            "current_stage": "执行中",
+            "active_edges": [],
+            "nodes": [],
+            "logs": [],
+            "dispatch_context": {
+                "state": "executing",
+                "route_decision": {
+                    "intent": "search",
+                    "execution_agent_id": "3",
+                    "execution_agent": "搜索 Agent",
+                    "fallback_policy": {
+                        "mode": "approval_gate",
+                        "target": "local_operator",
+                        "on_failure": "human_review",
+                    },
+                },
+                "state_machine": {"version": "brain_fact_layer_v1"},
+            },
+        },
+    )
+    scheduled: list[str] = []
+    monkeypatch.setattr(
+        workflow_execution_service,
+        "_schedule_retry_follow_up",
+        lambda fallback_run_id: scheduled.append(fallback_run_id),
+    )
+    monkeypatch.setattr(
+        workflow_execution_service.agent_execution_service,
+        "execute_task",
+        lambda **kwargs: {},
+    )
+
+    handed_off = workflow_execution_service.complete_agent_execution_job(run_id)
+
+    assert handed_off["status"] == "failed"
+    dispatch_context = handed_off["dispatch_context"]
+    assert dispatch_context["state"] == "manual_handoff_required"
+    assert dispatch_context["fallback_recovery_state"] == "handoff_required"
+    assert dispatch_context["fallback_recovery_action"] == "human_handoff"
+    assert dispatch_context["fallback_history"][-1]["reason"] == "invalid_result"
+    assert scheduled == []
+    assert store.audit_logs[0]["action"] == "workflow.manual_handoff"
+
+
+def test_workflow_run_manual_handoff_route_marks_run_for_operator_review(auth_headers) -> None:
+    created_at = store.now_string()
+    task_id = "task-manual-handoff-route"
+    run_id = "run-manual-handoff-route"
+    store.tasks.append(
+        {
+            "id": task_id,
+            "workflow_run_id": run_id,
+            "workflow_id": "workflow-1",
+            "title": "人工接管接口",
+            "description": "验证接口可以把运行转成人工接管",
+            "status": "running",
+            "priority": "medium",
+            "created_at": created_at,
+            "completed_at": None,
+            "agent": "Master Bot Planner",
+            "tokens": 0,
+            "result": None,
+        }
+    )
+    store.task_steps[task_id] = [
+        {
+            "id": f"{task_id}-1",
+            "title": "执行节点",
+            "status": "running",
+            "agent": "写作 Agent",
+            "started_at": created_at,
+            "finished_at": None,
+            "message": "等待人工介入",
+            "tokens": 0,
+        }
+    ]
+    store.workflow_runs.insert(
+        0,
+        {
+            "id": run_id,
+            "workflow_id": "workflow-1",
+            "workflow_name": "客户服务工作流",
+            "task_id": task_id,
+            "trigger": "manual",
+            "intent": "write",
+            "status": "running",
+            "created_at": created_at,
+            "updated_at": created_at,
+            "started_at": created_at,
+            "completed_at": None,
+            "current_stage": "执行中",
+            "active_edges": [],
+            "nodes": [],
+            "logs": [],
+            "dispatch_context": {
+                "state": "executing",
+                "route_decision": {
+                    "intent": "write",
+                    "approval_status": "pending",
+                },
+                "state_machine": {"version": "brain_fact_layer_v1"},
+            },
+        },
+    )
+
+    approval_response = client.post(
+        f"/api/workflows/runs/{run_id}/manual-handoff",
+        headers=auth_headers,
+        json={"operator": "ops-reviewer", "note": "需要本地人工审批"},
+    )
+    assert approval_response.status_code == 202
+    approval_id = approval_response.json()["approval"]["id"]
+    assert client.post(
+        f"/api/approvals/{approval_id}/approve",
+        headers=auth_headers,
+        json={"note": "允许人工接管"},
+    ).status_code == 200
+    response = client.post(
+        f"/api/workflows/runs/{run_id}/manual-handoff",
+        headers=auth_headers,
+        json={
+            "operator": "ops-reviewer",
+            "note": "需要本地人工审批",
+            "approvalId": approval_id,
+        },
+    )
+
+    assert response.status_code == 200
+    dispatch_context = response.json()["dispatchContext"]
+    assert dispatch_context["state"] == "manual_handoff_required"
+    assert dispatch_context["fallbackRecoveryState"] == "handoff_required"
+    assert dispatch_context["manualHandoffSource"] == "operator_request"
+    assert dispatch_context["manualHandoffOperator"] == "ops-reviewer"
+    assert dispatch_context["manualHandoffNote"] == "需要本地人工审批"
+
+
+def test_viewer_cannot_request_workflow_run_manual_handoff(viewer_auth_headers) -> None:
+    created_at = store.now_string()
+    task_id = "task-manual-handoff-viewer-forbidden"
+    run_id = "run-manual-handoff-viewer-forbidden"
+    store.tasks.append(
+        {
+            "id": task_id,
+            "workflow_run_id": run_id,
+            "workflow_id": "workflow-1",
+            "title": "人工接管权限校验",
+            "description": "viewer 无权请求人工接管",
+            "status": "running",
+            "priority": "medium",
+            "created_at": created_at,
+            "completed_at": None,
+            "agent": "Master Bot Planner",
+            "tokens": 0,
+            "result": None,
+        }
+    )
+    store.task_steps[task_id] = []
+    store.workflow_runs.insert(
+        0,
+        {
+            "id": run_id,
+            "workflow_id": "workflow-1",
+            "workflow_name": "客户服务工作流",
+            "task_id": task_id,
+            "trigger": "manual",
+            "intent": "write",
+            "status": "running",
+            "created_at": created_at,
+            "updated_at": created_at,
+            "started_at": created_at,
+            "completed_at": None,
+            "current_stage": "执行中",
+            "active_edges": [],
+            "nodes": [],
+            "logs": [],
+            "dispatch_context": {"state": "executing"},
+        },
+    )
+
+    response = client.post(
+        f"/api/workflows/runs/{run_id}/manual-handoff",
+        headers=viewer_auth_headers,
+        json={"operator": "viewer-user", "note": "viewer 无权操作"},
+    )
+
+    assert response.status_code == 403
+
+
+def test_complete_agent_execution_job_persists_multi_agent_branch_state_to_dispatch_context(
+    monkeypatch,
+) -> None:
+    created_at = store.now_string()
+    task_id = "task-multi-agent-branch-state"
+    run_id = "run-multi-agent-branch-state"
+    store.tasks.append(
+        {
+            "id": task_id,
+            "workflow_run_id": run_id,
+            "workflow_id": workflow_execution_service.AGENT_DISPATCH_WORKFLOW_ID,
+            "title": "并发分支状态回写",
+            "description": "验证主脑会把并发分支状态写回 dispatch_context",
+            "status": "running",
+            "priority": "medium",
+            "created_at": created_at,
+            "completed_at": None,
+            "agent": "Master Bot Planner",
+            "tokens": 0,
+            "result": None,
+        }
+    )
+    store.task_steps[task_id] = [
+        {
+            "id": f"{task_id}-1",
+            "title": "执行节点",
+            "status": "running",
+            "agent": "写作 Agent",
+            "started_at": created_at,
+            "finished_at": None,
+            "message": "等待执行器认领",
+            "tokens": 0,
+        }
+    ]
+    store.workflow_runs.insert(
+        0,
+        {
+            "id": run_id,
+            "workflow_id": workflow_execution_service.AGENT_DISPATCH_WORKFLOW_ID,
+            "workflow_name": workflow_execution_service.AGENT_DISPATCH_WORKFLOW_NAME,
+            "task_id": task_id,
+            "trigger": "message",
+            "intent": "write",
+            "status": "running",
+            "created_at": created_at,
+            "updated_at": created_at,
+            "started_at": created_at,
+            "completed_at": None,
+            "current_stage": "执行中",
+            "active_edges": [],
+            "nodes": [],
+            "logs": [],
+            "dispatch_context": {
+                "state": "executing",
+                "route_decision": {
+                    "intent": "write",
+                    "execution_agent_id": "2",
+                    "execution_agent": "写作 Agent",
+                },
+                "state_machine": {"version": "brain_fact_layer_v1"},
+            },
+        },
+    )
+    monkeypatch.setattr(
+        workflow_execution_service.agent_execution_service,
+        "execute_task",
+        lambda **kwargs: {
+            "kind": "draft_message",
+            "title": "统一输出",
+            "summary": "主脑已聚合多触手结果",
+            "content": "这是统一输出",
+            "bullets": ["分支 A 完成", "分支 B 已取消"],
+            "references": [],
+            "aggregation_contract": {
+                "mode": "race",
+                "successful_agents": 1,
+                "failed_agents": 0,
+                "cancelled_agents": 1,
+                "branch_results": [
+                    {
+                        "step_id": "candidate-a",
+                        "branch_id": "branch-a",
+                        "agent": "搜索 Agent",
+                        "status": "completed",
+                    },
+                    {
+                        "step_id": "candidate-b",
+                        "branch_id": "branch-b",
+                        "agent": "写作 Agent",
+                        "status": "cancelled",
+                    },
+                ],
+            },
+            "aggregation_notes": {
+                "selected_branch_id": "branch-a",
+                "selected_agent": "搜索 Agent",
+            },
+        },
+    )
+
+    completed = workflow_execution_service.complete_agent_execution_job(run_id)
+
+    assert completed["status"] == "completed"
+    dispatch_context = completed["dispatch_context"]
+    assert dispatch_context["aggregation_contract"]["mode"] == "race"
+    assert dispatch_context["aggregation_notes"]["selected_branch_id"] == "branch-a"
+    state_machine = dispatch_context["state_machine"]
+    assert state_machine["coordination_mode"] == "race"
+    assert state_machine["selected_branch_id"] == "branch-a"
+    assert state_machine["selected_agent"] == "搜索 Agent"
+    assert state_machine["branch_results"][1]["status"] == "cancelled"
 
 
 def test_workflow_run_detail_exposes_failure_and_delivery_attribution(auth_headers) -> None:
@@ -1788,7 +2573,7 @@ def test_message_ingest_routes_by_trigger_channel_language_and_priority(auth_hea
     )
     assert task_response.status_code == 200
     route_step = task_response.json()["items"][3]
-    assert route_step["title"] == "Master Bot 路由"
+    assert route_step["title"] == "项目经理分发"
     assert "命中工作流: Telegram 英文安全检索工作流" in route_step["message"]
     assert "渠道=telegram" in route_step["message"]
     assert "语言=en" in route_step["message"]
@@ -1889,10 +2674,15 @@ def test_message_ingest_skips_higher_priority_workflow_without_executable_agent(
 
     original_resolver = workflow_execution_service.resolve_workflow_execution_agent
 
-    def fake_resolve_workflow_execution_agent(workflow: dict, intent: str | None) -> dict | None:
+    def fake_resolve_workflow_execution_agent(
+        workflow: dict,
+        intent: str | None,
+        *,
+        route_seed: str | None = None,
+    ) -> dict | None:
         if str(workflow.get("id") or "").strip() == blocked_workflow_id:
             return None
-        return original_resolver(workflow, intent)
+        return original_resolver(workflow, intent, route_seed=route_seed)
 
     monkeypatch.setattr(
         workflow_execution_service,

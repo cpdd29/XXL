@@ -11,6 +11,7 @@ from threading import Event, Lock, Thread
 from typing import Callable
 
 from app.config import get_settings
+from app.core.event_protocol import validate_event_envelope
 
 
 logger = logging.getLogger(__name__)
@@ -50,6 +51,7 @@ class NatsEventBus:
         self._loop_ready = Event()
         self._last_connect_attempt_at = 0.0
         self._warned_unavailable = False
+        self._last_error: dict[str, object] | None = None
 
     def subscribe(self, subject: str, handler: EventHandler, *, queue_group: str = "") -> None:
         key = (subject, queue_group)
@@ -65,10 +67,12 @@ class NatsEventBus:
 
     def initialize(self) -> bool:
         if self._client_factory_override is None and nats is None:
+            self._set_last_error("connect", message="nats-py package is not installed")
             self._warn_missing_dependency()
             return False
 
         if not self._ensure_loop():
+            self._set_last_error("connect", message="failed to start NATS event loop thread")
             return False
         return self._connect()
 
@@ -76,20 +80,60 @@ class NatsEventBus:
         client = self._client
         return self._client_is_connected(client)
 
+    def connection_snapshot(self) -> dict[str, object]:
+        with self._lock:
+            handler_count = sum(len(handlers) for handlers in self._handlers.values())
+            subscription_count = len(self._subscriptions)
+            loop_ready = self._loop is not None and self._thread is not None and self._thread.is_alive()
+            client = self._client
+            connect_attempted = self._last_connect_attempt_at > 0.0
+        return {
+            "nats_url": self.nats_url,
+            "connected": self._client_is_connected(client),
+            "connect_attempted": connect_attempted,
+            "loop_ready": loop_ready,
+            "handler_registrations": handler_count,
+            "subscription_registrations": subscription_count,
+            "retry_interval_seconds": self.retry_interval_seconds,
+            "operation_timeout_seconds": self.operation_timeout_seconds,
+            "fallback_mode": not self._client_is_connected(client),
+            "warning_emitted": self._warned_unavailable,
+            "last_error": dict(self._last_error) if self._last_error is not None else None,
+        }
+
     def publish_json(self, subject: str, payload: dict) -> bool:
         if not self.initialize():
+            self._set_last_error("publish", message="publish skipped because event bus initialize() returned false")
             return False
 
-        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        normalized_payload = validate_event_envelope(subject, payload)
+        event_id = str(normalized_payload.get("event_id") or "").strip()
+        if subject.startswith("brain."):
+            from app.services.event_journal_service import record_event_publish_attempt
+
+            record_event_publish_attempt(subject, normalized_payload)
+        data = json.dumps(normalized_payload, ensure_ascii=False).encode("utf-8")
         try:
-            return bool(
+            published = bool(
                 self._run_coro(
                     self._publish_async(subject, data),
                     timeout=self.operation_timeout_seconds + 0.5,
                 )
             )
+            if published and subject.startswith("brain.") and event_id:
+                from app.services.event_journal_service import mark_event_published
+
+                mark_event_published(event_id)
+            if not published:
+                self._set_last_error("publish", message="publish returned false because NATS client is not connected")
+            return published
         except Exception as exc:  # pragma: no cover - depends on runtime environment
+            self._set_last_error("publish", exc=exc)
             self._mark_client_unavailable()
+            if subject.startswith("brain.") and event_id:
+                from app.services.event_journal_service import mark_event_publish_failed
+
+                mark_event_publish_failed(event_id, error=str(exc))
             if not self._warned_unavailable:
                 logger.warning("NATS publish failed, using in-process fallback: %s", exc)
                 self._warned_unavailable = True
@@ -174,8 +218,11 @@ class NatsEventBus:
             )
             if connected:
                 self._warned_unavailable = False
+            else:
+                self._set_last_error("connect", message="connect returned false")
             return connected
         except Exception as exc:  # pragma: no cover - depends on runtime environment
+            self._set_last_error("connect", exc=exc)
             self._mark_client_unavailable()
             if not self._warned_unavailable:
                 logger.warning("NATS integration disabled, using in-process fallback: %s", exc)
@@ -214,6 +261,7 @@ class NatsEventBus:
         )
 
     async def _on_async_error(self, exc: Exception) -> None:
+        self._set_last_error("connect", exc=exc)
         logger.debug("NATS client error: %s", exc)
 
     async def _on_async_disconnected(self) -> None:
@@ -231,6 +279,7 @@ class NatsEventBus:
             registrations = list(self._handlers.keys())
             subscribed_registrations = set(self._subscriptions.keys())
 
+        added_any = False
         for registration in registrations:
             if registration in subscribed_registrations:
                 continue
@@ -242,6 +291,14 @@ class NatsEventBus:
             )
             with self._lock:
                 self._subscriptions[registration] = subscription
+            added_any = True
+
+        if added_any:
+            flush = getattr(client, "flush", None)
+            if flush is not None:
+                result = flush(timeout=self.operation_timeout_seconds)
+                if inspect.isawaitable(result):
+                    await result
 
     def _sync_subscriptions(self) -> None:
         if not self.is_connected():
@@ -252,6 +309,7 @@ class NatsEventBus:
                 timeout=self.operation_timeout_seconds + 0.5,
             )
         except Exception as exc:  # pragma: no cover - depends on runtime environment
+            self._set_last_error("sync", exc=exc)
             self._mark_client_unavailable()
             logger.warning("NATS subscription sync failed, keeping local realtime fallback: %s", exc)
 
@@ -346,6 +404,16 @@ class NatsEventBus:
         with self._lock:
             self._client = None
             self._subscriptions.clear()
+
+    def _set_last_error(self, stage: str, *, message: str | None = None, exc: Exception | None = None) -> None:
+        details: dict[str, object] = {"stage": stage, "at": time.time()}
+        if message:
+            details["message"] = message
+        if exc is not None:
+            details["type"] = type(exc).__name__
+            details["message"] = str(exc)
+        with self._lock:
+            self._last_error = details
 
     def _run_coro(self, coro, *, timeout: float):
         loop = self._loop

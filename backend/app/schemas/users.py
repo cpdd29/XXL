@@ -1,3 +1,5 @@
+from typing import Literal
+
 from pydantic import Field
 
 from app.schemas.base import APIModel
@@ -59,7 +61,7 @@ class UserActivityResponse(APIModel):
 
 
 class UpdateUserRoleRequest(APIModel):
-    role: str
+    role: Literal["admin", "operator", "viewer", "external", "power_user", "user", "blocked"]
 
 
 class UpdateUserProfileRequest(APIModel):

@@ -9,6 +9,15 @@ from uuid import uuid4
 from fastapi import WebSocket
 from starlette.websockets import WebSocketDisconnect, WebSocketState
 
+from app.core.event_subjects import (
+    WORKFLOW_RUN_COMPLETED_SUBJECT,
+    WORKFLOW_RUN_CREATED_SUBJECT,
+    WORKFLOW_RUN_FAILED_SUBJECT,
+    WORKFLOW_RUN_KEEPALIVE_SUBJECT,
+    WORKFLOW_RUN_SNAPSHOT_SUBJECT,
+    WORKFLOW_RUN_UPDATED_SUBJECT,
+)
+from app.core.event_protocol import summarize_payload_for_bus, validate_event_envelope
 from app.core.nats_event_bus import nats_event_bus
 from app.schemas.base import to_camel
 from app.services.persistence_service import persistence_service
@@ -17,6 +26,7 @@ from app.services.store import store
 
 WORKFLOW_RUNS_SUBJECT_PREFIX = "workflow.runs"
 WORKFLOW_RUNS_SUBJECT_PATTERN = f"{WORKFLOW_RUNS_SUBJECT_PREFIX}.*"
+BRAIN_WORKFLOW_RUN_SUBJECT_PATTERN = "brain.workflow.run.*"
 
 
 class WorkflowRealtimeService:
@@ -26,6 +36,7 @@ class WorkflowRealtimeService:
         self._instance_id = uuid4().hex
         self._event_bus = event_bus or nats_event_bus
         self._event_bus.subscribe(WORKFLOW_RUNS_SUBJECT_PATTERN, self._handle_event_bus_message)
+        self._event_bus.subscribe(BRAIN_WORKFLOW_RUN_SUBJECT_PATTERN, self._handle_event_bus_message)
 
     def _workflow_runs_snapshot(self, workflow_id: str) -> list[dict]:
         database_runs = persistence_service.list_workflow_runs(workflow_id=workflow_id)
@@ -48,16 +59,38 @@ class WorkflowRealtimeService:
     def build_snapshot(self, workflow_id: str) -> dict:
         payload = {
             "type": "workflow.runs.snapshot",
+            "message_type": "snapshot",
             "workflow_id": workflow_id,
             "timestamp": store.now_string(),
             "items": self._workflow_runs_snapshot(workflow_id),
             "run": None,
         }
-        return self._camelize(payload)
+        return self._camelize(validate_event_envelope(WORKFLOW_RUN_SNAPSHOT_SUBJECT, payload))
+
+    def build_keepalive(self, workflow_id: str) -> dict:
+        payload = {
+            "type": "workflow.runs.keepalive",
+            "message_type": "snapshot",
+            "workflow_id": workflow_id,
+            "timestamp": store.now_string(),
+            "items": [],
+            "run": None,
+        }
+        return self._camelize(validate_event_envelope(WORKFLOW_RUN_KEEPALIVE_SUBJECT, payload))
 
     @staticmethod
     def _subject_for_workflow(workflow_id: str) -> str:
         return f"{WORKFLOW_RUNS_SUBJECT_PREFIX}.{workflow_id}"
+
+    @staticmethod
+    def _brain_subject_for_event(event_type: str) -> str:
+        mapping = {
+            "workflow_run.created": WORKFLOW_RUN_CREATED_SUBJECT,
+            "workflow_run.updated": WORKFLOW_RUN_UPDATED_SUBJECT,
+            "workflow_run.completed": WORKFLOW_RUN_COMPLETED_SUBJECT,
+            "workflow_run.failed": WORKFLOW_RUN_FAILED_SUBJECT,
+        }
+        return mapping.get(event_type, WORKFLOW_RUN_UPDATED_SUBJECT)
 
     def _broadcast(self, workflow_id: str, payload: dict) -> None:
         with self._lock:
@@ -70,7 +103,13 @@ class WorkflowRealtimeService:
         source_instance_id = payload.get("sourceInstanceId") or payload.get("source_instance_id")
         if source_instance_id == self._instance_id:
             return
-        workflow_id = str(payload.get("workflowId") or subject.rsplit(".", maxsplit=1)[-1])
+        workflow_id = str(
+            payload.get("workflowId")
+            or payload.get("workflow_id")
+            or ((payload.get("payload") or {}).get("workflowId") if isinstance(payload.get("payload"), dict) else None)
+            or ((payload.get("payload") or {}).get("workflow_id") if isinstance(payload.get("payload"), dict) else None)
+            or subject.rsplit(".", maxsplit=1)[-1]
+        )
         self._broadcast(workflow_id, payload)
 
     def publish_run_event(self, run: dict, event_type: str) -> None:
@@ -83,9 +122,16 @@ class WorkflowRealtimeService:
             "run": store.clone(run),
             "source_instance_id": self._instance_id,
         }
-        serialized_payload = self._camelize(payload)
-        self._broadcast(workflow_id, serialized_payload)
-        self._event_bus.publish_json(self._subject_for_workflow(workflow_id), serialized_payload)
+        legacy_subject = self._subject_for_workflow(workflow_id)
+        local_payload = self._camelize(validate_event_envelope(legacy_subject, payload))
+        self._broadcast(workflow_id, local_payload)
+        if not getattr(persistence_service, "enabled", False):
+            return
+        bus_payload = self._camelize(
+            validate_event_envelope(legacy_subject, summarize_payload_for_bus(payload))
+        )
+        self._event_bus.publish_json(legacy_subject, bus_payload)
+        self._event_bus.publish_json(self._brain_subject_for_event(event_type), bus_payload)
 
     def _subscribe(self, workflow_id: str) -> Queue:
         queue: Queue = Queue()
@@ -115,15 +161,7 @@ class WorkflowRealtimeService:
                     if websocket.client_state is WebSocketState.DISCONNECTED:
                         break
 
-                    await websocket.send_json(
-                        {
-                            "type": "workflow.runs.keepalive",
-                            "workflowId": workflow_id,
-                            "timestamp": store.now_string(),
-                            "items": [],
-                            "run": None,
-                        }
-                    )
+                    await websocket.send_json(self.build_keepalive(workflow_id))
                     continue
                 await websocket.send_json(payload)
         except WebSocketDisconnect:

@@ -12,7 +12,11 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-workbot} -d ${POSTGRES_DB:-workbot}"]
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${POSTGRES_USER:-workbot} -d ${POSTGRES_DB:-workbot}",
+        ]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -55,90 +59,6 @@ services:
     volumes:
       - chroma_data:/chroma/chroma
 
-  search-mcp:
-    build:
-      context: ../XXL_ExternalConnection/mcp-services/search-mcp
-      dockerfile: Dockerfile
-    container_name: workbot-search-mcp
-    restart: unless-stopped
-    ports:
-      - "${SEARCH_MCP_PORT:-8093}:8092"
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8092/health', timeout=3).read()"]
-      interval: 15s
-      timeout: 5s
-      retries: 5
-
-  pdf-mcp:
-    build:
-      context: ../XXL_ExternalConnection/mcp-services/pdf-mcp
-      dockerfile: Dockerfile
-    container_name: workbot-pdf-mcp
-    restart: unless-stopped
-    ports:
-      - "${PDF_MCP_PORT:-8092}:8092"
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8092/health', timeout=3).read()"]
-      interval: 15s
-      timeout: 5s
-      retries: 5
-
-  writer-mcp:
-    build:
-      context: ../XXL_ExternalConnection/mcp-services/writer-mcp
-      dockerfile: Dockerfile
-    container_name: workbot-writer-mcp
-    restart: unless-stopped
-    ports:
-      - "${WRITER_MCP_PORT:-8094}:8094"
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8094/health', timeout=3).read()"]
-      interval: 15s
-      timeout: 5s
-      retries: 5
-
-  weather-mcp:
-    build:
-      context: ../XXL_ExternalConnection/mcp-services/weather-mcp
-      dockerfile: Dockerfile
-    container_name: workbot-weather-mcp
-    restart: unless-stopped
-    ports:
-      - "${WEATHER_MCP_PORT:-8095}:8095"
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8095/health', timeout=3).read()"]
-      interval: 15s
-      timeout: 5s
-      retries: 5
-
-  order-query-mcp:
-    build:
-      context: ../XXL_ExternalConnection/mcp-services/order-query-mcp
-      dockerfile: Dockerfile
-    container_name: workbot-order-query-mcp
-    restart: unless-stopped
-    ports:
-      - "${ORDER_MCP_PORT:-8096}:8094"
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8094/health', timeout=3).read()"]
-      interval: 15s
-      timeout: 5s
-      retries: 5
-
-  crm-query-mcp:
-    build:
-      context: ../XXL_ExternalConnection/mcp-services/crm-query-mcp
-      dockerfile: Dockerfile
-    container_name: workbot-crm-query-mcp
-    restart: unless-stopped
-    ports:
-      - "${CRM_MCP_PORT:-8097}:8095"
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8095/health', timeout=3).read()"]
-      interval: 15s
-      timeout: 5s
-      retries: 5
-
   backend:
     build:
       context: ./backend
@@ -146,10 +66,15 @@ services:
     container_name: workbot-backend
     restart: unless-stopped
     working_dir: /app
-    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080", "--reload"]
+    command:
+      [
+        "sh",
+        "-lc",
+        "alembic upgrade head && exec uvicorn app.main:app --host 0.0.0.0 --port 8080 --reload",
+      ]
     environment:
       WORKBOT_ENVIRONMENT: ${WORKBOT_ENVIRONMENT:-docker-compose}
-      WORKBOT_DATABASE_URL: postgresql://${POSTGRES_USER:-workbot}:${POSTGRES_PASSWORD:-workbot}@postgres:5432/${POSTGRES_DB:-workbot}
+      WORKBOT_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-workbot}:${POSTGRES_PASSWORD:-workbot}@postgres:5432/${POSTGRES_DB:-workbot}
       WORKBOT_REDIS_URL: redis://redis:6379/0
       WORKBOT_MEMORY_SQLITE_PATH: ${WORKBOT_MEMORY_SQLITE_PATH:-data/memory-midterm.sqlite3}
       WORKBOT_NATS_URL: nats://nats:4222
@@ -160,23 +85,25 @@ services:
       WORKBOT_MESSAGE_RATE_LIMIT_PER_MINUTE: ${WORKBOT_MESSAGE_RATE_LIMIT_PER_MINUTE:-5}
       WORKBOT_MESSAGE_DEBOUNCE_SECONDS: ${WORKBOT_MESSAGE_DEBOUNCE_SECONDS:-3}
       WORKBOT_MEMORY_RETRIEVE_LIMIT: ${WORKBOT_MEMORY_RETRIEVE_LIMIT:-5}
-      WORKBOT_AGENT_CONFIG_ROOT: ${WORKBOT_AGENT_CONFIG_ROOT:-/external/agents}
+      WORKBOT_METRICS_SCRAPE_TOKEN: ${WORKBOT_METRICS_SCRAPE_TOKEN:-}
       WORKBOT_TOOL_SOURCES_MODE: ${WORKBOT_TOOL_SOURCES_MODE:-external_only}
       WORKBOT_ENABLE_LOCAL_MCP_SOURCE: ${WORKBOT_ENABLE_LOCAL_MCP_SOURCE:-false}
       WORKBOT_ENABLE_LOCAL_AGENT_SOURCE: ${WORKBOT_ENABLE_LOCAL_AGENT_SOURCE:-false}
-      WORKBOT_EXTERNAL_TOOL_SOURCES_FILE: ${WORKBOT_EXTERNAL_TOOL_SOURCES_FILE:-/external/config/workbot_external_sources.combined.json}
-      WORKBOT_SEARCH_MCP_BASE_URL: ${WORKBOT_SEARCH_MCP_BASE_URL:-http://search-mcp:8092}
-      WORKBOT_PDF_MCP_BASE_URL: ${WORKBOT_PDF_MCP_BASE_URL:-http://pdf-mcp:8092}
-      WORKBOT_WRITER_MCP_BASE_URL: ${WORKBOT_WRITER_MCP_BASE_URL:-http://writer-mcp:8094}
-      WORKBOT_WEATHER_MCP_BASE_URL: ${WORKBOT_WEATHER_MCP_BASE_URL:-http://weather-mcp:8095}
-      WORKBOT_ORDER_MCP_BASE_URL: ${WORKBOT_ORDER_MCP_BASE_URL:-http://order-query-mcp:8094}
-      WORKBOT_CRM_MCP_BASE_URL: ${WORKBOT_CRM_MCP_BASE_URL:-http://crm-query-mcp:8095}
+      WORKBOT_EXTERNAL_TOOL_SOURCES_FILE: ${WORKBOT_EXTERNAL_TOOL_SOURCES_FILE:-/opt/workbot/external-registry/workbot_external_sources.local.json}
+      WORKBOT_SEARCH_MCP_BASE_URL: ${WORKBOT_SEARCH_MCP_BASE_URL:-http://host.docker.internal:8093}
+      WORKBOT_PDF_MCP_BASE_URL: ${WORKBOT_PDF_MCP_BASE_URL:-http://host.docker.internal:8092}
+      WORKBOT_WRITER_MCP_BASE_URL: ${WORKBOT_WRITER_MCP_BASE_URL:-http://host.docker.internal:8094}
+      WORKBOT_WEATHER_MCP_BASE_URL: ${WORKBOT_WEATHER_MCP_BASE_URL:-http://host.docker.internal:8095}
+      WORKBOT_ORDER_MCP_BASE_URL: ${WORKBOT_ORDER_MCP_BASE_URL:-http://host.docker.internal:8096}
+      WORKBOT_CRM_MCP_BASE_URL: ${WORKBOT_CRM_MCP_BASE_URL:-http://host.docker.internal:8097}
     ports:
       - "${BACKEND_PORT:-8080}:8080"
     volumes:
       - ./backend:/app
-      - ../XXL_ExternalConnection/agents:/external/agents
-      - ../XXL_ExternalConnection/config:/external/config
+      - .:/workspace:ro
+      - ./deploy/external-registry:/opt/workbot/external-registry:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       postgres:
         condition: service_healthy
@@ -186,27 +113,16 @@ services:
         condition: service_started
       chromadb:
         condition: service_started
-      search-mcp:
-        condition: service_started
-      pdf-mcp:
-        condition: service_started
-      writer-mcp:
-        condition: service_started
-      weather-mcp:
-        condition: service_started
-      order-query-mcp:
-        condition: service_started
-      crm-query-mcp:
-        condition: service_started
 
   frontend:
     build:
-      context: ./样式文件
+      context: ./reception
       dockerfile: Dockerfile
     container_name: workbot-frontend
     restart: unless-stopped
     working_dir: /app
-    command: ["npm", "run", "dev", "--", "--hostname", "0.0.0.0", "--port", "3000"]
+    command:
+      ["npm", "run", "dev", "--", "--hostname", "0.0.0.0", "--port", "3000"]
     environment:
       NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://localhost:8080}
       NEXT_PUBLIC_WS_BASE_URL: ${NEXT_PUBLIC_WS_BASE_URL:-ws://localhost:8080}
@@ -214,7 +130,7 @@ services:
     ports:
       - "${FRONTEND_PORT:-3000}:3000"
     volumes:
-      - ./样式文件:/app
+      - ./reception:/app
       - frontend_node_modules:/app/node_modules
       - frontend_next:/app/.next
     depends_on:

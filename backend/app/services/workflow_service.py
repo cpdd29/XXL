@@ -4,6 +4,16 @@ from uuid import uuid4
 
 from fastapi import HTTPException, status
 
+from app.core.brain_payload_fields import alias_text, dispatch_context_from_run, route_decision_from_payload
+from app.core.event_protocol import build_event_envelope, summarize_payload_for_bus
+from app.core.event_subjects import (
+    INTERNAL_EVENT_DELIVERY_COMPLETED_SUBJECT,
+    INTERNAL_EVENT_DELIVERY_FAILED_SUBJECT,
+    INTERNAL_EVENT_DELIVERY_REQUESTED_SUBJECT,
+    INTERNAL_EVENT_DELIVERY_RETRIED_SUBJECT,
+)
+from app.core.event_types import MESSAGE_TYPE_EVENT, MESSAGE_TYPE_RESULT
+from app.core.nats_event_bus import nats_event_bus
 from app.services.persistence_service import persistence_service
 from app.services.store import store
 from app.services.webhook_guard_service import sanitize_webhook_payload
@@ -11,8 +21,10 @@ from app.services.workflow_execution_service import (
     create_manual_workflow_run,
     get_workflow_run,
     list_workflow_runs,
+    request_manual_handoff_for_workflow_run,
     tick_workflow_run,
 )
+from app.services.workflow_runtime_snapshot_service import workflow_runtime_snapshot_service
 
 DEFAULT_TRIGGER = {
     "type": "message",
@@ -206,6 +218,52 @@ def _persist_internal_event_delivery(delivery: dict) -> dict:
             delivery = persisted
 
     return _cache_internal_event_delivery(delivery)
+
+
+def _publish_internal_event_delivery_event(
+    delivery: dict,
+    *,
+    subject: str,
+    event_name: str,
+    message_type: str = MESSAGE_TYPE_EVENT,
+    extra_payload: dict | None = None,
+) -> None:
+    delivery_id = str(delivery.get("id") or "").strip()
+    if not delivery_id:
+        return
+    emitted_at = str(delivery.get("updated_at") or "").strip() or datetime.now(UTC).isoformat()
+    payload = {
+        "internal_event_id": delivery_id,
+        "internal_event_name": str(delivery.get("event_name") or "").strip() or None,
+        "status": str(delivery.get("status") or "").strip() or None,
+        "attempt_count": int(delivery.get("attempt_count") or 0),
+        "idempotency_key": str(delivery.get("idempotency_key") or "").strip() or None,
+        "triggered_count": int(delivery.get("triggered_count") or 0),
+        "triggered_workflow_ids": list(delivery.get("triggered_workflow_ids") or []),
+        "triggered_run_ids": list(delivery.get("triggered_run_ids") or []),
+        "triggered_task_ids": list(delivery.get("triggered_task_ids") or []),
+        "last_error": str(delivery.get("last_error") or "").strip() or None,
+        "updated_at": emitted_at,
+    }
+    if isinstance(extra_payload, dict):
+        payload.update(store.clone(extra_payload))
+    envelope = build_event_envelope(
+        subject=subject,
+        event_name=event_name,
+        message_type=message_type,
+        aggregate={"type": "internal_event_delivery", "id": delivery_id},
+        trace={"request_id": delivery_id},
+        routing={
+            "partition_key": delivery_id,
+            "idempotency_key": str(delivery.get("idempotency_key") or "").strip()
+            or f"{event_name}:{delivery_id}",
+        },
+        timing={"emitted_at": emitted_at, "available_at": emitted_at},
+        source={"kind": "workflow_service", "id": "internal_event_delivery"},
+        target={"kind": "brain_internal_bus", "id": "internal_event_delivery"},
+        payload=summarize_payload_for_bus(payload),
+    )
+    nats_event_bus.publish_json(subject, envelope)
 
 
 def _load_database_internal_event_delivery(delivery_id: str) -> tuple[dict | None, bool]:
@@ -743,26 +801,16 @@ def _workflow_run_status_reason(run: dict) -> str | None:
 
 
 def _workflow_run_execution_agent_id(run: dict) -> str | None:
-    dispatch_context = _workflow_run_dispatch_context(run)
-    if not isinstance(dispatch_context, dict):
+    dispatch_context = dispatch_context_from_run(run)
+    if dispatch_context is None:
         return None
 
-    route_decision = dispatch_context.get("route_decision")
-    if not isinstance(route_decision, dict):
-        route_decision = dispatch_context.get("routeDecision")
-    if not isinstance(route_decision, dict):
-        route_decision = {}
-
-    for value in (
-        dispatch_context.get("execution_agent_id"),
-        dispatch_context.get("executionAgentId"),
-        route_decision.get("execution_agent_id"),
-        route_decision.get("executionAgentId"),
-    ):
-        normalized = str(value or "").strip()
-        if normalized:
-            return normalized
-    return None
+    route_decision = route_decision_from_payload(dispatch_context) or {}
+    return alias_text(dispatch_context, "execution_agent_id", "executionAgentId") or alias_text(
+        route_decision,
+        "execution_agent_id",
+        "executionAgentId",
+    )
 
 
 def _workflow_run_policy(run: dict) -> dict:
@@ -1593,6 +1641,11 @@ def trigger_workflow_internal(
         }
     )
     delivery = _persist_internal_event_delivery(delivery)
+    _publish_internal_event_delivery_event(
+        delivery,
+        subject=INTERNAL_EVENT_DELIVERY_REQUESTED_SUBJECT,
+        event_name="brain.internal_event.delivery.requested",
+    )
 
     triggered_workflow_ids = list(delivery.get("triggered_workflow_ids") or [])
     triggered_run_ids = list(delivery.get("triggered_run_ids") or [])
@@ -1658,6 +1711,12 @@ def trigger_workflow_internal(
             }
         )
         delivery = _persist_internal_event_delivery(delivery)
+        _publish_internal_event_delivery_event(
+            delivery,
+            subject=INTERNAL_EVENT_DELIVERY_COMPLETED_SUBJECT,
+            event_name="brain.internal_event.delivery.completed",
+            message_type=MESSAGE_TYPE_RESULT,
+        )
         return _build_internal_event_delivery_response(delivery, deduplicated=False)
     except Exception as exc:
         if _is_internal_trigger_not_found_error(exc):
@@ -1674,7 +1733,7 @@ def trigger_workflow_internal(
                     "primary_workflow": store.clone(primary_workflow) if primary_workflow else None,
                 }
             )
-            _persist_internal_event_delivery(delivery)
+            delivery = _persist_internal_event_delivery(delivery)
             raise
         delivery.update(
             {
@@ -1693,7 +1752,12 @@ def trigger_workflow_internal(
                 "primary_workflow": store.clone(primary_workflow) if primary_workflow else None,
             }
         )
-        _persist_internal_event_delivery(delivery)
+        delivery = _persist_internal_event_delivery(delivery)
+        _publish_internal_event_delivery_event(
+            delivery,
+            subject=INTERNAL_EVENT_DELIVERY_FAILED_SUBJECT,
+            event_name="brain.internal_event.delivery.failed",
+        )
         raise
 
 
@@ -1801,6 +1865,13 @@ def retry_internal_event_delivery(delivery_id: str) -> dict:
         action = _build_internal_event_delivery_response(latest_delivery, deduplicated=False)
     latest_delivery = _get_internal_event_delivery(delivery["id"]) or delivery
     action["delivery"] = _hydrate_internal_event_delivery(latest_delivery)
+    _publish_internal_event_delivery_event(
+        latest_delivery,
+        subject=INTERNAL_EVENT_DELIVERY_RETRIED_SUBJECT,
+        event_name="brain.internal_event.delivery.retried",
+        message_type=MESSAGE_TYPE_RESULT,
+        extra_payload={"retry_delivery_id": str(delivery.get("id") or "").strip() or None},
+    )
     return action
 
 
@@ -1825,19 +1896,29 @@ def replay_internal_event_delivery(delivery_id: str) -> dict:
     return replay_action
 
 
-def list_runs(workflow_id: str | None = None, task_id: str | None = None) -> dict:
-    payload = list_workflow_runs(workflow_id=workflow_id, task_id=task_id)
+def list_runs(workflow_id: str | None = None, task_id: str | None = None, *, scope: dict[str, str] | None = None) -> dict:
+    payload = list_workflow_runs(workflow_id=workflow_id, task_id=task_id, scope=scope)
     monitor_now = datetime.now(UTC)
     items = [_attach_run_monitor(item, now=monitor_now) for item in payload["items"]]
     return {"items": items, "total": len(items)}
 
 
-def get_run(run_id: str) -> dict:
-    return _attach_run_monitor(get_workflow_run(run_id))
+def get_run(run_id: str, *, scope: dict[str, str] | None = None) -> dict:
+    return _attach_run_monitor(get_workflow_run(run_id, scope=scope))
 
 
 def tick_run(run_id: str) -> dict:
     return _attach_run_monitor(tick_workflow_run(run_id))
+
+
+def request_manual_handoff(run_id: str, *, operator: str | None = None, note: str | None = None) -> dict:
+    return _attach_run_monitor(
+        request_manual_handoff_for_workflow_run(
+            run_id,
+            operator=operator,
+            note=note,
+        )
+    )
 
 
 def get_workflow_monitor(
@@ -1852,6 +1933,13 @@ def get_workflow_monitor(
     monitor_now = datetime.now(UTC)
     monitored_items = [_attach_run_monitor(item, now=monitor_now) for item in payload["items"]]
     stats = _build_workflow_monitor_stats(monitored_items)
+    runtime = workflow_runtime_snapshot_service.build_snapshot(
+        runs=monitored_items,
+        workflow_id=workflow_id,
+        task_id=task_id,
+        now=monitor_now,
+        persistence=persistence_service,
+    )
 
     items = monitored_items
     if unhealthy_only:
@@ -1865,6 +1953,7 @@ def get_workflow_monitor(
         "stats": stats,
         "items": items[:resolved_limit],
         "alerts": _build_workflow_monitor_alerts(stats),
+        "runtime": runtime,
     }
 
 

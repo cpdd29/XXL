@@ -209,3 +209,48 @@ def test_reload_agent_missing_config_is_fail_soft_and_persists_missing_snapshot(
     assert persisted is not None
     assert persisted["config_snapshot"]["warnings"] == ["未找到 Agent 配置目录。"]
     assert persisted["config_summary"]["examples_count"] == 0
+
+
+def test_list_agents_auto_loads_security_agent_config_by_type(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    seeded_store = InMemoryStore()
+    seeded_store.agents = [
+        {
+            "id": "2",
+            "name": "安全检测 Agent",
+            "description": "检测和过滤敏感内容，保障系统安全",
+            "type": "security",
+            "status": "running",
+            "enabled": True,
+            "tasks_completed": 20,
+            "tasks_total": 20,
+            "avg_response_time": "12ms",
+            "tokens_used": 128,
+            "tokens_limit": 1024,
+            "success_rate": 100.0,
+            "last_active": "刚刚",
+        }
+    ]
+
+    config_root = tmp_path / "agents"
+    _write_agent_config_tree(config_root, "security")
+    service = _sqlite_service(tmp_path, seeded_store)
+    original_persistence_service = agent_service.persistence_service
+    original_agent_config_service = agent_service.agent_config_service
+    monkeypatch.setattr(agent_service, "persistence_service", service)
+    monkeypatch.setattr(agent_service, "agent_config_service", AgentConfigService(config_root=config_root))
+
+    try:
+        listed = agent_service.list_agents()
+        fetched = agent_service.get_agent("2")
+    finally:
+        monkeypatch.setattr(agent_service, "persistence_service", original_persistence_service)
+        monkeypatch.setattr(agent_service, "agent_config_service", original_agent_config_service)
+        service.close()
+
+    assert listed["items"][0]["config_summary"]["status"] == "loaded"
+    assert str(listed["items"][0]["config_summary"]["directory"]).endswith("security")
+    assert fetched["config_snapshot"]["status"] == "loaded"
+    assert fetched["config_snapshot"]["agent"]["trigger_intents"] == ["search", "lookup"]

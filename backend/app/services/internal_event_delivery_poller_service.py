@@ -5,6 +5,9 @@ import logging
 from threading import Event, Lock, Thread
 
 from app.config import get_settings
+from app.core.event_protocol import build_event_envelope
+from app.core.event_subjects import INTERNAL_EVENT_DELIVERY_CLAIMED_SUBJECT
+from app.core.nats_event_bus import nats_event_bus
 from app.services.persistence_service import persistence_service
 from app.services.store import store
 
@@ -38,6 +41,7 @@ class InternalEventDeliveryPollerService:
         self,
         *,
         persistence=None,
+        event_bus=None,
         poll_interval_seconds: float | None = None,
         retry_backoff_seconds: float | None = None,
         retry_lease_seconds: float | None = None,
@@ -45,6 +49,7 @@ class InternalEventDeliveryPollerService:
     ) -> None:
         settings = get_settings()
         self._persistence = persistence or persistence_service
+        self._event_bus = event_bus or nats_event_bus
         self._poll_interval_seconds = max(
             float(
                 poll_interval_seconds
@@ -117,6 +122,7 @@ class InternalEventDeliveryPollerService:
                 continue
 
             summary["claimed"] += 1
+            self._publish_claimed_event(delivery)
             try:
                 result = retry_internal_event_delivery(delivery_id)
                 if (
@@ -135,6 +141,34 @@ class InternalEventDeliveryPollerService:
                 summary["failed"] += 1
 
         return summary
+
+    def _publish_claimed_event(self, delivery: dict) -> None:
+        delivery_id = str(delivery.get("id") or "").strip()
+        if not delivery_id:
+            return
+        emitted_at = str(delivery.get("updated_at") or "").strip() or _utc_now().isoformat()
+        envelope = build_event_envelope(
+            subject=INTERNAL_EVENT_DELIVERY_CLAIMED_SUBJECT,
+            event_name="brain.internal_event.delivery.claimed",
+            aggregate={"type": "internal_event_delivery", "id": delivery_id},
+            trace={"request_id": delivery_id},
+            routing={
+                "partition_key": delivery_id,
+                "idempotency_key": str(delivery.get("idempotency_key") or "").strip()
+                or f"brain.internal_event.delivery.claimed:{delivery_id}",
+            },
+            timing={"emitted_at": emitted_at, "available_at": emitted_at},
+            source={"kind": "internal_event_delivery_poller_service", "id": "poller"},
+            target={"kind": "workflow_service", "id": "retry_internal_event_delivery"},
+            payload={
+                "internal_event_id": delivery_id,
+                "internal_event_name": str(delivery.get("event_name") or "").strip() or None,
+                "status": str(delivery.get("status") or "").strip() or None,
+                "attempt_count": int(delivery.get("attempt_count") or 0),
+                "idempotency_key": str(delivery.get("idempotency_key") or "").strip() or None,
+            },
+        )
+        self._event_bus.publish_json(INTERNAL_EVENT_DELIVERY_CLAIMED_SUBJECT, envelope)
 
     def _run_loop(self) -> None:
         while not self._stop_event.wait(timeout=self._poll_interval_seconds):

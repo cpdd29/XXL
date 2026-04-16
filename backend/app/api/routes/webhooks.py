@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from fastapi import APIRouter, Header, HTTPException, Request, status
@@ -7,10 +8,12 @@ from fastapi import APIRouter, Header, HTTPException, Request, status
 from app.schemas.messages import ChannelType, IngestMessageResponse, TelegramWebhookUpdate
 from app.schemas.workflows import WorkflowActionResponse
 from app.services.message_ingestion_service import ingest_channel_webhook, ingest_telegram_webhook
+from app.services.security_gateway_service import security_gateway_service
 from app.services.settings_service import get_channel_integration_runtime_settings
 from app.services.webhook_guard_service import (
     enforce_webhook_payload_size,
     enforce_webhook_rate_limit,
+    sanitize_webhook_payload,
 )
 from app.services.workflow_service import trigger_workflow_webhook
 
@@ -116,6 +119,26 @@ def _ingest_channel_webhook_route(
     return IngestMessageResponse(**result)
 
 
+def _workflow_webhook_user_key(request: Request, trigger_path: str) -> str:
+    forwarded_for = str(request.headers.get("x-forwarded-for") or "").strip()
+    if forwarded_for:
+        client_host = forwarded_for.split(",", maxsplit=1)[0].strip() or "unknown"
+    elif request.client is not None and request.client.host:
+        client_host = str(request.client.host)
+    else:
+        client_host = "unknown"
+    normalized_path = str(trigger_path or "").strip("/") or "root"
+    return f"workflow_webhook:{normalized_path}:{client_host}"
+
+
+def _workflow_webhook_security_text(trigger_path: str, payload: dict[str, Any] | None) -> str:
+    summarized_payload = {
+        "trigger_path": f"/{str(trigger_path or '').strip('/')}",
+        "payload": sanitize_webhook_payload(payload or {}),
+    }
+    return json.dumps(summarized_payload, ensure_ascii=False, sort_keys=True)
+
+
 @router.post("/telegram", response_model=IngestMessageResponse)
 def telegram_webhook_route(
     request: Request,
@@ -184,10 +207,16 @@ def workflow_webhook_route(
     payload: dict[str, Any] | None = None,
 ) -> WorkflowActionResponse:
     route_key = "workflow"
+    normalized_payload = payload or {}
     enforce_webhook_rate_limit(request=request, route_key=route_key)
     enforce_webhook_payload_size(
         request=request,
         route_key=route_key,
-        payload=payload or {},
+        payload=normalized_payload,
     )
-    return WorkflowActionResponse(**trigger_workflow_webhook(trigger_path, payload))
+    security_gateway_service.inspect_text_entrypoint(
+        text=_workflow_webhook_security_text(trigger_path, normalized_payload),
+        user_key=_workflow_webhook_user_key(request, trigger_path),
+        auth_scope="webhook:workflow",
+    )
+    return WorkflowActionResponse(**trigger_workflow_webhook(trigger_path, normalized_payload))

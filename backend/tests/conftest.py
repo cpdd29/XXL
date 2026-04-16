@@ -21,15 +21,28 @@ if str(BACKEND_ROOT) not in sys.path:
 
 from app.config import get_settings
 from app.core.nats_event_bus import reset_nats_event_bus_state
+from app.services.agent_execution_worker_service import agent_execution_worker_service
+from app.services.internal_event_delivery_poller_service import (
+    internal_event_delivery_poller_service,
+    reset_internal_event_delivery_poller_state,
+)
 from app.services.memory_service import reset_memory_store
-from app.services.message_ingestion_service import reset_message_ingestion_state
+from app.services.message_ingestion_service import (
+    reset_message_ingestion_state,
+)
+from app.services.external_agent_registry_service import reset_external_agent_registry_state
+from app.services.external_connection_auth_service import reset_external_connection_auth_state
+from app.services.external_skill_registry_service import reset_external_skill_registry_state
 from app.services.security_gateway_service import reset_security_gateway_state
 from app.services.store import store
-from app.services.internal_event_delivery_poller_service import reset_internal_event_delivery_poller_state
-from app.services.workflow_dispatch_poller_service import reset_workflow_dispatch_poller_state
+from app.services.workflow_dispatch_poller_service import (
+    reset_workflow_dispatch_poller_state,
+    workflow_dispatch_poller_service,
+)
 from app.services.workflow_realtime_service import reset_workflow_realtime_state
 from app.services.workflow_recovery_service import reset_workflow_recovery_state
 from app.services.workflow_scheduler_service import reset_workflow_scheduler_state
+from app.services.workflow_execution_worker_service import workflow_execution_worker_service
 from app.services.webhook_guard_service import reset_webhook_guard_state
 from app.services.workflow_service import reset_internal_event_delivery_state
 
@@ -91,31 +104,36 @@ def _should_inject_auth(path: str, headers: dict[str, str]) -> bool:
 @pytest.fixture(autouse=True)
 def reset_runtime_state() -> None:
     snapshot = deepcopy(store.__dict__)
-    reset_nats_event_bus_state()
-    reset_internal_event_delivery_poller_state()
-    reset_workflow_dispatch_poller_state()
-    reset_workflow_realtime_state()
-    reset_workflow_recovery_state()
-    reset_workflow_scheduler_state()
-    reset_internal_event_delivery_state()
-    reset_memory_store()
-    reset_message_ingestion_state()
-    reset_security_gateway_state()
-    reset_webhook_guard_state()
+
+    def _restore_runtime(*, start_background_runtime: bool) -> None:
+        agent_execution_worker_service.stop()
+        workflow_execution_worker_service.stop()
+        reset_nats_event_bus_state()
+        reset_internal_event_delivery_poller_state()
+        reset_workflow_dispatch_poller_state()
+        reset_workflow_realtime_state()
+        reset_workflow_recovery_state()
+        reset_workflow_scheduler_state()
+        reset_internal_event_delivery_state()
+        reset_memory_store()
+        reset_message_ingestion_state()
+        reset_external_agent_registry_state()
+        reset_external_connection_auth_state()
+        reset_external_skill_registry_state()
+        reset_security_gateway_state()
+        reset_webhook_guard_state()
+
+        if start_background_runtime:
+            workflow_execution_worker_service.start()
+            agent_execution_worker_service.start()
+            workflow_dispatch_poller_service.start()
+            internal_event_delivery_poller_service.start()
+
+    _restore_runtime(start_background_runtime=True)
     yield
     store.__dict__.clear()
     store.__dict__.update(deepcopy(snapshot))
-    reset_nats_event_bus_state()
-    reset_internal_event_delivery_poller_state()
-    reset_workflow_dispatch_poller_state()
-    reset_workflow_realtime_state()
-    reset_workflow_recovery_state()
-    reset_workflow_scheduler_state()
-    reset_internal_event_delivery_state()
-    reset_memory_store()
-    reset_message_ingestion_state()
-    reset_security_gateway_state()
-    reset_webhook_guard_state()
+    _restore_runtime(start_background_runtime=False)
 
 
 @pytest.fixture

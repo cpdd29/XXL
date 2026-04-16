@@ -3,7 +3,9 @@ from __future__ import annotations
 from pathlib import Path
 
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 
+from app.config import Settings
 from app.main import app
 from app.services.encryption_service import ENCRYPTED_TEXT_PREFIX
 from app.services import settings_service
@@ -12,6 +14,32 @@ from app.services.store import InMemoryStore, store
 
 
 client = TestClient(app)
+
+
+def test_settings_accepts_extra_workbot_env_vars(monkeypatch) -> None:
+    monkeypatch.setenv("WORKBOT_ENVIRONMENT", "test")
+    monkeypatch.setenv("WORKBOT_TOOL_SOURCES_MODE", "external_only")
+    monkeypatch.setenv("WORKBOT_ENABLE_LOCAL_MCP_SOURCE", "false")
+
+    settings = Settings()
+
+    assert settings.environment == "test"
+
+
+def test_settings_default_database_url_uses_psycopg_driver() -> None:
+    settings = Settings(_env_file=None)
+
+    assert settings.database_url.startswith("postgresql+psycopg://")
+
+
+def test_settings_still_validates_critical_field_types(monkeypatch) -> None:
+    monkeypatch.setenv("WORKBOT_MESSAGE_RATE_LIMIT_PER_MINUTE", "not-an-int")
+
+    try:
+        Settings()
+        assert False, "Expected Settings() to fail on invalid integer env value"
+    except ValidationError as exc:
+        assert "message_rate_limit_per_minute" in str(exc)
 
 
 def _replace_global_store(seeded_store: InMemoryStore) -> None:
@@ -40,6 +68,54 @@ def test_general_settings_route_returns_defaults(auth_headers) -> None:
         "dashboardAutoRefresh": True,
         "showSystemStatus": True,
     }
+
+
+def test_config_governance_route_returns_sectioned_snapshot(auth_headers) -> None:
+    response = client.get("/api/settings/governance", headers=auth_headers)
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["summary"]["totalSections"] >= 4
+    assert payload["summary"]["runtimeMutableSections"] >= 4
+    assert payload["readPriorityModel"]["runtimeMutable"] == [
+        "database_system_settings",
+        "runtime_cache",
+        "deployment_defaults",
+    ]
+    section_keys = {item["key"] for item in payload["sections"]}
+    assert "general" in section_keys
+    assert "security_policy" in section_keys
+    assert "agent_api" in section_keys
+    assert "channel_integrations" in section_keys
+    assert "auth_runtime" in section_keys
+
+
+def test_config_governance_route_exposes_settings_change_audits(
+    auth_headers_factory,
+) -> None:
+    update_response = client.put(
+        "/api/settings/general",
+        headers=auth_headers_factory(role="operator", email="governance.audit@example.com"),
+        json={"dashboardAutoRefresh": False},
+    )
+    assert update_response.status_code == 200
+
+    response = client.get("/api/settings/governance", headers=auth_headers_factory())
+
+    assert response.status_code == 200
+    audits = response.json()["recentChangeAudits"]
+    assert audits
+    assert audits[0]["action"] == "settings.general.updated"
+    assert audits[0]["user"] == "governance.audit@example.com"
+
+
+def test_config_governance_route_flags_runtime_risks(auth_headers) -> None:
+    response = client.get("/api/settings/governance", headers=auth_headers)
+
+    assert response.status_code == 200
+    sections = {item["key"]: item for item in response.json()["sections"]}
+    assert sections["auth_runtime"]["riskLevel"] == "warning"
+    assert sections["auth_runtime"]["warnings"]
 
 
 def test_update_general_settings_persists_round_trip(
@@ -215,6 +291,37 @@ def test_viewer_cannot_update_general_settings(
     assert response.json()["detail"] == "Permission denied"
 
 
+def test_power_user_cannot_update_general_settings(
+    auth_headers_factory,
+) -> None:
+    response = client.put(
+        "/api/settings/general",
+        headers=auth_headers_factory(role="power_user"),
+        json={
+            "dashboardAutoRefresh": False,
+        },
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Permission denied"
+
+
+def test_update_general_settings_appends_control_plane_audit_log(
+    auth_headers_factory,
+) -> None:
+    response = client.put(
+        "/api/settings/general",
+        headers=auth_headers_factory(role="operator", email="ops.settings@example.test"),
+        json={
+            "dashboardAutoRefresh": False,
+        },
+    )
+
+    assert response.status_code == 200
+    assert store.audit_logs[0]["action"] == "settings.general.updated"
+    assert store.audit_logs[0]["user"] == "ops.settings@example.test"
+
+
 def test_security_policy_route_returns_defaults(auth_headers) -> None:
     response = client.get("/api/settings/security-policy", headers=auth_headers)
 
@@ -244,6 +351,29 @@ def test_update_security_policy_persists_round_trip(
     auth_headers = auth_headers_factory()
 
     try:
+        approval_response = client.put(
+            "/api/settings/security-policy",
+            headers=auth_headers,
+            json={
+                "messageRateLimitPerMinute": 9,
+                "messageRateLimitCooldownSeconds": 45,
+                "messageRateLimitBanThreshold": 4,
+                "messageRateLimitBanSeconds": 600,
+                "securityIncidentWindowSeconds": 900,
+                "promptRuleBlockThreshold": 5,
+                "promptClassifierBlockThreshold": 4,
+                "promptInjectionEnabled": False,
+                "contentRedactionEnabled": False,
+            },
+        )
+        assert approval_response.status_code == 202
+        approval_id = approval_response.json()["approval"]["id"]
+        approve_response = client.post(
+            f"/api/approvals/{approval_id}/approve",
+            headers=auth_headers,
+            json={"note": "允许执行安全策略更新"},
+        )
+        assert approve_response.status_code == 200
         update_response = client.put(
             "/api/settings/security-policy",
             headers=auth_headers,
@@ -257,6 +387,7 @@ def test_update_security_policy_persists_round_trip(
                 "promptClassifierBlockThreshold": 4,
                 "promptInjectionEnabled": False,
                 "contentRedactionEnabled": False,
+                "approvalId": approval_id,
             },
         )
         read_response = client.get("/api/settings/security-policy", headers=auth_headers)
@@ -302,12 +433,28 @@ def test_update_security_policy_merges_partial_payload_with_defaults_when_missin
     auth_headers = auth_headers_factory()
 
     try:
+        approval_response = client.put(
+            "/api/settings/security-policy",
+            headers=auth_headers,
+            json={
+                "messageRateLimitPerMinute": 11,
+                "promptInjectionEnabled": False,
+            },
+        )
+        assert approval_response.status_code == 202
+        approval_id = approval_response.json()["approval"]["id"]
+        assert client.post(
+            f"/api/approvals/{approval_id}/approve",
+            headers=auth_headers,
+            json={"note": "允许执行"},
+        ).status_code == 200
         update_response = client.put(
             "/api/settings/security-policy",
             headers=auth_headers,
             json={
                 "messageRateLimitPerMinute": 11,
                 "promptInjectionEnabled": False,
+                "approvalId": approval_id,
             },
         )
         persisted_setting = service.get_system_setting("security_policy")
@@ -340,6 +487,56 @@ def test_viewer_cannot_update_security_policy(
 
     assert response.status_code == 403
     assert response.json()["detail"] == "Permission denied"
+
+
+def test_update_security_policy_requires_approval_and_prevents_replay(
+    tmp_path: Path,
+    monkeypatch,
+    auth_headers_factory,
+) -> None:
+    service = _sqlite_service(tmp_path, InMemoryStore())
+    monkeypatch.setattr(settings_service, "persistence_service", service)
+    auth_headers = auth_headers_factory(role="operator", email="security.policy@example.test")
+
+    try:
+        approval_response = client.put(
+            "/api/settings/security-policy",
+            headers=auth_headers,
+            json={
+                "messageRateLimitPerMinute": 12,
+                "approvalReason": "需要提高风控强度",
+            },
+        )
+        approval_id = approval_response.json()["approval"]["id"]
+        approve_response = client.post(
+            f"/api/approvals/{approval_id}/approve",
+            headers=auth_headers,
+            json={"note": "批准"},
+        )
+        first_execute = client.put(
+            "/api/settings/security-policy",
+            headers=auth_headers,
+            json={
+                "messageRateLimitPerMinute": 12,
+                "approvalId": approval_id,
+            },
+        )
+        replay_execute = client.put(
+            "/api/settings/security-policy",
+            headers=auth_headers,
+            json={
+                "messageRateLimitPerMinute": 12,
+                "approvalId": approval_id,
+            },
+        )
+    finally:
+        service.close()
+
+    assert approval_response.status_code == 202
+    assert approval_response.json()["approvalRequired"] is True
+    assert approve_response.status_code == 200
+    assert first_execute.status_code == 200
+    assert replay_execute.status_code == 409
 
 
 def test_agent_api_settings_route_returns_defaults(auth_headers) -> None:

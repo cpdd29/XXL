@@ -45,6 +45,9 @@ class UpdateSecurityPolicySettingsRequest(APIModel):
     prompt_classifier_block_threshold: int | None = None
     prompt_injection_enabled: bool | None = None
     content_redaction_enabled: bool | None = None
+    approval_id: str | None = None
+    approval_reason: str | None = None
+    approval_note: str | None = None
 
 
 class AgentApiProviderSettings(APIModel):
@@ -205,3 +208,47 @@ class UpdateChannelIntegrationSettingsRequest(APIModel):
     wecom: UpdateWeComChannelIntegrationSettingsRequest | None = None
     feishu: UpdateFeishuChannelIntegrationSettingsRequest | None = None
     dingtalk: UpdateDingTalkChannelIntegrationSettingsRequest | None = None
+
+
+class ConfigGovernanceSummary(APIModel):
+    total_sections: int
+    runtime_mutable_sections: int
+    deployment_immutable_sections: int
+    warning_count: int
+
+
+class ConfigReadPriorityModel(APIModel):
+    runtime_mutable: list[str]
+    deployment_immutable: list[str]
+
+
+class ConfigGovernanceSection(APIModel):
+    key: str
+    label: str
+    category: str
+    mutability: str
+    effective_source: str
+    read_priority: list[str]
+    updated_at: str
+    defaults_from: str
+    current: dict[str, object]
+    defaults: dict[str, object]
+    warnings: list[str]
+    risk_level: str
+
+
+class ConfigChangeAuditItem(APIModel):
+    id: str
+    timestamp: str
+    action: str
+    user: str
+    resource: str
+    details: str
+    status: str
+
+
+class ConfigGovernanceResponse(APIModel):
+    summary: ConfigGovernanceSummary
+    read_priority_model: ConfigReadPriorityModel
+    sections: list[ConfigGovernanceSection]
+    recent_change_audits: list[ConfigChangeAuditItem]

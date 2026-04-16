@@ -10,5 +10,5 @@ backend/.env
 backend/.pytest_cache/
 data/
 backend/data/
-样式文件/.next/
-样式文件/node_modules/
+reception/.next/
+reception/node_modules/

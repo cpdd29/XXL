@@ -4,6 +4,7 @@ from typing import Any
 from fastapi import HTTPException, status
 
 from app.services.agent_config_service import agent_config_service, build_agent_config_summary
+from app.services.external_agent_registry_service import external_agent_registry_service
 from app.services.persistence_service import persistence_service
 from app.services.store import store
 
@@ -30,12 +31,23 @@ ALLOWED_AGENT_STATUSES = {
 def _load_agents() -> list[dict]:
     database_agents = persistence_service.list_agents()
     if database_agents is not None:
-        return database_agents
+        base_agents = database_agents
+    elif getattr(persistence_service, "enabled", False):
+        base_agents = []
+    else:
+        base_agents = store.clone(store.agents)
 
-    if getattr(persistence_service, "enabled", False):
-        return []
-
-    return store.clone(store.agents)
+    merged: dict[str, dict] = {
+        str(agent.get("id") or "").strip(): store.clone(agent)
+        for agent in base_agents
+        if str(agent.get("id") or "").strip()
+    }
+    for external_agent in external_agent_registry_service.list_agents(include_offline=True):
+        agent_id = str(external_agent.get("id") or "").strip()
+        if not agent_id or agent_id in merged:
+            continue
+        merged[agent_id] = store.clone(external_agent)
+    return list(merged.values())
 
 
 def _find_cached_agent(agent_id: str) -> dict | None:
@@ -201,6 +213,17 @@ def _build_runtime_view(agent: dict, *, now: datetime | None = None) -> dict:
 
 def _decorate_agent(agent_payload: dict, *, include_snapshot: bool = True) -> dict:
     payload = store.clone(agent_payload)
+    snapshot = payload.get("config_snapshot")
+    if not isinstance(snapshot, dict):
+        snapshot = agent_config_service.load_agent_config(payload)
+        payload["config_snapshot"] = snapshot
+        payload["config_summary"] = build_agent_config_summary(snapshot)
+        cached_agent = _find_cached_agent(str(payload.get("id") or "").strip())
+        if cached_agent is not None:
+            cached_agent["config_snapshot"] = store.clone(snapshot)
+            cached_agent["config_summary"] = build_agent_config_summary(snapshot)
+    elif not isinstance(payload.get("config_summary"), dict):
+        payload["config_summary"] = build_agent_config_summary(snapshot)
     payload.update(_build_runtime_view(payload))
     if not include_snapshot:
         payload.pop("config_snapshot", None)
@@ -235,6 +258,10 @@ def _find_agent_mutable(agent_id: str) -> dict:
     cached_agent = _find_cached_agent(agent_id)
     if cached_agent is not None:
         return cached_agent
+
+    external_agent = external_agent_registry_service.get_agent(agent_id)
+    if external_agent is not None:
+        return _sync_cached_agent(external_agent)
 
     raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent not found")
 
@@ -319,6 +346,25 @@ def report_agent_heartbeat(
     queue_depth: int | None = None,
     metadata: dict[str, Any] | None = None,
 ) -> dict:
+    external_agent = external_agent_registry_service.get_agent(agent_id)
+    if external_agent is not None:
+        updated_external = external_agent_registry_service.report_heartbeat(
+            agent_id,
+            status=status_text,
+            load=load,
+            queue_depth=queue_depth,
+            metadata=metadata,
+        )
+        _sync_cached_agent(updated_external)
+        return {
+            "ok": True,
+            "message": (
+                f"External agent {updated_external['name']} heartbeat accepted; "
+                f"runtime={updated_external['runtime_status']}, routable={updated_external['routable']}"
+            ),
+            "agent": _decorate_agent(updated_external),
+        }
+
     agent = _find_agent_mutable(agent_id)
     runtime = _runtime_snapshot(agent)
     normalized_status = _normalize_agent_status(status_text)

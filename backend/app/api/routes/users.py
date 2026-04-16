@@ -88,7 +88,7 @@ def get_user_activity_route(user_id: str) -> UserActivityResponse:
 @router.put(
     "/{user_id}/profile",
     response_model=UserActionResponse,
-    dependencies=[Depends(require_permission("users:write"))],
+    dependencies=[Depends(require_permission("users:profile:write"))],
 )
 def update_user_profile_route(
     user_id: str,
@@ -107,7 +107,7 @@ def update_user_profile_route(
 @router.post(
     "/{user_id}/platform-accounts/bind",
     response_model=UserActionResponse,
-    dependencies=[Depends(require_permission("users:write"))],
+    dependencies=[Depends(require_permission("users:identity:bind"))],
 )
 def bind_user_platform_account_route(
     user_id: str,
@@ -127,7 +127,7 @@ def bind_user_platform_account_route(
 @router.post(
     "/{user_id}/platform-accounts/unbind",
     response_model=UserActionResponse,
-    dependencies=[Depends(require_permission("users:write"))],
+    dependencies=[Depends(require_permission("users:identity:bind"))],
 )
 def unbind_user_platform_account_route(
     user_id: str,
@@ -145,7 +145,7 @@ def unbind_user_platform_account_route(
 @router.put(
     "/{user_id}/role",
     response_model=UserActionResponse,
-    dependencies=[Depends(require_permission("users:write"))],
+    dependencies=[Depends(require_permission("users:role:write"))],
 )
 def update_user_role_route(user_id: str, payload: UpdateUserRoleRequest) -> UserActionResponse:
     return UserActionResponse(**update_user_role(user_id, payload.role))

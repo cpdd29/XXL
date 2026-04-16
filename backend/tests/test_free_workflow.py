@@ -110,6 +110,37 @@ class _MCPLegacyOnlyMappingStub(_MCPRuntimeStub):
         }
 
 
+class _MCPRuntimeHTTPWeatherStub(_MCPRuntimeStub):
+    def invoke_tool(self, *, tool_id: str, payload: dict | None = None, trace_context: dict | None = None, **kwargs):  # noqa: ANN001
+        _ = (payload, trace_context, kwargs)
+        return {
+            "ok": True,
+            "trace_id": "trace-runtime-http-weather",
+            "duration_ms": 8.4,
+            "result": {
+                "ok": True,
+                "bridge_mode": "http",
+                "meta": {"endpoint": "http://weather-mcp/execute"},
+                "output": {
+                    "ok": True,
+                    "tool": "weather",
+                    "summary": "weather generated for 广州",
+                    "result": {
+                        "location": "广州",
+                        "temperature_c": 18.9,
+                        "weather_description": "windy",
+                        "wind_speed_kmh": 6.9,
+                        "forecast": [
+                            {"day_offset": 0, "temperature_c": 18.9, "weather": "windy"},
+                            {"day_offset": 1, "temperature_c": 19.5, "weather": "windy"},
+                            {"day_offset": 2, "temperature_c": 20.1, "weather": "windy"},
+                        ],
+                    },
+                },
+            },
+        }
+
+
 def test_free_workflow_registers_builtin_skills() -> None:
     service = _build_service()
     names = {item["name"] for item in service.list_skills()}
@@ -355,6 +386,28 @@ def test_free_workflow_external_only_still_routes_weather_through_runtime_withou
     assert result["ok"] is True
     assert result["selected_skill"] == "weather_skill"
     assert result["migration_runtime"]["selected_path"] == "runtime"
+    assert result["result"]["source"] == "mcp_runtime"
+
+
+def test_free_workflow_formats_nested_weather_runtime_payload_for_user_reply() -> None:
+    registry = SkillRegistryService()
+    runtime = SkillRuntimeService(registry=registry)
+    service = FreeWorkflowService(
+        registry=registry,
+        runtime=runtime,
+        mcp_runtime=_MCPRuntimeHTTPWeatherStub(),
+    )
+
+    result = service.run(text="帮我查询一下广州的天气")
+
+    assert result["ok"] is True
+    assert result["selected_skill"] == "weather_skill"
+    assert result["result_summary"] == "广州，有风，18.9°C，风速6.9 km/h"
+    assert result["wrapped_result"]["title"] == "广州天气"
+    assert "广州当前天气：有风" in result["wrapped_result"]["content"]
+    assert "当前温度：18.9°C" in result["wrapped_result"]["content"]
+    assert "明天：有风，19.5°C" in result["wrapped_result"]["content"]
+    assert result["result"]["runtime_tool_id"] == "agent-reach-external:weather"
     assert result["result"]["source"] == "mcp_runtime"
 
 

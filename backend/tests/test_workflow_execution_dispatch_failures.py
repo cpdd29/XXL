@@ -210,6 +210,126 @@ def test_fail_workflow_run_due_dispatch_failure_falls_back_when_workflow_is_miss
     assert cancelled == [run_id]
 
 
+def test_fail_workflow_run_due_dispatch_failure_auto_recovers_with_planner_recovery(
+    monkeypatch,
+) -> None:
+    task_id = "task-dispatch-recovery"
+    run_id = "run-task-dispatch-recovery"
+    store.tasks.append(_task(task_id))
+    store.workflow_runs.insert(
+        0,
+        _run(run_id, task_id)
+        | {
+            "dispatch_context": {
+                "state": "dispatching",
+                "route_decision": {
+                    "intent": "search",
+                    "fallback_policy": {
+                        "mode": "planner_recovery",
+                        "target": "master_bot_planner",
+                        "on_failure": "retry_or_fail_terminal",
+                    },
+                },
+                "state_machine": {"version": "brain_fact_layer_v1"},
+            }
+        },
+    )
+    store.task_steps[task_id] = [
+        {
+            "id": f"{task_id}-1",
+            "title": "执行节点",
+            "status": "running",
+            "agent": "搜索Agent",
+            "started_at": store.now_string(),
+            "finished_at": None,
+            "message": "等待调度继续推进",
+            "tokens": 64,
+        }
+    ]
+
+    scheduled: list[str] = []
+    monkeypatch.setattr(
+        workflow_execution_service,
+        "_schedule_retry_follow_up",
+        lambda fallback_run_id: scheduled.append(fallback_run_id),
+    )
+
+    payload = workflow_execution_service.fail_workflow_run_due_dispatch_failure(
+        run_id,
+        failure_message="调度推进连续失败，触发主脑自动回退",
+    )
+
+    task = next(item for item in store.tasks if item["id"] == task_id)
+    dispatch_context = payload["dispatch_context"]
+    assert payload["status"] == "pending"
+    assert task["status"] == "pending"
+    assert dispatch_context["state"] == "queued"
+    assert dispatch_context["fallback_recovery_reason"] == "dispatch_failure"
+    assert dispatch_context["fallback_recovery_action"] == "planner_retry"
+    assert dispatch_context["fallback_history"][-1]["reason"] == "dispatch_failure"
+    assert scheduled == [payload["id"]]
+
+
+def test_fail_workflow_run_due_dispatch_failure_enters_manual_handoff_for_approval_gate(
+    monkeypatch,
+) -> None:
+    task_id = "task-dispatch-approval-gate"
+    run_id = "run-task-dispatch-approval-gate"
+    store.tasks.append(_task(task_id))
+    store.workflow_runs.insert(
+        0,
+        _run(run_id, task_id)
+        | {
+            "dispatch_context": {
+                "state": "dispatching",
+                "route_decision": {
+                    "intent": "search",
+                    "fallback_policy": {
+                        "mode": "approval_gate",
+                        "target": "local_operator",
+                        "on_failure": "human_review",
+                    },
+                },
+                "state_machine": {"version": "brain_fact_layer_v1"},
+            }
+        },
+    )
+    store.task_steps[task_id] = [
+        {
+            "id": f"{task_id}-1",
+            "title": "执行节点",
+            "status": "running",
+            "agent": "搜索Agent",
+            "started_at": store.now_string(),
+            "finished_at": None,
+            "message": "等待调度继续推进",
+            "tokens": 64,
+        }
+    ]
+
+    scheduled: list[str] = []
+    monkeypatch.setattr(
+        workflow_execution_service,
+        "_schedule_retry_follow_up",
+        lambda fallback_run_id: scheduled.append(fallback_run_id),
+    )
+
+    payload = workflow_execution_service.fail_workflow_run_due_dispatch_failure(
+        run_id,
+        failure_message="调度失败，需人工审批接管",
+    )
+
+    task = next(item for item in store.tasks if item["id"] == task_id)
+    dispatch_context = payload["dispatch_context"]
+    assert payload["status"] == "failed"
+    assert task["status"] == "failed"
+    assert dispatch_context["state"] == "manual_handoff_required"
+    assert dispatch_context["fallback_recovery_state"] == "handoff_required"
+    assert dispatch_context["fallback_recovery_action"] == "human_handoff"
+    assert dispatch_context["fallback_history"][-1]["reason"] == "dispatch_failure"
+    assert scheduled == []
+
+
 def test_tick_workflow_run_returns_terminal_state_when_workflow_is_missing(
     monkeypatch,
 ) -> None:

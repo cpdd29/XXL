@@ -1,0 +1,70 @@
+{
+  "archive_dir": "/Users/xiaoyuge/Documents/XXL/backend/docs/release_evidence_archives/release_evidence_20260415_192958",
+  "archive_complete": true,
+  "items": [
+    {
+      "name": "release_preflight_20260415T192958Z.json",
+      "source": "/Users/xiaoyuge/Documents/XXL/backend/docs/release_evidence_archives/release_evidence_20260415_192958/release_preflight_20260415T192958Z.json",
+      "archived": "/Users/xiaoyuge/Documents/XXL/backend/docs/release_evidence_archives/release_evidence_20260415_192958/release_preflight_20260415T192958Z.json",
+      "size_bytes": 4677
+    },
+    {
+      "name": "release_preflight_20260415T192958Z.md",
+      "source": "/Users/xiaoyuge/Documents/XXL/backend/docs/release_evidence_archives/release_evidence_20260415_192958/release_preflight_20260415T192958Z.md",
+      "archived": "/Users/xiaoyuge/Documents/XXL/backend/docs/release_evidence_archives/release_evidence_20260415_192958/release_preflight_20260415T192958Z.md",
+      "size_bytes": 4829
+    },
+    {
+      "name": "brain_prelaunch_20260415T192959Z.json",
+      "source": "/Users/xiaoyuge/Documents/XXL/backend/docs/release_evidence_archives/release_evidence_20260415_192958/brain_prelaunch_20260415T192959Z.json",
+      "archived": "/Users/xiaoyuge/Documents/XXL/backend/docs/release_evidence_archives/release_evidence_20260415_192958/brain_prelaunch_20260415T192959Z.json",
+      "size_bytes": 162147
+    },
+    {
+      "name": "brain_prelaunch_20260415T192959Z.md",
+      "source": "/Users/xiaoyuge/Documents/XXL/backend/docs/release_evidence_archives/release_evidence_20260415_192958/brain_prelaunch_20260415T192959Z.md",
+      "archived": "/Users/xiaoyuge/Documents/XXL/backend/docs/release_evidence_archives/release_evidence_20260415_192958/brain_prelaunch_20260415T192959Z.md",
+      "size_bytes": 162313
+    },
+    {
+      "name": "compatibility_boundaries_20260415T192959Z.json",
+      "source": "/Users/xiaoyuge/Documents/XXL/backend/docs/release_evidence_archives/release_evidence_20260415_192958/compatibility_boundaries_20260415T192959Z.json",
+      "archived": "/Users/xiaoyuge/Documents/XXL/backend/docs/release_evidence_archives/release_evidence_20260415_192958/compatibility_boundaries_20260415T192959Z.json",
+      "size_bytes": 1454
+    },
+    {
+      "name": "compatibility_boundaries_20260415T192959Z.md",
+      "source": "/Users/xiaoyuge/Documents/XXL/backend/docs/release_evidence_archives/release_evidence_20260415_192958/compatibility_boundaries_20260415T192959Z.md",
+      "archived": "/Users/xiaoyuge/Documents/XXL/backend/docs/release_evidence_archives/release_evidence_20260415_192958/compatibility_boundaries_20260415T192959Z.md",
+      "size_bytes": 1617
+    },
+    {
+      "name": "memory_governance_20260415T192959Z.json",
+      "source": "/Users/xiaoyuge/Documents/XXL/backend/docs/release_evidence_archives/release_evidence_20260415_192958/memory_governance_20260415T192959Z.json",
+      "archived": "/Users/xiaoyuge/Documents/XXL/backend/docs/release_evidence_archives/release_evidence_20260415_192958/memory_governance_20260415T192959Z.json",
+      "size_bytes": 4804
+    },
+    {
+      "name": "memory_governance_20260415T192959Z.md",
+      "source": "/Users/xiaoyuge/Documents/XXL/backend/docs/release_evidence_archives/release_evidence_20260415_192958/memory_governance_20260415T192959Z.md",
+      "archived": "/Users/xiaoyuge/Documents/XXL/backend/docs/release_evidence_archives/release_evidence_20260415_192958/memory_governance_20260415T192959Z.md",
+      "size_bytes": 4956
+    },
+    {
+      "name": "release_evidence_bundle_20260415T192959Z.json",
+      "source": "/Users/xiaoyuge/Documents/XXL/backend/docs/release_evidence_archives/release_evidence_20260415_192958/release_evidence_bundle_20260415T192959Z.json",
+      "archived": "/Users/xiaoyuge/Documents/XXL/backend/docs/release_evidence_archives/release_evidence_20260415_192958/release_evidence_bundle_20260415T192959Z.json",
+      "size_bytes": 198775
+    },
+    {
+      "name": "release_evidence_bundle_20260415T192959Z.md",
+      "source": "/Users/xiaoyuge/Documents/XXL/backend/docs/release_evidence_archives/release_evidence_20260415_192958/release_evidence_bundle_20260415T192959Z.md",
+      "archived": "/Users/xiaoyuge/Documents/XXL/backend/docs/release_evidence_archives/release_evidence_20260415_192958/release_evidence_bundle_20260415T192959Z.md",
+      "size_bytes": 198939
+    }
+  ],
+  "bundle_artifacts": {
+    "json_report": "/Users/xiaoyuge/Documents/XXL/backend/docs/release_evidence_archives/release_evidence_20260415_192958/release_evidence_bundle_20260415T192959Z.json",
+    "markdown_report": "/Users/xiaoyuge/Documents/XXL/backend/docs/release_evidence_archives/release_evidence_20260415_192958/release_evidence_bundle_20260415T192959Z.md"
+  }
+}

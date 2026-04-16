@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import sqlite3
 
 from sqlalchemy import select
 
@@ -15,6 +16,112 @@ from app.db.models import (
 )
 from app.services.persistence_service import StatePersistenceService
 from app.services.store import InMemoryStore
+
+
+def test_persistence_service_initialize_backfills_legacy_job_protocol_columns(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "legacy-job-schema.db"
+    database_url = f"sqlite:///{database_path}"
+
+    connection = sqlite3.connect(database_path)
+    try:
+        connection.executescript(
+            """
+            CREATE TABLE workflow_dispatch_jobs (
+                run_id VARCHAR(128) PRIMARY KEY,
+                available_at VARCHAR(128) NOT NULL,
+                step_delay_seconds FLOAT,
+                dispatcher_id VARCHAR(128),
+                claimed_at VARCHAR(128),
+                lease_expires_at VARCHAR(128),
+                created_at VARCHAR(128) NOT NULL,
+                updated_at VARCHAR(128) NOT NULL
+            );
+            CREATE TABLE workflow_execution_jobs (
+                run_id VARCHAR(128) PRIMARY KEY,
+                available_at VARCHAR(128) NOT NULL,
+                step_delay_seconds FLOAT,
+                worker_id VARCHAR(128),
+                claimed_at VARCHAR(128),
+                lease_expires_at VARCHAR(128),
+                created_at VARCHAR(128) NOT NULL,
+                updated_at VARCHAR(128) NOT NULL
+            );
+            CREATE TABLE agent_execution_jobs (
+                run_id VARCHAR(128) PRIMARY KEY,
+                task_id VARCHAR(64) NOT NULL,
+                workflow_id VARCHAR(128) NOT NULL,
+                execution_agent_id VARCHAR(128),
+                available_at VARCHAR(128) NOT NULL,
+                step_delay_seconds FLOAT,
+                worker_id VARCHAR(128),
+                claimed_at VARCHAR(128),
+                lease_expires_at VARCHAR(128),
+                created_at VARCHAR(128) NOT NULL,
+                updated_at VARCHAR(128) NOT NULL
+            );
+            """
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    service = StatePersistenceService(runtime_store=InMemoryStore(), database_url=database_url)
+    assert service.initialize() is True
+
+    try:
+        verification = sqlite3.connect(database_path)
+        try:
+            for table_name in (
+                "workflow_dispatch_jobs",
+                "workflow_execution_jobs",
+                "agent_execution_jobs",
+            ):
+                columns = {
+                    row[1]
+                    for row in verification.execute(f"PRAGMA table_info({table_name})").fetchall()
+                }
+                assert "protocol" in columns
+        finally:
+            verification.close()
+
+        dispatch_job = service.upsert_workflow_dispatch_job(
+            "run-dispatch-legacy",
+            available_at="2026-04-16T00:00:00+00:00",
+            queued_at="2026-04-16T00:00:00+00:00",
+            message_id="msg-dispatch-1",
+            attempt=1,
+        )
+        workflow_job = service.upsert_workflow_execution_job(
+            "run-workflow-legacy",
+            available_at="2026-04-16T00:00:00+00:00",
+            queued_at="2026-04-16T00:00:00+00:00",
+            message_id="msg-workflow-1",
+            attempt=2,
+        )
+        agent_job = service.upsert_agent_execution_job(
+            "run-agent-legacy",
+            task_id="task-legacy-1",
+            workflow_id="workflow-legacy-1",
+            execution_agent_id="agent-legacy-1",
+            available_at="2026-04-16T00:00:00+00:00",
+            queued_at="2026-04-16T00:00:00+00:00",
+            message_id="msg-agent-1",
+            attempt=3,
+        )
+
+        assert dispatch_job is not None
+        assert dispatch_job["message_id"] == "msg-dispatch-1"
+        assert dispatch_job["attempt"] == 1
+        assert workflow_job is not None
+        assert workflow_job["message_id"] == "msg-workflow-1"
+        assert workflow_job["attempt"] == 2
+        assert agent_job is not None
+        assert agent_job["message_id"] == "msg-agent-1"
+        assert agent_job["attempt"] == 3
+    finally:
+        service.close()
 
 
 def test_persistence_service_round_trips_runtime_state(tmp_path: Path) -> None:
@@ -1513,6 +1620,70 @@ def test_persistence_service_upsert_and_claim_agent_execution_jobs(tmp_path: Pat
     assert stale_delete is False
     assert claimed_delete is True
     assert deleted_job is None
+
+
+def test_persistence_service_persists_job_protocol_snapshots(tmp_path: Path) -> None:
+    database_path = tmp_path / "workbot-job-protocol.db"
+    database_url = f"sqlite:///{database_path}"
+
+    service = StatePersistenceService(runtime_store=InMemoryStore(), database_url=database_url)
+    assert service.initialize() is True
+
+    try:
+        dispatch_job = service.upsert_workflow_dispatch_job(
+            "run-dispatch-protocol",
+            available_at="2026-04-15T03:10:01+00:00",
+            queued_at="2026-04-15T03:10:00+00:00",
+            request_id="req-dispatch-protocol",
+            correlation_id="corr-dispatch-protocol",
+            idempotency_key="workflow.dispatch.request:run-dispatch-protocol",
+            attempt=2,
+            max_attempts=6,
+        )
+        execution_job = service.upsert_workflow_execution_job(
+            "run-execution-protocol",
+            available_at="2026-04-15T03:10:02+00:00",
+            queued_at="2026-04-15T03:10:00+00:00",
+            request_id="req-execution-protocol",
+            correlation_id="corr-execution-protocol",
+            idempotency_key="workflow.execution.request:run-execution-protocol",
+            attempt=3,
+            max_attempts=4,
+            dead_letter=False,
+            last_error="boom",
+        )
+        agent_job = service.upsert_agent_execution_job(
+            "run-agent-protocol",
+            task_id="task-agent-protocol",
+            workflow_id="workflow-agent-protocol",
+            execution_agent_id="agent-search",
+            available_at="2026-04-15T03:10:03+00:00",
+            queued_at="2026-04-15T03:10:00+00:00",
+            request_id="req-agent-protocol",
+            correlation_id="corr-agent-protocol",
+            idempotency_key="agent.execution.request:run-agent-protocol",
+            attempt=1,
+            max_attempts=3,
+            dead_letter=True,
+            dead_letter_reason="manual_handoff",
+        )
+    finally:
+        service.close()
+
+    assert dispatch_job is not None
+    assert dispatch_job["request_id"] == "req-dispatch-protocol"
+    assert dispatch_job["protocol"]["attempt"] == 2
+    assert dispatch_job["protocol"]["max_attempts"] == 6
+
+    assert execution_job is not None
+    assert execution_job["request_id"] == "req-execution-protocol"
+    assert execution_job["protocol"]["idempotency_key"] == "workflow.execution.request:run-execution-protocol"
+    assert execution_job["protocol"]["last_error"] == "boom"
+
+    assert agent_job is not None
+    assert agent_job["request_id"] == "req-agent-protocol"
+    assert agent_job["protocol"]["dead_letter"] is True
+    assert agent_job["protocol"]["dead_letter_reason"] == "manual_handoff"
 
 
 def test_persistence_service_appends_and_lists_conversation_messages(tmp_path: Path) -> None:

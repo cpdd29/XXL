@@ -26,6 +26,28 @@ def _normalize_list(values: Iterable[object] | None, *, lowercase: bool = True) 
     return normalized
 
 
+def _parse_version_parts(value: object) -> tuple[int, ...]:
+    normalized = _normalize_text(value).lower().lstrip("v")
+    if not normalized:
+        return (0,)
+    parts: list[int] = []
+    for piece in normalized.replace("-", ".").split("."):
+        digits = "".join(char for char in piece if char.isdigit())
+        parts.append(int(digits or 0))
+    return tuple(parts or [0])
+
+
+def _release_channel_rank(value: object) -> int:
+    normalized = _normalize_text(value).lower()
+    return {
+        "stable": 4,
+        "canary": 3,
+        "beta": 2,
+        "alpha": 1,
+        "deprecated": 0,
+    }.get(normalized, 0)
+
+
 class SkillRegistryService:
     def __init__(self) -> None:
         self._abilities_by_name: dict[str, dict[str, Any]] = {}
@@ -114,9 +136,37 @@ class SkillRegistryService:
             matched = set(ability["capabilities"]) & required_set
             if not matched:
                 continue
-            scored.append((len(matched), -len(ability["capabilities"]), ability))
-        scored.sort(key=lambda item: (-item[0], item[1], item[2]["name"].lower()))
-        return [self._clone_ability(item[2]) for item in scored]
+            metadata = ability.get("metadata") or {}
+            registry = metadata.get("registry") if isinstance(metadata, dict) else {}
+            if not isinstance(registry, dict):
+                registry = {}
+            deprecated_penalty = 0 if bool(registry.get("deprecated")) else 1
+            default_bonus = 1 if bool(registry.get("default_version")) else 0
+            channel_rank = _release_channel_rank(registry.get("release_channel"))
+            version_rank = _parse_version_parts(registry.get("version"))
+            scored.append(
+                (
+                    len(matched),
+                    deprecated_penalty,
+                    default_bonus,
+                    channel_rank,
+                    version_rank,
+                    -len(ability["capabilities"]),
+                    ability,
+                )
+            )
+        scored.sort(
+            key=lambda item: (
+                -item[0],
+                -item[1],
+                -item[2],
+                -item[3],
+                tuple(-part for part in item[4]),
+                item[5],
+                item[6]["name"].lower(),
+            )
+        )
+        return [self._clone_ability(item[6]) for item in scored]
 
     # Compatibility API used by existing execution chain.
     def list_skills(

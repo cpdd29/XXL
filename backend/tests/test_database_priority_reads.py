@@ -7369,13 +7369,13 @@ def test_message_ingest_falls_back_to_direct_agent_with_database_priority_reads(
         service.close()
 
     assert result["ok"] is True
-    assert result["route_decision"]["routing_strategy"] == "workflow_or_direct_agent_fallback"
+    assert result["route_decision"]["routing_strategy"] == "workflow_or_agent_dispatch_fallback"
     assert result["route_decision"]["execution_agent_id"] == "db-agent-direct-search"
     assert persisted_tasks is not None
     assert len(persisted_tasks) == 1
     assert persisted_runs is not None
     assert len(persisted_runs) == 1
-    assert persisted_runs[0]["workflow_id"] == "__direct_agent_fallback__"
+    assert persisted_runs[0]["workflow_id"] == workflow_execution_service.AGENT_DISPATCH_WORKFLOW_ID
 
 
 def test_message_ingest_rejects_disabled_database_execution_agent(

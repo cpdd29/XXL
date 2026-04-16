@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import logging
 import re
@@ -7,6 +8,13 @@ from typing import Any
 
 import httpx
 
+from app.core.brain_payload_fields import (
+    alias_text,
+    dispatch_context_from_run,
+    execution_plan_from_payload,
+    route_decision_from_payload,
+    route_decision_from_task,
+)
 from app.services.agent_config_service import agent_config_service, build_agent_config_summary
 from app.services.document_search_service import document_search_service
 from app.services.language_service import detect_language
@@ -148,6 +156,15 @@ LIVE_INFORMATION_HINTS = (
     "traffic",
     "flight",
 )
+CANONICAL_ROUTING_STRATEGY_WORKFLOW_OR_AGENT_DISPATCH_FALLBACK = (
+    "workflow_or_agent_dispatch_fallback"
+)
+LEGACY_ROUTING_STRATEGY_WORKFLOW_OR_AGENT_FALLBACK = "_".join(
+    ("workflow", "or", "direct", "agent", "fallback")
+)
+LEGACY_ROUTING_STRATEGY_ALIASES = {
+    LEGACY_ROUTING_STRATEGY_WORKFLOW_OR_AGENT_FALLBACK: CANONICAL_ROUTING_STRATEGY_WORKFLOW_OR_AGENT_DISPATCH_FALLBACK,
+}
 
 
 def _normalize_language(value: Any) -> str | None:
@@ -209,18 +226,17 @@ def _combined_references(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def _planned_execution(run: dict) -> dict[str, Any] | None:
-    dispatch_context = run.get("dispatch_context")
-    if not isinstance(dispatch_context, dict):
+    dispatch_context = dispatch_context_from_run(run)
+    if dispatch_context is None:
         return None
-    for key in ("execution_plan", "executionPlan"):
-        candidate = dispatch_context.get(key)
-        if isinstance(candidate, dict):
-            steps = candidate.get("steps")
-            if isinstance(steps, list) and len(steps) > 1:
-                return candidate
-    route_decision = dispatch_context.get("route_decision") or dispatch_context.get("routeDecision")
-    if isinstance(route_decision, dict):
-        candidate = route_decision.get("execution_plan") or route_decision.get("executionPlan")
+    candidate = execution_plan_from_payload(dispatch_context)
+    if isinstance(candidate, dict):
+        steps = candidate.get("steps")
+        if isinstance(steps, list) and len(steps) > 1:
+            return candidate
+    route_decision = route_decision_from_payload(dispatch_context)
+    if route_decision is not None:
+        candidate = execution_plan_from_payload(route_decision)
         if isinstance(candidate, dict):
             steps = candidate.get("steps")
             if isinstance(steps, list) and len(steps) > 1:
@@ -298,6 +314,7 @@ def _normalize_interaction_mode(value: Any) -> str | None:
     normalized = str(value or "").strip().lower()
     if not normalized:
         return None
+    normalized = _canonical_routing_strategy(normalized) or normalized
     if normalized in {"chat", "conversation", "dialog", "dialogue"}:
         return "chat"
     if normalized in {
@@ -305,12 +322,19 @@ def _normalize_interaction_mode(value: Any) -> str | None:
         "workflow",
         "workflow_or_direct",
         "workflow_or_direct_agent",
-        "workflow_or_direct_agent_fallback",
+        CANONICAL_ROUTING_STRATEGY_WORKFLOW_OR_AGENT_DISPATCH_FALLBACK,
         "direct_agent",
         "direct",
     }:
         return "task"
     return None
+
+
+def _canonical_routing_strategy(value: Any) -> str | None:
+    normalized = str(value or "").strip().lower()
+    if not normalized:
+        return None
+    return LEGACY_ROUTING_STRATEGY_ALIASES.get(normalized, normalized)
 
 
 def _normalize_reception_mode(value: Any) -> str | None:
@@ -329,21 +353,19 @@ def _normalize_reception_mode(value: Any) -> str | None:
 
 def _resolve_interaction_mode(task: dict, run: dict) -> str | None:
     payload_candidates: list[dict[str, Any]] = []
-    dispatch_context = run.get("dispatch_context")
-    if isinstance(dispatch_context, dict):
+    dispatch_context = dispatch_context_from_run(run)
+    if dispatch_context is not None:
         payload_candidates.append(dispatch_context)
-        route_decision = dispatch_context.get("route_decision") or dispatch_context.get("routeDecision")
-        if isinstance(route_decision, dict):
+        route_decision = route_decision_from_payload(dispatch_context)
+        if route_decision is not None:
             payload_candidates.append(route_decision)
 
-    task_route_decision = task.get("route_decision") or task.get("routeDecision")
-    if isinstance(task_route_decision, dict):
+    task_route_decision = route_decision_from_task(task)
+    if task_route_decision is not None:
         payload_candidates.append(task_route_decision)
 
     for payload in payload_candidates:
-        mode = _normalize_interaction_mode(
-            payload.get("interaction_mode") or payload.get("interactionMode")
-        )
+        mode = _normalize_interaction_mode(alias_text(payload, "interaction_mode", "interactionMode"))
         if mode:
             return mode
     return None
@@ -351,21 +373,19 @@ def _resolve_interaction_mode(task: dict, run: dict) -> str | None:
 
 def _resolve_reception_mode(task: dict, run: dict) -> str | None:
     payload_candidates: list[dict[str, Any]] = []
-    dispatch_context = run.get("dispatch_context")
-    if isinstance(dispatch_context, dict):
+    dispatch_context = dispatch_context_from_run(run)
+    if dispatch_context is not None:
         payload_candidates.append(dispatch_context)
-        route_decision = dispatch_context.get("route_decision") or dispatch_context.get("routeDecision")
-        if isinstance(route_decision, dict):
+        route_decision = route_decision_from_payload(dispatch_context)
+        if route_decision is not None:
             payload_candidates.append(route_decision)
 
-    task_route_decision = task.get("route_decision") or task.get("routeDecision")
-    if isinstance(task_route_decision, dict):
+    task_route_decision = route_decision_from_task(task)
+    if task_route_decision is not None:
         payload_candidates.append(task_route_decision)
 
     for payload in payload_candidates:
-        mode = _normalize_reception_mode(
-            payload.get("reception_mode") or payload.get("receptionMode")
-        )
+        mode = _normalize_reception_mode(alias_text(payload, "reception_mode", "receptionMode"))
         if mode:
             return mode
     return None
@@ -373,15 +393,49 @@ def _resolve_reception_mode(task: dict, run: dict) -> str | None:
 
 def _resolve_route_decision(task: dict, run: dict) -> dict[str, Any] | None:
     payload_candidates: list[dict[str, Any]] = []
-    dispatch_context = run.get("dispatch_context")
-    if isinstance(dispatch_context, dict):
-        route_decision = dispatch_context.get("route_decision") or dispatch_context.get("routeDecision")
-        if isinstance(route_decision, dict):
+    dispatch_context = dispatch_context_from_run(run)
+    if dispatch_context is not None:
+        route_decision = route_decision_from_payload(dispatch_context)
+        if route_decision is not None:
             payload_candidates.append(route_decision)
-    task_route_decision = task.get("route_decision") or task.get("routeDecision")
-    if isinstance(task_route_decision, dict):
+    task_route_decision = route_decision_from_task(task)
+    if task_route_decision is not None:
         payload_candidates.append(task_route_decision)
     return payload_candidates[0] if payload_candidates else None
+
+
+def _resolve_manager_packet(task: dict, run: dict) -> dict[str, Any] | None:
+    payload_candidates: list[dict[str, Any]] = []
+    dispatch_context = run.get("dispatch_context")
+    if isinstance(dispatch_context, dict):
+        manager_packet = dispatch_context.get("manager_packet")
+        if isinstance(manager_packet, dict):
+            payload_candidates.append(manager_packet)
+    task_manager_packet = task.get("manager_packet")
+    if isinstance(task_manager_packet, dict):
+        payload_candidates.append(task_manager_packet)
+    return payload_candidates[0] if payload_candidates else None
+
+
+def _resolve_brain_dispatch_summary(task: dict, run: dict) -> dict[str, Any] | None:
+    payload_candidates: list[dict[str, Any]] = []
+    dispatch_context = run.get("dispatch_context")
+    if isinstance(dispatch_context, dict):
+        brain_dispatch_summary = dispatch_context.get("brain_dispatch_summary")
+        if isinstance(brain_dispatch_summary, dict):
+            payload_candidates.append(brain_dispatch_summary)
+    task_dispatch_summary = task.get("brain_dispatch_summary")
+    if isinstance(task_dispatch_summary, dict):
+        payload_candidates.append(task_dispatch_summary)
+    return payload_candidates[0] if payload_candidates else None
+
+
+def _resolve_manager_field(task: dict, run: dict, key: str) -> str | None:
+    manager_packet = _resolve_manager_packet(task, run)
+    if not isinstance(manager_packet, dict):
+        return None
+    value = str(manager_packet.get(key) or "").strip()
+    return value or None
 
 
 def _normalize_workflow_mode(value: Any) -> str | None:
@@ -430,6 +484,7 @@ def _free_workflow_payload(task: dict, run: dict) -> dict[str, Any]:
         "preferred_language": _output_language(task),
         "metadata": store.clone(task.get("metadata") or {}),
         "route_decision": store.clone(_resolve_route_decision(task, run) or {}),
+        "manager_packet": store.clone(_resolve_manager_packet(task, run) or {}),
         "requires_permission": _resolve_requires_permission(task, run),
         "required_capabilities": _resolve_required_capabilities(task, run),
         "file_path": task.get("file_path") or task.get("filePath"),
@@ -745,6 +800,7 @@ def _provider_prompt(
     language: str,
     request_text: str,
     reception_mode: str | None,
+    manager_packet: dict[str, Any] | None,
     knowledge_hits: list[dict],
     context_notes: list[str],
     memory_notes: list[str],
@@ -756,6 +812,22 @@ def _provider_prompt(
         f"- {_knowledge_label(hit)}: {hit['excerpt']}"
         for hit in knowledge_hits[:5]
     ] or ["- none"]
+    manager_lines = []
+    if isinstance(manager_packet, dict) and manager_packet:
+        manager_lines = [
+            f"- user_goal: {manager_packet.get('user_goal') or '-'}",
+            f"- response_contract: {manager_packet.get('response_contract') or '-'}",
+            f"- delivery_mode: {manager_packet.get('delivery_mode') or '-'}",
+            f"- decomposition_hint: {manager_packet.get('decomposition_hint') or '-'}",
+            f"- manager_action: {manager_packet.get('manager_action') or '-'}",
+            f"- next_owner: {manager_packet.get('next_owner') or '-'}",
+            f"- handoff_summary: {manager_packet.get('handoff_summary') or '-'}",
+        ]
+        clarify_question = str(manager_packet.get("clarify_question") or "").strip()
+        if clarify_question:
+            manager_lines.append(f"- clarify_question: {clarify_question}")
+    else:
+        manager_lines = ["- none"]
 
     if mode == "chat":
         if language == "en":
@@ -773,6 +845,8 @@ def _provider_prompt(
                     *context_lines,
                     "memory_notes:",
                     *memory_lines,
+                    "manager_packet:",
+                    *manager_lines,
                     "optional_grounding_sources:",
                     *grounding_lines[:3],
                     "requirements:",
@@ -804,6 +878,8 @@ def _provider_prompt(
                 *context_lines,
                 "memory_notes:",
                 *memory_lines,
+                "manager_packet:",
+                *manager_lines,
                 "optional_grounding_sources:",
                 *grounding_lines[:3],
                 "requirements:",
@@ -837,6 +913,8 @@ def _provider_prompt(
                 *context_lines,
                 "memory_notes:",
                 *memory_lines,
+                "manager_packet:",
+                *manager_lines,
                 "grounding_sources:",
                 *grounding_lines,
                 "requirements:",
@@ -865,6 +943,8 @@ def _provider_prompt(
             *context_lines,
             "memory_notes:",
             *memory_lines,
+            "manager_packet:",
+            *manager_lines,
             "grounding_sources:",
             *grounding_lines,
             "requirements:",
@@ -1176,9 +1256,12 @@ def _resolve_execution_mode(
     profile: dict[str, Any] | None = None,
 ) -> str:
     runtime_task = task if isinstance(task, dict) else {}
+    delivery_mode = _resolve_manager_field(runtime_task, run, "delivery_mode")
     agent_type = str((execution_agent or {}).get("type") or "").strip().lower()
     intent = str(run.get("intent") or "").strip().lower()
     interaction_mode = _resolve_interaction_mode(runtime_task, run)
+    if delivery_mode == "conversational":
+        return "chat"
     if interaction_mode == "chat":
         return "chat"
     request_text = _primary_request_text(runtime_task) if runtime_task else ""
@@ -1205,6 +1288,7 @@ def _execution_trace_entries(
     language: str,
     mode: str,
     request_text: str,
+    manager_packet: dict[str, Any] | None,
     knowledge_hits: list[dict],
     context_notes: list[str],
     memory_notes: list[str],
@@ -1222,6 +1306,11 @@ def _execution_trace_entries(
     profile_tools = [str(item).strip() for item in profile.get("tools") or [] if str(item).strip()]
     profile_status = str(profile.get("status") or "missing")
     supports_intent = profile.get("supports_intent")
+    manager_action = str((manager_packet or {}).get("manager_action") or "").strip()
+    next_owner = str((manager_packet or {}).get("next_owner") or "").strip()
+    delivery_mode = str((manager_packet or {}).get("delivery_mode") or "").strip()
+    decomposition_hint = str((manager_packet or {}).get("decomposition_hint") or "").strip()
+    workflow_admission = str((manager_packet or {}).get("workflow_admission") or "").strip()
 
     if language == "en":
         context_detail = (
@@ -1267,6 +1356,23 @@ def _execution_trace_entries(
                 "metadata": {
                     "context_notes": len(context_notes),
                     "memory_notes": len(memory_notes),
+                },
+            },
+            {
+                "stage": "manager_directive",
+                "title": "Manager directive",
+                "status": "completed",
+                "detail": (
+                    "Applied brain manager decision: "
+                    f"action={manager_action or '-'}; next_owner={next_owner or '-'}; "
+                    f"delivery_mode={delivery_mode or '-'}; decomposition_hint={decomposition_hint or '-'}."
+                ),
+                "metadata": {
+                    "manager_action": manager_action or None,
+                    "next_owner": next_owner or None,
+                    "delivery_mode": delivery_mode or None,
+                    "decomposition_hint": decomposition_hint or None,
+                    "workflow_admission": workflow_admission or None,
                 },
             },
             {
@@ -1343,6 +1449,23 @@ def _execution_trace_entries(
             },
         },
         {
+            "stage": "manager_directive",
+            "title": "项目经理指令",
+            "status": "completed",
+            "detail": (
+                f"已应用项目经理决策：action={manager_action or '-'}；"
+                f"next_owner={next_owner or '-'}；delivery_mode={delivery_mode or '-'}；"
+                f"decomposition_hint={decomposition_hint or '-'}。"
+            ),
+            "metadata": {
+                "manager_action": manager_action or None,
+                "next_owner": next_owner or None,
+                "delivery_mode": delivery_mode or None,
+                "decomposition_hint": decomposition_hint or None,
+                "workflow_admission": workflow_admission or None,
+            },
+        },
+        {
             "stage": "result_rendering",
             "title": "结果渲染",
             "status": "completed",
@@ -1382,6 +1505,7 @@ class AgentExecutionService:
         language: str,
         request_text: str,
         reception_mode: str | None,
+        manager_packet: dict[str, Any] | None,
         knowledge_hits: list[dict],
         context_notes: list[str],
         memory_notes: list[str],
@@ -1398,6 +1522,7 @@ class AgentExecutionService:
             language=language,
             request_text=request_text,
             reception_mode=reception_mode,
+            manager_packet=manager_packet,
             knowledge_hits=knowledge_hits,
             context_notes=context_notes,
             memory_notes=memory_notes,
@@ -1483,10 +1608,283 @@ class AgentExecutionService:
             language=_output_language(task),
             request_text=_primary_request_text(task),
             reception_mode=_resolve_reception_mode(task, run),
+            manager_packet=_resolve_manager_packet(task, run),
             knowledge_hits=knowledge_hits,
             context_notes=context_notes,
             memory_notes=memory_notes,
         )
+
+    def _dispatch_contract(
+        self,
+        *,
+        task: dict,
+        run: dict,
+        execution_agent: dict | None,
+        result: dict[str, Any],
+        execution_plan: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        route_decision = _resolve_route_decision(task, run) or {}
+        manager_packet = _resolve_manager_packet(task, run) or {}
+        summary = _resolve_brain_dispatch_summary(task, run) or {}
+        resolved_execution_plan = execution_plan or _planned_execution(run) or (
+            route_decision.get("execution_plan") or route_decision.get("executionPlan") or {}
+        )
+        if not isinstance(resolved_execution_plan, dict):
+            resolved_execution_plan = {}
+        fallback_policy = route_decision.get("fallback_policy") or route_decision.get("fallbackPolicy") or {}
+        if not isinstance(fallback_policy, dict):
+            fallback_policy = {}
+        route_rationale = route_decision.get("route_rationale") or route_decision.get("routeRationale") or {}
+        if not isinstance(route_rationale, dict):
+            route_rationale = {}
+        execution_agent_name = (
+            str(summary.get("execution_agent") or summary.get("executionAgent") or "").strip()
+            or str((execution_agent or {}).get("name") or "").strip()
+            or str(route_decision.get("execution_agent") or route_decision.get("executionAgent") or "").strip()
+            or None
+        )
+        routing_strategy = _canonical_routing_strategy(
+            summary.get("routing_strategy")
+            or summary.get("routingStrategy")
+            or route_decision.get("routing_strategy")
+            or route_decision.get("routingStrategy")
+        )
+        return {
+            "contract_version": "brain-core-v1",
+            "workflow_mode": _resolve_workflow_mode(task, run),
+            "interaction_mode": _resolve_interaction_mode(task, run),
+            "reception_mode": _resolve_reception_mode(task, run),
+            "routing_strategy": routing_strategy,
+            "execution_topology": str(
+                summary.get("execution_topology")
+                or summary.get("executionTopology")
+                or resolved_execution_plan.get("plan_type")
+                or resolved_execution_plan.get("coordination_mode")
+                or ""
+            ).strip()
+            or None,
+            "execution_agent": execution_agent_name,
+            "delivery_mode": str(
+                manager_packet.get("delivery_mode")
+                or summary.get("delivery_mode")
+                or summary.get("deliveryMode")
+                or ""
+            ).strip()
+            or None,
+            "response_contract": str(
+                manager_packet.get("response_contract")
+                or summary.get("response_contract")
+                or summary.get("responseContract")
+                or ""
+            ).strip()
+            or None,
+            "session_state": str(
+                manager_packet.get("session_state")
+                or summary.get("session_state")
+                or summary.get("sessionState")
+                or ""
+            ).strip()
+            or None,
+            "state_label": str(
+                manager_packet.get("state_label")
+                or summary.get("state_label")
+                or summary.get("stateLabel")
+                or ""
+            ).strip()
+            or None,
+            "execution_scope": str(
+                route_decision.get("execution_scope")
+                or route_decision.get("executionScope")
+                or summary.get("execution_scope")
+                or summary.get("executionScope")
+                or ""
+            ).strip()
+            or None,
+            "fallback_mode": str(
+                summary.get("fallback_mode")
+                or summary.get("fallbackMode")
+                or fallback_policy.get("mode")
+                or ""
+            ).strip()
+            or None,
+            "route_reason_summary": str(
+                summary.get("route_reason_summary")
+                or summary.get("routeReasonSummary")
+                or route_rationale.get("route_reason_summary")
+                or ""
+            ).strip()
+            or None,
+            "planned_step_count": int(
+                resolved_execution_plan.get("step_count")
+                or len(resolved_execution_plan.get("steps") or [])
+                or 0
+            ),
+            "result_kind": str(result.get("kind") or "").strip() or None,
+        }
+
+    def _fallback_contract(
+        self,
+        *,
+        task: dict,
+        run: dict,
+        stage: str,
+        activated: bool,
+        resolution: str,
+        detail: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        route_decision = _resolve_route_decision(task, run) or {}
+        policy = route_decision.get("fallback_policy") or route_decision.get("fallbackPolicy") or {}
+        if not isinstance(policy, dict):
+            policy = {}
+        return {
+            "mode": str(policy.get("mode") or "").strip() or None,
+            "target": str(policy.get("target") or "").strip() or None,
+            "on_failure": str(policy.get("on_failure") or policy.get("onFailure") or "").strip() or None,
+            "summary": str(policy.get("summary") or "").strip() or None,
+            "stage": stage,
+            "activated": activated,
+            "resolution": resolution,
+            "detail": str(detail or "").strip() or None,
+            "metadata": store.clone(metadata or {}),
+        }
+
+    def _aggregation_contract(
+        self,
+        *,
+        execution_plan: dict[str, Any],
+        agent_results: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        completed_agents = sum(1 for item in agent_results if item.get("status") == "completed")
+        failed_agents = sum(1 for item in agent_results if item.get("status") == "failed")
+        cancelled_agents = sum(1 for item in agent_results if item.get("status") == "cancelled")
+        return {
+            "mode": str(execution_plan.get("coordination_mode") or "serial").strip().lower() or "serial",
+            "plan_type": str(execution_plan.get("plan_type") or "multi_agent").strip() or "multi_agent",
+            "planner": str(execution_plan.get("planner") or "").strip() or None,
+            "aggregator": str(execution_plan.get("aggregator") or "").strip() or None,
+            "step_count": int(execution_plan.get("step_count") or len(execution_plan.get("steps") or []) or 0),
+            "branch_count": len(agent_results),
+            "completed_agents": completed_agents,
+            "successful_agents": completed_agents,
+            "failed_agents": failed_agents,
+            "cancelled_agents": cancelled_agents,
+            "fan_in": store.clone(
+                execution_plan.get("fan_in") or execution_plan.get("fanIn") or {}
+            ),
+            "winner_strategy": str(
+                execution_plan.get("winner_strategy") or execution_plan.get("winnerStrategy") or ""
+            ).strip()
+            or None,
+            "quorum": store.clone(execution_plan.get("quorum") or {}),
+            "merge_strategy": str(
+                execution_plan.get("merge_strategy") or execution_plan.get("mergeStrategy") or ""
+            ).strip()
+            or None,
+            "cancel_policy": store.clone(
+                execution_plan.get("cancel_policy") or execution_plan.get("cancelPolicy") or {}
+            ),
+            "branch_results": [
+                {
+                    "step_id": str((item.get("step") or {}).get("id") or "").strip() or None,
+                    "branch_id": str((item.get("step") or {}).get("branch_id") or "").strip() or None,
+                    "intent": str((item.get("step") or {}).get("intent") or "").strip() or None,
+                    "agent": str(
+                        (item.get("step") or {}).get("execution_agent")
+                        or (item.get("step") or {}).get("agent")
+                        or ""
+                    ).strip()
+                    or None,
+                    "status": str(item.get("status") or "").strip() or None,
+                    "score": int(item.get("score") or 0),
+                }
+                for item in agent_results
+            ],
+        }
+
+    def _result_is_acceptable(self, result: dict[str, Any] | None) -> bool:
+        if not isinstance(result, dict):
+            return False
+        if str(result.get("kind") or "").strip():
+            return True
+        for key in ("summary", "content", "text", "title"):
+            if str(result.get(key) or "").strip():
+                return True
+        return False
+
+    def _result_quality_score(self, result: dict[str, Any] | None) -> int:
+        if not isinstance(result, dict):
+            return 0
+        score = 0
+        if str(result.get("summary") or "").strip():
+            score += 3
+        if str(result.get("content") or result.get("text") or "").strip():
+            score += 3
+        score += min(len(result.get("bullets") or []), 4)
+        score += min(len(result.get("references") or []), 4)
+        return score
+
+    def _resolve_quorum_min_success(self, execution_plan: dict[str, Any], total_steps: int) -> int:
+        quorum = execution_plan.get("quorum") or {}
+        if isinstance(quorum, dict):
+            try:
+                resolved = int(quorum.get("min_success_count") or quorum.get("minSuccessCount") or 0)
+            except (TypeError, ValueError):
+                resolved = 0
+            if resolved > 0:
+                return resolved
+        return max(1, total_steps)
+
+    def _select_multi_agent_result(
+        self,
+        *,
+        execution_plan: dict[str, Any],
+        agent_results: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        coordination_mode = str(execution_plan.get("coordination_mode") or "serial").strip().lower()
+        winner_strategy = str(
+            execution_plan.get("winner_strategy") or execution_plan.get("winnerStrategy") or "first_acceptable"
+        ).strip().lower() or "first_acceptable"
+        successful_results = [item for item in agent_results if item.get("status") == "completed"]
+        candidate_pool = successful_results or [
+            item for item in agent_results if isinstance(item.get("result"), dict)
+        ]
+        if not candidate_pool:
+            return {}
+        if coordination_mode == "serial":
+            return candidate_pool[-1]
+        if winner_strategy == "highest_score":
+            return max(candidate_pool, key=lambda item: int(item.get("score") or 0))
+        return candidate_pool[0]
+
+    def _attach_execution_contracts(
+        self,
+        *,
+        task: dict,
+        run: dict,
+        execution_agent: dict | None,
+        result: dict[str, Any],
+        execution_plan: dict[str, Any] | None = None,
+        fallback_contract: dict[str, Any] | None = None,
+        aggregation_contract: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        wrapped = store.clone(result)
+        wrapped["dispatch_contract"] = self._dispatch_contract(
+            task=task,
+            run=run,
+            execution_agent=execution_agent,
+            result=wrapped,
+            execution_plan=execution_plan,
+        )
+        if fallback_contract is not None:
+            wrapped["fallback_contract"] = store.clone(fallback_contract)
+        elif isinstance(wrapped.get("fallback_contract"), dict):
+            wrapped["fallback_contract"] = store.clone(wrapped["fallback_contract"])
+        if aggregation_contract is not None:
+            wrapped["aggregation_contract"] = store.clone(aggregation_contract)
+        elif isinstance(wrapped.get("aggregation_contract"), dict):
+            wrapped["aggregation_contract"] = store.clone(wrapped["aggregation_contract"])
+        return wrapped
 
     def build_greeting_result(
         self,
@@ -1519,6 +1917,7 @@ class AgentExecutionService:
         language = _output_language(task)
         request_text = _primary_request_text(task)
         reception_mode = _resolve_reception_mode(task, run)
+        manager_packet = _resolve_manager_packet(task, run) or {}
         context_notes = _context_notes(task)
         memory_notes = _memory_notes(task)
         knowledge_hits = _knowledge_hits(task, "help")
@@ -1536,17 +1935,23 @@ class AgentExecutionService:
             return provider_result
 
         references: list[dict[str, Any]] = []
-        text = _chat_fallback_text(
-            request_text=request_text,
-            language=language,
-            context_notes=context_notes,
-            reception_mode=reception_mode,
-        )
+        if str(manager_packet.get("response_contract") or "") == "clarify_first" and str(
+            manager_packet.get("clarify_question") or ""
+        ).strip():
+            text = str(manager_packet.get("clarify_question") or "").strip()
+        else:
+            text = _chat_fallback_text(
+                request_text=request_text,
+                language=language,
+                context_notes=context_notes,
+                reception_mode=reception_mode,
+            )
 
         execution_trace = _execution_trace_entries(
             language=language,
             mode="chat",
             request_text=request_text,
+            manager_packet=manager_packet,
             knowledge_hits=knowledge_hits,
             context_notes=context_notes,
             memory_notes=memory_notes,
@@ -1617,22 +2022,39 @@ class AgentExecutionService:
         ]
         for index, agent_result in enumerate(agent_results, start=1):
             step = agent_result["step"]
-            result = agent_result["result"]
+            result = agent_result.get("result") or {}
+            branch_status = str(agent_result.get("status") or "completed").strip() or "completed"
             agent_name = str(step.get("execution_agent") or step.get("agent") or f"Agent {index}").strip()
+            if branch_status == "cancelled":
+                detail = (
+                    f"{agent_name} 分支已提前取消，等待主脑收口。"
+                    if language != "en"
+                    else f"{agent_name} branch was cancelled early after brain convergence."
+                )
+            elif branch_status == "failed":
+                detail = (
+                    f"{agent_name} 未产出合格结果，主脑已记录失败分支。"
+                    if language != "en"
+                    else f"{agent_name} did not produce an acceptable result; the brain recorded a failed branch."
+                )
+            else:
+                detail = (
+                    f"{agent_name} 已完成 {step.get('intent')} 子任务：{result.get('summary')}"
+                    if language != "en"
+                    else f"{agent_name} completed the {step.get('intent')} subtask: {result.get('summary')}"
+                )
             entries.append(
                 {
                     "stage": f"planned_agent_{index}",
                     "title": f"{agent_name} 执行" if language != "en" else f"{agent_name} execution",
-                    "status": "completed",
-                    "detail": (
-                        f"{agent_name} 已完成 {step.get('intent')} 子任务：{result.get('summary')}"
-                        if language != "en"
-                        else f"{agent_name} completed the {step.get('intent')} subtask: {result.get('summary')}"
-                    ),
+                    "status": branch_status,
+                    "detail": detail,
                     "metadata": {
                         "intent": str(step.get("intent") or ""),
                         "agent": agent_name,
                         "result_kind": str(result.get("kind") or ""),
+                        "branch_id": str(step.get("branch_id") or "").strip() or None,
+                        "score": int(agent_result.get("score") or 0),
                     },
                 }
             )
@@ -1649,6 +2071,9 @@ class AgentExecutionService:
                 "metadata": {
                     "coordination_mode": coordination_mode,
                     "agent_count": len(agent_results),
+                    "successful_agents": sum(
+                        1 for item in agent_results if item.get("status") == "completed"
+                    ),
                 },
             }
         )
@@ -1678,14 +2103,24 @@ class AgentExecutionService:
         ]
         for agent_result in agent_results:
             step = agent_result["step"]
-            result = agent_result["result"]
+            result = agent_result.get("result") or {}
             agent_name = str(step.get("execution_agent") or step.get("agent") or "Agent").strip()
+            branch_status = str(agent_result.get("status") or "completed").strip() or "completed"
             steps.append(
                 {
                     "title": f"{agent_name} 协同执行",
-                    "status": "completed",
+                    "status": branch_status,
                     "agent": agent_name,
-                    "message": str(result.get("summary") or "").strip() or f"{agent_name} 已完成子任务",
+                    "message": (
+                        str(result.get("summary") or "").strip()
+                        or (
+                            f"{agent_name} 分支已取消"
+                            if branch_status == "cancelled"
+                            else f"{agent_name} 子任务未产出合格结果"
+                            if branch_status == "failed"
+                            else f"{agent_name} 已完成子任务"
+                        )
+                    ),
                     "tokens": 24,
                 }
             )
@@ -1711,8 +2146,19 @@ class AgentExecutionService:
         agent_results: list[dict[str, Any]],
     ) -> dict[str, Any]:
         language = _output_language(task)
-        final_agent_result = agent_results[-1]
-        final_result = store.clone(final_agent_result["result"])
+        coordination_mode = str(execution_plan.get("coordination_mode") or "serial").strip().lower()
+        selected_agent_result = self._select_multi_agent_result(
+            execution_plan=execution_plan,
+            agent_results=agent_results,
+        )
+        final_result = store.clone(selected_agent_result.get("result") or {})
+        successful_results = [item for item in agent_results if item.get("status") == "completed"]
+        executed_results = [
+            item for item in agent_results if isinstance(item.get("result"), dict)
+        ]
+        merge_strategy = str(
+            execution_plan.get("merge_strategy") or execution_plan.get("mergeStrategy") or "append_bullets_and_references"
+        ).strip().lower() or "append_bullets_and_references"
         orchestration_trace = self._orchestration_trace_entries(
             language=language,
             execution_plan=execution_plan,
@@ -1723,8 +2169,16 @@ class AgentExecutionService:
             execution_plan=execution_plan,
             agent_results=agent_results,
         )
-        references = _combined_references([item["result"] for item in agent_results])
+        references = _combined_references([item["result"] for item in executed_results])
         bullets = [str(item).strip() for item in final_result.get("bullets") or [] if str(item).strip()]
+        if merge_strategy == "append_bullets_and_references":
+            for item in successful_results:
+                if item is selected_agent_result:
+                    continue
+                for bullet in item.get("result", {}).get("bullets") or []:
+                    normalized_bullet = str(bullet).strip()
+                    if normalized_bullet and normalized_bullet not in bullets:
+                        bullets.append(normalized_bullet)
         if str(final_result.get("kind") or "").strip().lower() != "chat_reply":
             synthesis_note = (
                 "已综合多轮分析结果，生成统一回复。"
@@ -1733,6 +2187,19 @@ class AgentExecutionService:
             )
             if synthesis_note not in bullets:
                 bullets.insert(0, synthesis_note)
+        if coordination_mode == "race" and selected_agent_result:
+            winner_agent = str(
+                (selected_agent_result.get("step") or {}).get("execution_agent")
+                or (selected_agent_result.get("step") or {}).get("agent")
+                or "Agent"
+            ).strip()
+            winner_note = (
+                f"本轮采用竞速收敛，winner={winner_agent}。"
+                if language != "en"
+                else f"Race convergence selected winner={winner_agent}."
+            )
+            if winner_note not in bullets:
+                bullets.insert(0, winner_note)
 
         final_result["content"] = str(final_result.get("content") or "").rstrip()
         final_result["bullets"] = bullets
@@ -1746,7 +2213,44 @@ class AgentExecutionService:
             ],
         ]
         final_result["orchestration_steps"] = orchestration_steps
-        return final_result
+        final_result["aggregation_notes"] = {
+            "coordination_mode": coordination_mode,
+            "selected_branch_id": str(
+                (selected_agent_result.get("step") or {}).get("branch_id") or ""
+            ).strip()
+            or None,
+            "selected_agent": str(
+                (selected_agent_result.get("step") or {}).get("execution_agent")
+                or (selected_agent_result.get("step") or {}).get("agent")
+                or ""
+            ).strip()
+            or None,
+            "successful_agents": len(successful_results),
+            "failed_agents": sum(1 for item in agent_results if item.get("status") == "failed"),
+        }
+        return self._attach_execution_contracts(
+            task=task,
+            run=run,
+            execution_agent=None,
+            result=final_result,
+            execution_plan=execution_plan,
+            fallback_contract=self._fallback_contract(
+                task=task,
+                run=run,
+                stage="multi_agent_orchestration",
+                activated=False,
+                resolution="planner_completed",
+                detail=str(execution_plan.get("summary") or "").strip() or None,
+                metadata={
+                    "coordination_mode": coordination_mode,
+                    "completed_agents": len(successful_results),
+                },
+            ),
+            aggregation_contract=self._aggregation_contract(
+                execution_plan=execution_plan,
+                agent_results=agent_results,
+            ),
+        )
 
     def _execute_multi_agent(
         self,
@@ -1758,28 +2262,132 @@ class AgentExecutionService:
     ) -> dict[str, Any]:
         coordination_mode = str(execution_plan.get("coordination_mode") or "serial").strip().lower()
         steps = execution_plan.get("steps") or []
+        cancel_policy = execution_plan.get("cancel_policy") or execution_plan.get("cancelPolicy") or {}
+        if not isinstance(cancel_policy, dict):
+            cancel_policy = {}
+        quorum_min_success = self._resolve_quorum_min_success(execution_plan, len(steps))
+        planned_steps = [(index, step) for index, step in enumerate(steps) if isinstance(step, dict)]
         agent_results: list[dict[str, Any]] = []
-        working_task = dict(task)
-        for index, step in enumerate(steps):
-            if not isinstance(step, dict):
-                continue
-            planned_agent = self._resolve_planned_agent(step, fallback_agent=execution_agent)
-            step_result = self._build_planned_step_result(
-                task=working_task,
-                run=run,
-                step=step,
-                execution_agent=planned_agent,
-            )
-            agent_results.append({"step": step, "result": step_result})
-            if coordination_mode == "serial" and index < len(steps) - 1:
-                working_task = _task_with_added_context(
-                    working_task,
-                    f"补充上下文: 上一子任务摘要：{step_result.get('summary')}",
-                    *[
-                        f"补充上下文: {bullet}"
-                        for bullet in (step_result.get("bullets") or [])[:2]
-                    ],
+
+        if coordination_mode == "serial":
+            working_task = dict(task)
+            success_count = 0
+            stop_dispatch = False
+            for index, step in planned_steps:
+                if stop_dispatch:
+                    agent_results.append(
+                        {
+                            "step": step,
+                            "result": None,
+                            "status": "cancelled",
+                            "score": 0,
+                        }
+                    )
+                    continue
+                planned_agent = self._resolve_planned_agent(step, fallback_agent=execution_agent)
+                step_result = self._build_planned_step_result(
+                    task=working_task,
+                    run=run,
+                    step=step,
+                    execution_agent=planned_agent,
                 )
+                is_acceptable = self._result_is_acceptable(step_result)
+                branch_status = "completed" if is_acceptable else "failed"
+                agent_results.append(
+                    {
+                        "step": step,
+                        "result": step_result,
+                        "status": branch_status,
+                        "score": self._result_quality_score(step_result),
+                    }
+                )
+                if is_acceptable:
+                    success_count += 1
+                if index < len(planned_steps) - 1:
+                    working_task = _task_with_added_context(
+                        working_task,
+                        f"补充上下文: 上一子任务摘要：{step_result.get('summary')}",
+                        *[
+                            f"补充上下文: {bullet}"
+                            for bullet in (step_result.get("bullets") or [])[:2]
+                        ],
+                    )
+                if coordination_mode == "race" and is_acceptable:
+                    stop_dispatch = bool(cancel_policy.get("cancel_remaining_on_winner", True))
+                if coordination_mode == "quorum" and success_count >= quorum_min_success:
+                    stop_dispatch = bool(cancel_policy.get("cancel_remaining_on_quorum", True))
+        else:
+            result_by_index: dict[int, dict[str, Any]] = {}
+            ignored_indexes: set[int] = set()
+            success_count = 0
+            max_workers = max(1, min(len(planned_steps), 4))
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_map = {
+                    executor.submit(
+                        self._build_planned_step_result,
+                        task=dict(task),
+                        run=run,
+                        step=step,
+                        execution_agent=self._resolve_planned_agent(step, fallback_agent=execution_agent),
+                    ): (index, step)
+                    for index, step in planned_steps
+                }
+                for future in as_completed(future_map):
+                    index, step = future_map[future]
+                    if index in ignored_indexes:
+                        result_by_index[index] = {
+                            "step": step,
+                            "result": None,
+                            "status": "cancelled",
+                            "score": 0,
+                        }
+                        continue
+                    try:
+                        step_result = future.result()
+                    except Exception as exc:  # pragma: no cover - defensive path
+                        step_result = {
+                            "kind": None,
+                            "summary": str(exc),
+                            "content": str(exc),
+                            "bullets": [],
+                            "references": [],
+                        }
+                    is_acceptable = self._result_is_acceptable(step_result)
+                    branch_status = "completed" if is_acceptable else "failed"
+                    result_by_index[index] = {
+                        "step": step,
+                        "result": step_result,
+                        "status": branch_status,
+                        "score": self._result_quality_score(step_result),
+                    }
+                    if is_acceptable:
+                        success_count += 1
+                    should_cancel_remaining = False
+                    if coordination_mode == "race" and is_acceptable:
+                        should_cancel_remaining = bool(
+                            cancel_policy.get("cancel_remaining_on_winner", True)
+                        )
+                    elif coordination_mode == "quorum" and success_count >= quorum_min_success:
+                        should_cancel_remaining = bool(
+                            cancel_policy.get("cancel_remaining_on_quorum", True)
+                        )
+                    if should_cancel_remaining:
+                        for pending_future, pending_meta in future_map.items():
+                            pending_index, pending_step = pending_meta
+                            if pending_future is future or pending_index in result_by_index:
+                                continue
+                            ignored_indexes.add(pending_index)
+                            pending_future.cancel()
+                            result_by_index.setdefault(
+                                pending_index,
+                                {
+                                    "step": pending_step,
+                                    "result": None,
+                                    "status": "cancelled",
+                                    "score": 0,
+                                },
+                            )
+            agent_results = [result_by_index[index] for index, _step in planned_steps if index in result_by_index]
         if not agent_results:
             return self.build_task_result(task=task, run=run, execution_agent=execution_agent)
         return self._aggregate_planned_results(
@@ -1814,53 +2422,84 @@ class AgentExecutionService:
                 context=trace_context,
             )
         except Exception as exc:
-            return {
-                "kind": "help_note",
-                "title": "自由工作流执行失败",
-                "summary": "自由工作流技能执行失败",
-                "content": f"自由工作流已命中，但执行失败：{exc}",
-                "bullets": [
-                    "路由层已正确识别为自由工作流。",
-                    "当前失败已被统一收敛到 Free Workflow 异常语义。",
-                ],
-                "references": [],
-                "execution_trace": [
-                    {
-                        "stage": "free_workflow_runtime",
-                        "title": "自由工作流运行时",
-                        "status": "failed",
-                        "detail": str(exc),
-                        "metadata": {"required_capabilities": capabilities},
-                    }
-                ],
-            }
+            return self._attach_execution_contracts(
+                task=task,
+                run=run,
+                execution_agent=execution_agent,
+                result={
+                    "kind": "help_note",
+                    "title": "自由工作流执行失败",
+                    "summary": "自由工作流技能执行失败",
+                    "content": f"自由工作流已命中，但执行失败：{exc}",
+                    "bullets": [
+                        "路由层已正确识别为自由工作流。",
+                        "当前失败已被统一收敛到 Free Workflow 异常语义。",
+                    ],
+                    "references": [],
+                    "execution_trace": [
+                        {
+                            "stage": "free_workflow_runtime",
+                            "title": "自由工作流运行时",
+                            "status": "failed",
+                            "detail": str(exc),
+                            "metadata": {"required_capabilities": capabilities},
+                        }
+                    ],
+                },
+                fallback_contract=self._fallback_contract(
+                    task=task,
+                    run=run,
+                    stage="free_workflow_runtime",
+                    activated=True,
+                    resolution="terminal_failure",
+                    detail=str(exc),
+                    metadata={"required_capabilities": capabilities},
+                ),
+            )
 
         selected_skill = str(result.get("selected_skill") or "unknown_skill")
         if not bool(result.get("ok", False)):
             error_message = str((result.get("error") or {}).get("message") or "free_workflow_failed")
-            return {
-                "kind": "help_note",
-                "title": "自由工作流执行失败",
-                "summary": "自由工作流技能执行失败",
-                "content": f"自由工作流已命中，但技能执行失败：{error_message}",
-                "bullets": [
-                    f"selected_skill: {selected_skill}",
-                    "路由层已正确识别为自由工作流。",
-                ],
-                "references": [],
-                "execution_trace": [
-                    {
-                        "stage": "free_workflow_runtime",
-                        "title": "自由工作流运行时",
-                        "status": "failed",
-                        "detail": error_message,
-                        "metadata": {
-                            "required_capabilities": capabilities,
-                            "selected_skill": selected_skill,
-                        },
-                    }
-                ],
-            }
+            return self._attach_execution_contracts(
+                task=task,
+                run=run,
+                execution_agent=execution_agent,
+                result={
+                    "kind": "help_note",
+                    "title": "自由工作流执行失败",
+                    "summary": "自由工作流技能执行失败",
+                    "content": f"自由工作流已命中，但技能执行失败：{error_message}",
+                    "bullets": [
+                        f"selected_skill: {selected_skill}",
+                        "路由层已正确识别为自由工作流。",
+                    ],
+                    "references": [],
+                    "execution_trace": [
+                        {
+                            "stage": "free_workflow_runtime",
+                            "title": "自由工作流运行时",
+                            "status": "failed",
+                            "detail": error_message,
+                            "metadata": {
+                                "required_capabilities": capabilities,
+                                "selected_skill": selected_skill,
+                            },
+                        }
+                    ],
+                },
+                fallback_contract=self._fallback_contract(
+                    task=task,
+                    run=run,
+                    stage="free_workflow_runtime",
+                    activated=True,
+                    resolution="skill_failure",
+                    detail=error_message,
+                    metadata={
+                        "required_capabilities": capabilities,
+                        "selected_skill": selected_skill,
+                    },
+                ),
+            )
 
         execution_trace = [
             {
@@ -1900,7 +2539,29 @@ class AgentExecutionService:
                 *wrapped_result.get("bullets", []),
                 f"runtime mode: {migration_runtime.get('mode') or 'builtin_primary'}",
             ]
-        return wrapped_result
+        return self._attach_execution_contracts(
+            task=task,
+            run=run,
+            execution_agent=execution_agent,
+            result=wrapped_result,
+            fallback_contract=self._fallback_contract(
+                task=task,
+                run=run,
+                stage="free_workflow_runtime",
+                activated=str((migration_runtime or {}).get("selected_path") or "runtime") != "runtime",
+                resolution=(
+                    "runtime_completed"
+                    if str((migration_runtime or {}).get("selected_path") or "runtime") == "runtime"
+                    else "degraded_runtime_path"
+                ),
+                detail=str(result.get("result_summary") or "").strip() or None,
+                metadata={
+                    "selected_skill": selected_skill,
+                    "migration_runtime": store.clone(migration_runtime or {}),
+                    "required_capabilities": capabilities,
+                },
+            ),
+        )
 
     def _execute_professional_workflow(
         self,
@@ -1927,7 +2588,32 @@ class AgentExecutionService:
                 if isinstance(entry, dict)
             ],
         ]
-        return result
+        execution_result = result.get("structured_data", {}).get("execution_result", {})
+        if not isinstance(execution_result, dict):
+            execution_result = {}
+        return self._attach_execution_contracts(
+            task=task,
+            run=run,
+            execution_agent=execution_agent,
+            result=result,
+            fallback_contract=self._fallback_contract(
+                task=task,
+                run=run,
+                stage="professional_workflow_runtime",
+                activated=not bool(execution_result.get("ok", False)),
+                resolution=(
+                    "connector_execution"
+                    if bool(execution_result.get("ok", False))
+                    else "professional_runtime_failed"
+                ),
+                detail=str(execution_result.get("status") or result.get("summary") or "").strip() or None,
+                metadata={
+                    "required_capabilities": _resolve_required_capabilities(task, run),
+                    "requires_permission": _resolve_requires_permission(task, run),
+                    "selected_runtime_tool_id": execution_result.get("selected_runtime_tool_id"),
+                },
+            ),
+        )
 
     def execute_task(
         self,
@@ -1960,14 +2646,39 @@ class AgentExecutionService:
         profile = _safe_execution_profile(execution_agent, run)
         execution_mode = _resolve_execution_mode(task, execution_agent, run, profile)
         if execution_mode == "chat":
-            return self._execute_chat(task=task, run=run, execution_agent=execution_agent)
+            return self._attach_execution_contracts(
+                task=task,
+                run=run,
+                execution_agent=execution_agent,
+                result=self._execute_chat(task=task, run=run, execution_agent=execution_agent),
+            )
         if execution_mode == "search":
-            return self._execute_search(task=task, run=run, execution_agent=execution_agent)
+            return self._attach_execution_contracts(
+                task=task,
+                run=run,
+                execution_agent=execution_agent,
+                result=self._execute_search(task=task, run=run, execution_agent=execution_agent),
+            )
         if execution_mode == "write":
-            return self._execute_write(task=task, run=run, execution_agent=execution_agent)
+            return self._attach_execution_contracts(
+                task=task,
+                run=run,
+                execution_agent=execution_agent,
+                result=self._execute_write(task=task, run=run, execution_agent=execution_agent),
+            )
         if execution_mode == "help":
-            return self._execute_help(task=task, run=run, execution_agent=execution_agent)
-        return self._execute_default(task=task, run=run, execution_agent=execution_agent)
+            return self._attach_execution_contracts(
+                task=task,
+                run=run,
+                execution_agent=execution_agent,
+                result=self._execute_help(task=task, run=run, execution_agent=execution_agent),
+            )
+        return self._attach_execution_contracts(
+            task=task,
+            run=run,
+            execution_agent=execution_agent,
+            result=self._execute_default(task=task, run=run, execution_agent=execution_agent),
+        )
 
     def build_search_result(
         self,
@@ -1980,6 +2691,9 @@ class AgentExecutionService:
         resolved_profile = profile or _safe_execution_profile(execution_agent, run)
         language = _output_language(task)
         request_text = _primary_request_text(task)
+        manager_packet = _resolve_manager_packet(task, run) or {}
+        decomposition_hint = str(manager_packet.get("decomposition_hint") or "").strip()
+        delivery_mode = str(manager_packet.get("delivery_mode") or "").strip()
         context_notes = _context_notes(task)
         memory_notes = _memory_notes(task)
         knowledge_hits = _knowledge_hits(task, str(run.get("intent") or "search").lower())
@@ -2013,6 +2727,15 @@ class AgentExecutionService:
                 ]
             ),
         ]
+        if decomposition_hint:
+            bullets.insert(
+                1,
+                (
+                    f"Execution plan hint: {decomposition_hint}."
+                    if language == "en"
+                    else f"项目经理拆解提示：{decomposition_hint}。"
+                ),
+            )
         bullets.append(
             "If you need a deeper pass, follow the collaboration view logs and rerun with extra context."
             if language == "en"
@@ -2034,6 +2757,17 @@ class AgentExecutionService:
 
         content_lines = [
             f"Search target: {request_text}" if language == "en" else f"检索目标：{request_text}",
+            "",
+            (
+                f"Delivery mode: {delivery_mode or 'structured_result'}"
+                if language == "en"
+                else f"交付模式：{delivery_mode or 'structured_result'}"
+            ),
+            (
+                f"Decomposition hint: {decomposition_hint or 'direct_execute'}"
+                if language == "en"
+                else f"拆解提示：{decomposition_hint or 'direct_execute'}"
+            ),
             "",
             "Matched local project materials:" if language == "en" else "命中的本地项目资料：",
         ]
@@ -2067,6 +2801,7 @@ class AgentExecutionService:
             language=language,
             mode="search",
             request_text=request_text,
+            manager_packet=manager_packet,
             knowledge_hits=knowledge_hits,
             context_notes=context_notes,
             memory_notes=memory_notes,
@@ -2102,6 +2837,9 @@ class AgentExecutionService:
         resolved_profile = profile or _safe_execution_profile(execution_agent, run)
         language = _output_language(task)
         request_text = _primary_request_text(task)
+        manager_packet = _resolve_manager_packet(task, run) or {}
+        decomposition_hint = str(manager_packet.get("decomposition_hint") or "").strip()
+        delivery_mode = str(manager_packet.get("delivery_mode") or "").strip()
         context_notes = _context_notes(task)
         memory_notes = _memory_notes(task)
         knowledge_hits = _knowledge_hits(task, str(run.get("intent") or "write").lower())
@@ -2124,6 +2862,12 @@ class AgentExecutionService:
         )
         content_lines = [
             "Hello," if language == "en" else "您好，",
+            "",
+            (
+                f"[delivery_mode={delivery_mode or 'structured_result'}; decomposition_hint={decomposition_hint or 'direct_execute'}]"
+                if language == "en"
+                else f"[交付模式={delivery_mode or 'structured_result'}；拆解提示={decomposition_hint or 'direct_execute'}]"
+            ),
             "",
             (
                 f"For \"{request_text}\", we prepared a grounded draft based on the local project guide and architecture materials in this workspace."
@@ -2204,11 +2948,21 @@ class AgentExecutionService:
                 else "如果后续还有语气、篇幅、对象变化，可以继续通过 context patch 追加要求。"
             ),
         ]
+        if decomposition_hint:
+            bullets.insert(
+                1,
+                (
+                    f"Execution hint: {decomposition_hint}."
+                    if language == "en"
+                    else f"项目经理拆解提示：{decomposition_hint}。"
+                ),
+            )
         bullets.extend(_execution_profile_bullets(resolved_profile, language=language))
         execution_trace = _execution_trace_entries(
             language=language,
             mode="write",
             request_text=request_text,
+            manager_packet=manager_packet,
             knowledge_hits=knowledge_hits,
             context_notes=context_notes,
             memory_notes=memory_notes,
@@ -2244,6 +2998,9 @@ class AgentExecutionService:
         resolved_profile = profile or _safe_execution_profile(execution_agent, run)
         language = _output_language(task)
         request_text = _primary_request_text(task)
+        manager_packet = _resolve_manager_packet(task, run) or {}
+        decomposition_hint = str(manager_packet.get("decomposition_hint") or "").strip()
+        delivery_mode = str(manager_packet.get("delivery_mode") or "").strip()
         memory_notes = _memory_notes(task)
         knowledge_hits = _knowledge_hits(task, str(run.get("intent") or "help").lower())
         provider_result = self._try_provider_result(
@@ -2260,6 +3017,17 @@ class AgentExecutionService:
             return provider_result
         content_lines = [
             f"Topic: {request_text}" if language == "en" else f"问题主题：{request_text}",
+            "",
+            (
+                f"Delivery mode: {delivery_mode or 'structured_result'}"
+                if language == "en"
+                else f"交付模式：{delivery_mode or 'structured_result'}"
+            ),
+            (
+                f"Decomposition hint: {decomposition_hint or 'direct_execute'}"
+                if language == "en"
+                else f"拆解提示：{decomposition_hint or 'direct_execute'}"
+            ),
             "",
             "Primary references:" if language == "en" else "优先参考资料：",
             *[
@@ -2306,6 +3074,15 @@ class AgentExecutionService:
                 if language == "en"
                 else "这是一份偏说明型的帮助结果，适合继续转成 FAQ 或运营回复。"
             ),
+            (
+                f"Execution hint: {decomposition_hint}."
+                if language == "en"
+                else f"项目经理拆解提示：{decomposition_hint}。"
+            ) if decomposition_hint else (
+                "Execution hint: direct_execute."
+                if language == "en"
+                else "项目经理拆解提示：direct_execute。"
+            ),
             *[
                 (
                     f"Referenced {_knowledge_label(hit)}."
@@ -2325,6 +3102,7 @@ class AgentExecutionService:
             language=language,
             mode="help",
             request_text=request_text,
+            manager_packet=manager_packet,
             knowledge_hits=knowledge_hits,
             context_notes=[],
             memory_notes=memory_notes,

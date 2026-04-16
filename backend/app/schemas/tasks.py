@@ -4,6 +4,53 @@ from app.schemas.base import APIModel
 from app.schemas.messages import MessageRouteDecision
 
 
+class ManagerPacket(APIModel):
+    manager_agent: str | None = None
+    manager_role: str | None = None
+    user_goal: str | None = None
+    intent: str | None = None
+    interaction_mode: str | None = None
+    reception_mode: str | None = None
+    workflow_mode: str | None = None
+    workflow_admission: str | None = None
+    task_shape: str | None = None
+    decomposition_hint: str | None = None
+    delivery_mode: str | None = None
+    clarify_required: bool | None = None
+    clarify_question: str | None = None
+    manager_action: str | None = None
+    next_owner: str | None = None
+    response_contract: str | None = None
+    handoff_summary: str | None = None
+    routing_note: str | None = None
+    session_state: str | None = None
+    state_label: str | None = None
+
+
+class BrainDispatchSummary(APIModel):
+    intent: str | None = None
+    dispatch_type: str | None = None
+    workflow_mode: str | None = None
+    interaction_mode: str | None = None
+    reception_mode: str | None = None
+    workflow_name: str | None = None
+    execution_agent: str | None = None
+    manager_action: str | None = None
+    next_owner: str | None = None
+    delivery_mode: str | None = None
+    response_contract: str | None = None
+    clarify_required: bool | None = None
+    approval_required: bool | None = None
+    execution_scope: str | None = None
+    summary_line: str | None = None
+    routing_strategy: str | None = None
+    execution_topology: str | None = None
+    fallback_mode: str | None = None
+    route_reason_summary: str | None = None
+    session_state: str | None = None
+    state_label: str | None = None
+
+
 class TaskResultReference(APIModel):
     title: str
     detail: str | None = None
@@ -30,6 +77,9 @@ class TaskResult(APIModel):
 
 class Task(APIModel):
     id: str
+    tenant_id: str | None = None
+    project_id: str | None = None
+    environment: str | None = None
     title: str
     description: str
     status: str
@@ -60,6 +110,12 @@ class Task(APIModel):
     execution_scope: str | None = None
     schedule_plan: dict[str, Any] | None = None
     route_decision: MessageRouteDecision | None = None
+    manager_packet: ManagerPacket | None = None
+    brain_dispatch_summary: BrainDispatchSummary | None = None
+    brain_fact_snapshot: dict[str, Any] | None = None
+    memory_injection_summary: dict[str, Any] | None = None
+    context_patch_audit: list[dict[str, Any]] = []
+    state_machine: dict[str, Any] | None = None
     result: TaskResult | None = None
 
 
@@ -76,6 +132,7 @@ class TaskStep(APIModel):
     started_at: str
     finished_at: str | None = None
     message: str
+    metadata: dict[str, Any] | None = None
     tokens: int = 0
 
 

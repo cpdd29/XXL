@@ -7,14 +7,22 @@ from uuid import uuid4
 
 from app.config import get_settings
 from app.core.agent_protocol import (
+    DEFAULT_MAX_ATTEMPTS,
     apply_protocol_to_run,
     build_protocol_envelope,
     payload_from_message,
     protocol_from_dispatch_context,
     protocol_from_message,
 )
+from app.core.event_subjects import (
+    WORKFLOW_EXECUTION_CLAIMED_SUBJECT,
+    WORKFLOW_EXECUTION_COMPLETED_SUBJECT,
+    WORKFLOW_EXECUTION_FAILED_SUBJECT,
+    WORKFLOW_EXECUTION_STARTED_SUBJECT,
+)
 from app.core.nats_event_bus import nats_event_bus
 from app.services.persistence_service import persistence_service
+from app.services.scheduler_guard_service import scheduler_guard_service
 from app.services.store import store
 from app.services.workflow_dispatcher_service import (
     WORKFLOW_EXECUTION_QUEUE,
@@ -140,6 +148,11 @@ class WorkflowExecutionWorkerService:
             "skipped_claimed": 0,
             "skipped_terminal": 0,
         }
+        guard_summary = scheduler_guard_service.guard_workflow_execution_runtime(
+            now=_utc_now(),
+            persistence=self._persistence,
+        )
+        summary["repaired"] += int(guard_summary.get("repaired_missing_jobs") or 0)
 
         due_jobs = self._load_due_execution_jobs()
         if due_jobs is not None:
@@ -367,6 +380,7 @@ class WorkflowExecutionWorkerService:
         from app.services.workflow_scheduler_service import workflow_scheduler_service
 
         run = self._find_run(run_id)
+        protocol = self._resolve_protocol(job, run)
         if run is None and getattr(self._persistence, "enabled", False):
             self._delete_execution_job(run_id, claimed_at=job.get("claimed_at"))
             self._release_dispatch_claim(run_id, dispatcher_id=dispatcher_id)
@@ -392,29 +406,101 @@ class WorkflowExecutionWorkerService:
             )
             return "executed"
 
+        if str(job.get("claimed_at") or "").strip():
+            self._publish_execution_event(
+                run=run,
+                protocol=protocol,
+                message_name="workflow.execution.claimed",
+                dispatcher_id=dispatcher_id or str((run or {}).get("dispatcher_id") or "").strip() or None,
+                emitted_at=str(job.get("claimed_at") or "").strip() or _utc_now().isoformat(),
+                status="claimed",
+                lease_until=str(job.get("lease_expires_at") or "").strip() or None,
+                subject=WORKFLOW_EXECUTION_CLAIMED_SUBJECT,
+                legacy_subject=WORKFLOW_EXECUTION_EVENT_SUBJECT,
+            )
+
+        self._publish_execution_event(
+            run=run,
+            protocol=protocol,
+            message_name="workflow.execution.started",
+            dispatcher_id=dispatcher_id or str((run or {}).get("dispatcher_id") or "").strip() or None,
+            emitted_at=_utc_now().isoformat(),
+            status="started",
+            lease_until=str(job.get("lease_expires_at") or "").strip() or None,
+            subject=WORKFLOW_EXECUTION_STARTED_SUBJECT,
+            legacy_subject=WORKFLOW_EXECUTION_EVENT_SUBJECT,
+        )
         try:
             result = workflow_execution_service.execute_workflow_run(run_id)
         except Exception as exc:  # pragma: no cover - defensive worker guard
             logger.warning("Workflow execution worker failed for run %s: %s", run_id, exc)
+            current_attempt = max(int(protocol.get("attempt") or 1), 1)
+            max_attempts = self._max_attempts_for_protocol(protocol, run)
+            if current_attempt >= max_attempts:
+                dead_letter_protocol = {
+                    **protocol,
+                    "dead_letter": True,
+                    "dead_letter_reason": str(exc),
+                    "last_error": str(exc),
+                }
+                if run is not None:
+                    apply_protocol_to_run(run, dead_letter_protocol)
+                    self._persist_run(run)
+                dead_letter_at = _utc_now().isoformat()
+                self._publish_execution_event(
+                    run=run,
+                    protocol=dead_letter_protocol,
+                    message_name="workflow.execution.dead_lettered",
+                    dispatcher_id=dispatcher_id or str((run or {}).get("dispatcher_id") or "").strip() or None,
+                    emitted_at=dead_letter_at,
+                    error_message=str(exc),
+                    status="dead_lettered",
+                    dead_letter=True,
+                    dead_letter_reason=str(exc),
+                    subject=WORKFLOW_EXECUTION_FAILED_SUBJECT,
+                    legacy_subject=WORKFLOW_EXECUTION_EVENT_SUBJECT,
+                )
+                workflow_execution_service.fail_workflow_run_due_agent_execution_error(
+                    run_id,
+                    failure_message=f"工作流执行失败并进入死信：{exc}",
+                )
+                self._delete_execution_job(run_id, claimed_at=job.get("claimed_at"))
+                self._release_dispatch_claim(
+                    run_id,
+                    dispatcher_id=dispatcher_id or str((run or {}).get("dispatcher_id") or "").strip() or None,
+                )
+                return "skipped_claimed"
+
+            retry_protocol = {
+                **protocol,
+                "attempt": current_attempt + 1,
+                "dead_letter": False,
+                "dead_letter_reason": None,
+                "last_error": str(exc),
+            }
+            if run is not None:
+                apply_protocol_to_run(run, retry_protocol)
+                self._persist_run(run)
             step_delay = float(job.get("step_delay_seconds") or 0.0)
             workflow_scheduler_service.defer(
                 run_id,
                 delay=max(step_delay, 0.5),
                 step_delay=step_delay,
-                dispatcher_id=dispatcher_id or str(run.get("dispatcher_id") or "").strip() or None,
+                dispatcher_id=dispatcher_id or str((run or {}).get("dispatcher_id") or "").strip() or None,
             )
             self._publish_execution_event(
                 run=run,
-                protocol=self._resolve_protocol(job, run),
+                protocol=retry_protocol,
                 message_name="workflow.execution.deferred",
-                dispatcher_id=dispatcher_id or str(run.get("dispatcher_id") or "").strip() or None,
+                dispatcher_id=dispatcher_id or str((run or {}).get("dispatcher_id") or "").strip() or None,
                 error_message=str(exc),
                 emitted_at=_utc_now().isoformat(),
+                status="retry_scheduled",
             )
             self._delete_execution_job(run_id, claimed_at=job.get("claimed_at"))
             self._release_dispatch_claim(
                 run_id,
-                dispatcher_id=dispatcher_id or str(run.get("dispatcher_id") or "").strip() or None,
+                dispatcher_id=dispatcher_id or str((run or {}).get("dispatcher_id") or "").strip() or None,
             )
             return "skipped_claimed"
 
@@ -429,7 +515,8 @@ class WorkflowExecutionWorkerService:
             or None,
             emitted_at=_utc_now().isoformat(),
             result_payload={"status": str((result or {}).get("status") or "").strip() or None},
-            subject=WORKFLOW_EXECUTION_RESULT_SUBJECT,
+            subject=WORKFLOW_EXECUTION_COMPLETED_SUBJECT,
+            legacy_subject=WORKFLOW_EXECUTION_RESULT_SUBJECT,
             message_type="result",
         )
         self._delete_execution_job(run_id, claimed_at=job.get("claimed_at"))
@@ -540,6 +627,22 @@ class WorkflowExecutionWorkerService:
         protocol.update({key: value for key, value in message_protocol.items() if value is not None})
         return protocol
 
+    @staticmethod
+    def _max_attempts_for_protocol(protocol: dict | None, run: dict | None) -> int:
+        if isinstance(protocol, dict):
+            try:
+                resolved = int(protocol.get("max_attempts") or 0)
+            except (TypeError, ValueError):
+                resolved = 0
+            if resolved > 0:
+                return resolved
+        policy = _run_workflow_policy(run)
+        try:
+            resolved = int(policy.get("max_dispatch_retry") or policy.get("maxDispatchRetry") or 0)
+        except (TypeError, ValueError):
+            resolved = 0
+        return max(resolved, DEFAULT_MAX_ATTEMPTS, 1)
+
     def _publish_execution_event(
         self,
         *,
@@ -550,7 +653,12 @@ class WorkflowExecutionWorkerService:
         emitted_at: str,
         error_message: str | None = None,
         result_payload: dict | None = None,
+        status: str | None = None,
+        lease_until: str | None = None,
+        dead_letter: bool = False,
+        dead_letter_reason: str | None = None,
         subject: str = WORKFLOW_EXECUTION_EVENT_SUBJECT,
+        legacy_subject: str | None = None,
         message_type: str = "event",
     ) -> None:
         payload = {
@@ -558,8 +666,10 @@ class WorkflowExecutionWorkerService:
             "task_id": str((run or {}).get("task_id") or "").strip() or None,
             "workflow_id": str((run or {}).get("workflow_id") or "").strip() or None,
             "dispatcher_id": dispatcher_id,
-            "status": str((run or {}).get("status") or "").strip() or None,
+            "status": status or str((run or {}).get("status") or "").strip() or None,
         }
+        if lease_until:
+            payload["lease_until"] = lease_until
         if error_message:
             payload["error_message"] = error_message
         if isinstance(result_payload, dict):
@@ -574,8 +684,8 @@ class WorkflowExecutionWorkerService:
             attempt=protocol.get("attempt"),
             emitted_at=emitted_at,
             available_at=emitted_at,
-            dead_letter=False,
-            dead_letter_reason=None,
+            dead_letter=dead_letter,
+            dead_letter_reason=dead_letter_reason,
             last_error=error_message,
             source={"kind": "workflow_execution_worker", "id": self.worker_id},
             target={"kind": "workflow_dispatcher", "id": dispatcher_id or "unknown"},
@@ -583,7 +693,20 @@ class WorkflowExecutionWorkerService:
         if isinstance(run, dict):
             apply_protocol_to_run(run, resolved_protocol)
             self._persist_run(run)
-        self._event_bus.publish_json(subject, envelope)
+        self._publish_to_subjects([subject, legacy_subject], envelope)
+
+    def _publish_to_subjects(self, subjects: list[str | None], payload: dict) -> bool:
+        if not getattr(self._persistence, "enabled", False):
+            return False
+        published = False
+        seen: set[str] = set()
+        for subject in subjects:
+            normalized = str(subject or "").strip()
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            published = self._event_bus.publish_json(normalized, payload) or published
+        return published
 
 
 workflow_execution_worker_service = WorkflowExecutionWorkerService()

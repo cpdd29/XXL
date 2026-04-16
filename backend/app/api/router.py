@@ -1,10 +1,14 @@
 from fastapi import APIRouter
 
 from app.api.routes import (
+    alerts,
     agents,
+    approvals,
     auth,
     collaboration,
     dashboard,
+    external_connections,
+    events,
     messages,
     memory,
     settings,
@@ -19,7 +23,11 @@ from app.api.routes import (
 
 api_router = APIRouter()
 api_router.include_router(auth.router, prefix="/auth", tags=["auth"])
+api_router.include_router(alerts.router, prefix="/alerts", tags=["alerts"])
+api_router.include_router(approvals.router, prefix="/approvals", tags=["approvals"])
 api_router.include_router(dashboard.router, prefix="/dashboard", tags=["dashboard"])
+api_router.include_router(external_connections.router, prefix="/external-connections", tags=["external-connections"])
+api_router.include_router(events.router, prefix="/events", tags=["events"])
 api_router.include_router(collaboration.router, prefix="/collaboration", tags=["collaboration"])
 api_router.include_router(tasks.router, prefix="/tasks", tags=["tasks"])
 api_router.include_router(agents.router, prefix="/agents", tags=["agents"])

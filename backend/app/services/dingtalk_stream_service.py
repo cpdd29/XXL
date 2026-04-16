@@ -178,9 +178,6 @@ class DingTalkStreamService:
         self._ssl_context = ssl.create_default_context(cafile=certifi.where())
 
     def reconcile_runtime(self) -> bool:
-        if not DINGTALK_STREAM_AVAILABLE:
-            self.stop()
-            return False
         runtime_settings = get_channel_integration_runtime_settings()["dingtalk"]
         if not bool(runtime_settings.get("enabled", True)):
             self.stop()

@@ -1,0 +1,768 @@
+{
+  "version": "2026-04-11",
+  "mode": "external_only",
+  "sources": [
+    {
+      "id": "agent-reach-upstream",
+      "name": "Agent Reach Upstream",
+      "kind": "external_repo",
+      "enabled": true,
+      "registry": {
+        "origin": "external_repo",
+        "bridge_enabled": true
+      },
+      "config_summary": {
+        "deployment_mode": "path_agnostic",
+        "notes": "Agent Reach tools are declared inline in this registry for cross-server portability."
+      }
+    },
+    {
+      "id": "clawempire-skill-library",
+      "name": "ClawEmpire Skill Library",
+      "kind": "external_repo",
+      "enabled": true,
+      "registry": {
+        "origin": "external_repo",
+        "bridge_enabled": true
+      },
+      "config_summary": {
+        "asset_manifest": "skills/clawempire/db-export/manifest.json",
+        "asset_kind": "workflow_packs",
+        "execution_mode": "metadata_bridge"
+      }
+    },
+    {
+      "id": "workbot-external-mcp",
+      "name": "WorkBot External MCP Runtime",
+      "kind": "mcp_registry",
+      "enabled": true,
+      "registry": {
+        "origin": "external_mcp_registry",
+        "bridge_enabled": true
+      },
+      "config_summary": {
+        "deployment_mode": "env_aware_registry",
+        "notes": "General and professional MCP tentacles are declared here and resolved by environment placeholders."
+      }
+    }
+  ],
+  "tools": [
+    {
+      "id": "mcp-tool-web-search",
+      "name": "web_search",
+      "type": "mcp",
+      "source": "workbot-external-mcp",
+      "source_kind": "mcp_server",
+      "enabled": true,
+      "description": "Search MCP tool",
+      "tags": ["mcp", "search", "externalized", "runtime"],
+      "provider": "mcp-http",
+      "bridge_mode": "runtime_bridge",
+      "permissions": {
+        "requires_permission": false,
+        "scopes": ["agents:read"],
+        "roles": ["admin", "operator", "power_user", "viewer"],
+        "approval_required": false
+      },
+      "config_summary": {
+        "base_url": "${WORKBOT_SEARCH_MCP_BASE_URL:-http://127.0.0.1:8093}",
+        "invoke_path": "/search",
+        "http_method": "POST",
+        "request_mode": "raw_payload_with_trace",
+        "timeout_seconds": 10,
+        "retry_attempts": 2
+      }
+    },
+    {
+      "id": "mcp-tool-pdf-read",
+      "name": "pdf_read",
+      "type": "mcp",
+      "source": "workbot-external-mcp",
+      "source_kind": "mcp_server",
+      "enabled": true,
+      "description": "PDF read MCP tool",
+      "tags": ["mcp", "pdf", "externalized", "runtime"],
+      "provider": "mcp-http",
+      "bridge_mode": "runtime_bridge",
+      "permissions": {
+        "requires_permission": false,
+        "scopes": ["agents:read"],
+        "roles": ["admin", "operator", "power_user", "viewer"],
+        "approval_required": false
+      },
+      "config_summary": {
+        "base_url": "${WORKBOT_PDF_MCP_BASE_URL:-http://127.0.0.1:8092}",
+        "invoke_path": "/tools/read",
+        "http_method": "POST",
+        "request_mode": "raw_payload",
+        "timeout_seconds": 10,
+        "retry_attempts": 2
+      }
+    },
+    {
+      "id": "mcp-tool-pdf-summary",
+      "name": "pdf_summary",
+      "type": "mcp",
+      "source": "workbot-external-mcp",
+      "source_kind": "mcp_server",
+      "enabled": true,
+      "description": "PDF summary MCP tool",
+      "tags": ["mcp", "pdf", "externalized", "runtime"],
+      "provider": "mcp-http",
+      "bridge_mode": "runtime_bridge",
+      "permissions": {
+        "requires_permission": false,
+        "scopes": ["agents:read"],
+        "roles": ["admin", "operator", "power_user", "viewer"],
+        "approval_required": false
+      },
+      "config_summary": {
+        "base_url": "${WORKBOT_PDF_MCP_BASE_URL:-http://127.0.0.1:8092}",
+        "invoke_path": "/tools/summary",
+        "http_method": "POST",
+        "request_mode": "raw_payload",
+        "timeout_seconds": 10,
+        "retry_attempts": 2
+      }
+    },
+    {
+      "id": "mcp-tool-pdf-to-docx",
+      "name": "pdf_to_docx",
+      "type": "mcp",
+      "source": "workbot-external-mcp",
+      "source_kind": "mcp_server",
+      "enabled": true,
+      "description": "PDF to DOCX MCP tool",
+      "tags": ["mcp", "pdf", "externalized", "runtime"],
+      "provider": "mcp-http",
+      "bridge_mode": "runtime_bridge",
+      "permissions": {
+        "requires_permission": false,
+        "scopes": ["agents:read"],
+        "roles": ["admin", "operator", "power_user", "viewer"],
+        "approval_required": false
+      },
+      "config_summary": {
+        "base_url": "${WORKBOT_PDF_MCP_BASE_URL:-http://127.0.0.1:8092}",
+        "invoke_path": "/tools/to_docx",
+        "http_method": "POST",
+        "request_mode": "raw_payload",
+        "timeout_seconds": 10,
+        "retry_attempts": 2
+      }
+    },
+    {
+      "id": "mcp-tool-writer-speech",
+      "name": "speech_writer",
+      "type": "mcp",
+      "source": "workbot-external-mcp",
+      "source_kind": "mcp_server",
+      "enabled": true,
+      "description": "Writer MCP speech tool",
+      "tags": ["mcp", "writer", "speech", "externalized", "runtime"],
+      "provider": "mcp-http",
+      "bridge_mode": "runtime_bridge",
+      "permissions": {
+        "requires_permission": false,
+        "scopes": ["agents:read"],
+        "roles": ["admin", "operator", "power_user", "viewer"],
+        "approval_required": false
+      },
+      "config_summary": {
+        "base_url": "${WORKBOT_WRITER_MCP_BASE_URL:-http://127.0.0.1:8094}",
+        "invoke_path": "/execute",
+        "http_method": "POST",
+        "request_mode": "execute_tool_payload",
+        "tool_alias": "speech_writer",
+        "timeout_seconds": 10,
+        "retry_attempts": 2
+      }
+    },
+    {
+      "id": "mcp-tool-writer-general",
+      "name": "general_writer",
+      "type": "mcp",
+      "source": "workbot-external-mcp",
+      "source_kind": "mcp_server",
+      "enabled": true,
+      "description": "Writer MCP general drafting tool",
+      "tags": ["mcp", "writer", "copywriting", "externalized", "runtime"],
+      "provider": "mcp-http",
+      "bridge_mode": "runtime_bridge",
+      "permissions": {
+        "requires_permission": false,
+        "scopes": ["agents:read"],
+        "roles": ["admin", "operator", "power_user", "viewer"],
+        "approval_required": false
+      },
+      "config_summary": {
+        "base_url": "${WORKBOT_WRITER_MCP_BASE_URL:-http://127.0.0.1:8094}",
+        "invoke_path": "/execute",
+        "http_method": "POST",
+        "request_mode": "execute_tool_payload",
+        "tool_alias": "general_writer",
+        "timeout_seconds": 10,
+        "retry_attempts": 2
+      }
+    },
+    {
+      "id": "mcp-tool-weather-lookup",
+      "name": "weather_lookup",
+      "type": "mcp",
+      "source": "workbot-external-mcp",
+      "source_kind": "mcp_server",
+      "enabled": true,
+      "description": "Weather MCP tool",
+      "tags": ["mcp", "weather", "externalized", "runtime"],
+      "provider": "mcp-http",
+      "bridge_mode": "runtime_bridge",
+      "permissions": {
+        "requires_permission": false,
+        "scopes": ["agents:read"],
+        "roles": ["admin", "operator", "power_user", "viewer"],
+        "approval_required": false
+      },
+      "config_summary": {
+        "base_url": "${WORKBOT_WEATHER_MCP_BASE_URL:-http://127.0.0.1:8095}",
+        "invoke_path": "/execute",
+        "http_method": "POST",
+        "request_mode": "execute_tool_payload",
+        "tool_alias": "weather_lookup",
+        "timeout_seconds": 8,
+        "retry_attempts": 2
+      }
+    },
+    {
+      "id": "mcp-tool-order-query",
+      "name": "order_query",
+      "type": "mcp",
+      "source": "workbot-external-mcp",
+      "source_kind": "mcp_server",
+      "enabled": true,
+      "description": "Order read-only MCP tool",
+      "tags": ["mcp", "order", "readonly", "professional"],
+      "provider": "mcp-http",
+      "bridge_mode": "runtime_bridge",
+      "permissions": {
+        "requires_permission": true,
+        "scopes": ["agents:read", "tasks:write"],
+        "roles": ["admin", "operator"],
+        "approval_required": true
+      },
+      "config_summary": {
+        "base_url": "${WORKBOT_ORDER_MCP_BASE_URL:-http://127.0.0.1:8096}",
+        "invoke_path": "/query",
+        "http_method": "POST",
+        "request_mode": "raw_payload",
+        "timeout_seconds": 10,
+        "retry_attempts": 1
+      }
+    },
+    {
+      "id": "mcp-tool-crm-query",
+      "name": "crm_query",
+      "type": "mcp",
+      "source": "workbot-external-mcp",
+      "source_kind": "mcp_server",
+      "enabled": true,
+      "description": "CRM read-only MCP tool",
+      "tags": ["mcp", "crm", "readonly", "professional"],
+      "provider": "mcp-http",
+      "bridge_mode": "runtime_bridge",
+      "permissions": {
+        "requires_permission": true,
+        "scopes": ["agents:read", "tasks:write"],
+        "roles": ["admin", "operator"],
+        "approval_required": true
+      },
+      "config_summary": {
+        "base_url": "${WORKBOT_CRM_MCP_BASE_URL:-http://127.0.0.1:8097}",
+        "invoke_path": "/query",
+        "http_method": "POST",
+        "request_mode": "raw_payload",
+        "timeout_seconds": 10,
+        "retry_attempts": 1
+      }
+    },
+    {
+      "id": "agent-reach-upstream:mcp:exa",
+      "name": "exa",
+      "type": "mcp",
+      "source": "agent-reach-upstream",
+      "source_kind": "external_repo",
+      "enabled": true,
+      "description": "Agent Reach MCP server: exa",
+      "tags": ["external", "mcp", "agent-reach", "exa"],
+      "provider": "mcporter",
+      "bridge_mode": "runtime_bridge",
+      "health_status": "healthy",
+      "permissions": {
+        "requires_permission": false,
+        "scopes": ["agents:read"],
+        "roles": ["admin", "operator", "power_user", "viewer"],
+        "approval_required": false
+      },
+      "config_summary": {
+        "baseUrl": "https://mcp.exa.ai/mcp",
+        "base_url": "https://mcp.exa.ai/mcp",
+        "invokePath": "/invoke",
+        "invoke_path": "/invoke",
+        "httpMethod": "POST",
+        "http_method": "POST"
+      }
+    },
+    {
+      "id": "agent-reach-upstream:mcp:xiaohongshu",
+      "name": "xiaohongshu",
+      "type": "mcp",
+      "source": "agent-reach-upstream",
+      "source_kind": "external_repo",
+      "enabled": true,
+      "description": "Agent Reach MCP server: xiaohongshu",
+      "tags": ["external", "mcp", "agent-reach", "xiaohongshu"],
+      "provider": "mcporter",
+      "bridge_mode": "runtime_bridge",
+      "health_status": "degraded",
+      "permissions": {
+        "requires_permission": false,
+        "scopes": ["agents:read"],
+        "roles": ["admin", "operator", "power_user", "viewer"],
+        "approval_required": false
+      },
+      "config_summary": {
+        "baseUrl": "http://localhost:18060/mcp",
+        "base_url": "http://localhost:18060/mcp",
+        "invokePath": "/invoke",
+        "invoke_path": "/invoke",
+        "httpMethod": "POST",
+        "http_method": "POST"
+      }
+    },
+    {
+      "id": "agent-reach-upstream:tool:doctor",
+      "name": "agent-reach doctor",
+      "type": "bridge",
+      "source": "agent-reach-upstream",
+      "source_kind": "external_repo",
+      "enabled": true,
+      "description": "Agent Reach health doctor entry.",
+      "tags": ["external", "diagnostics", "doctor"],
+      "provider": "agent-reach-cli",
+      "bridge_mode": "doctor_bridge",
+      "health_status": "degraded",
+      "permissions": {
+        "requires_permission": true,
+        "scopes": ["agents:reload", "agents:read"],
+        "roles": ["admin", "operator"],
+        "approval_required": true
+      },
+      "config_summary": {
+        "command": "agent-reach doctor"
+      }
+    },
+    {
+      "id": "agent-reach-upstream:tool:skill",
+      "name": "agent-reach skill",
+      "type": "bridge",
+      "source": "agent-reach-upstream",
+      "source_kind": "external_repo",
+      "enabled": true,
+      "description": "Agent Reach skill install/uninstall bridge entry.",
+      "tags": ["external", "skill-management"],
+      "provider": "agent-reach-cli",
+      "bridge_mode": "catalog_bridge",
+      "health_status": "degraded",
+      "permissions": {
+        "requires_permission": true,
+        "scopes": ["agents:reload"],
+        "roles": ["admin", "operator"],
+        "approval_required": true
+      },
+      "config_summary": {
+        "command": "agent-reach skill --install|--uninstall"
+      }
+    },
+    {
+      "id": "agent-reach-upstream:tool:runtime",
+      "name": "agent-reach runtime bridge",
+      "type": "bridge",
+      "source": "agent-reach-upstream",
+      "source_kind": "external_repo",
+      "enabled": true,
+      "description": "Agent Reach runtime bridge entry.",
+      "tags": ["external", "runtime", "bridge"],
+      "provider": "agent-reach-cli",
+      "bridge_mode": "runtime_bridge",
+      "health_status": "degraded",
+      "permissions": {
+        "requires_permission": true,
+        "scopes": ["agents:read", "agents:reload"],
+        "roles": ["admin", "operator"],
+        "approval_required": true
+      },
+      "config_summary": {
+        "command": "agent-reach <subcommand>"
+      }
+    },
+    {
+      "id": "clawempire-skill-pack-development",
+      "name": "development_skill_pack",
+      "type": "skill",
+      "source": "clawempire-skill-library",
+      "source_kind": "external_repo",
+      "enabled": true,
+      "description": "ClawEmpire workflow pack: Development",
+      "tags": ["skill", "external", "clawempire", "workflow-pack", "engineering"],
+      "provider": "clawempire-skill-registry",
+      "bridge_mode": "skill_bridge",
+      "health_status": "unknown",
+      "permissions": {
+        "requires_permission": false,
+        "scopes": ["agents:read"],
+        "roles": ["admin", "operator", "power_user", "viewer"],
+        "approval_required": false
+      },
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "project": {"type": "string"},
+          "instruction": {"type": "string"},
+          "constraints": {"type": "string"},
+          "acceptance_criteria": {"type": "string"},
+          "deadline": {"type": "string"}
+        },
+        "required": ["project", "instruction"]
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "summary": {"type": "string"},
+          "changes": {"type": "array"},
+          "verification": {"type": "array"},
+          "next_steps": {"type": "array"}
+        }
+      },
+      "config_summary": {
+        "skill_asset": "workflow_pack",
+        "pack_key": "development",
+        "pack_name": "Development",
+        "registry_source_file": "skills/clawempire/db-export/workflow_packs.normalized.json",
+        "execution_mode": "metadata_bridge",
+        "prompt_mode": "engineering"
+      }
+    },
+    {
+      "id": "clawempire-skill-pack-novel",
+      "name": "novel_skill_pack",
+      "type": "skill",
+      "source": "clawempire-skill-library",
+      "source_kind": "external_repo",
+      "enabled": true,
+      "description": "ClawEmpire workflow pack: Novel Writing",
+      "tags": ["skill", "external", "clawempire", "workflow-pack", "creative-writing"],
+      "provider": "clawempire-skill-registry",
+      "bridge_mode": "skill_bridge",
+      "health_status": "unknown",
+      "permissions": {
+        "requires_permission": false,
+        "scopes": ["agents:read"],
+        "roles": ["admin", "operator", "power_user", "viewer"],
+        "approval_required": false
+      },
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "genre": {"type": "string"},
+          "tone": {"type": "string"},
+          "length": {"type": "string"},
+          "characters": {"type": "string"},
+          "world_setting": {"type": "string"},
+          "point_of_view": {"type": "string"}
+        },
+        "required": ["genre", "tone", "length"]
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "synopsis": {"type": "string"},
+          "chapter_or_scene": {"type": "string"}
+        }
+      },
+      "config_summary": {
+        "skill_asset": "workflow_pack",
+        "pack_key": "novel",
+        "pack_name": "Novel Writing",
+        "registry_source_file": "skills/clawempire/db-export/workflow_packs.normalized.json",
+        "execution_mode": "metadata_bridge",
+        "prompt_mode": "creative_writing"
+      }
+    },
+    {
+      "id": "clawempire-skill-pack-report",
+      "name": "report_skill_pack",
+      "type": "skill",
+      "source": "clawempire-skill-library",
+      "source_kind": "external_repo",
+      "enabled": true,
+      "description": "ClawEmpire workflow pack: Structured Report",
+      "tags": ["skill", "external", "clawempire", "workflow-pack", "reporting"],
+      "provider": "clawempire-skill-registry",
+      "bridge_mode": "skill_bridge",
+      "health_status": "unknown",
+      "permissions": {
+        "requires_permission": false,
+        "scopes": ["agents:read"],
+        "roles": ["admin", "operator", "power_user", "viewer"],
+        "approval_required": false
+      },
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "goal": {"type": "string"},
+          "audience": {"type": "string"},
+          "format": {"type": "string"},
+          "length": {"type": "string"},
+          "tone": {"type": "string"},
+          "deadline": {"type": "string"}
+        },
+        "required": ["goal", "audience", "format"]
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "summary": {"type": "string"},
+          "body": {"type": "string"},
+          "action_items": {"type": "array"}
+        }
+      },
+      "config_summary": {
+        "skill_asset": "workflow_pack",
+        "pack_key": "report",
+        "pack_name": "Structured Report",
+        "registry_source_file": "skills/clawempire/db-export/workflow_packs.normalized.json",
+        "execution_mode": "metadata_bridge",
+        "prompt_mode": "reporting"
+      }
+    },
+    {
+      "id": "clawempire-skill-pack-roleplay",
+      "name": "roleplay_skill_pack",
+      "type": "skill",
+      "source": "clawempire-skill-library",
+      "source_kind": "external_repo",
+      "enabled": true,
+      "description": "ClawEmpire workflow pack: Roleplay",
+      "tags": ["skill", "external", "clawempire", "workflow-pack", "roleplay"],
+      "provider": "clawempire-skill-registry",
+      "bridge_mode": "skill_bridge",
+      "health_status": "unknown",
+      "permissions": {
+        "requires_permission": false,
+        "scopes": ["agents:read"],
+        "roles": ["admin", "operator", "power_user", "viewer"],
+        "approval_required": false
+      },
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "character": {"type": "string"},
+          "tone": {"type": "string"},
+          "setting": {"type": "string"},
+          "constraints": {"type": "string"},
+          "safety_rules": {"type": "string"}
+        },
+        "required": ["character", "tone"]
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "dialogue": {"type": "string"}
+        }
+      },
+      "config_summary": {
+        "skill_asset": "workflow_pack",
+        "pack_key": "roleplay",
+        "pack_name": "Roleplay",
+        "registry_source_file": "skills/clawempire/db-export/workflow_packs.normalized.json",
+        "execution_mode": "metadata_bridge",
+        "prompt_mode": "roleplay"
+      }
+    },
+    {
+      "id": "clawempire-skill-pack-video-preprod",
+      "name": "video_preprod_skill_pack",
+      "type": "skill",
+      "source": "clawempire-skill-library",
+      "source_kind": "external_repo",
+      "enabled": true,
+      "description": "ClawEmpire workflow pack: Video Pre-production",
+      "tags": ["skill", "external", "clawempire", "workflow-pack", "video-planning"],
+      "provider": "clawempire-skill-registry",
+      "bridge_mode": "skill_bridge",
+      "health_status": "unknown",
+      "permissions": {
+        "requires_permission": false,
+        "scopes": ["agents:read"],
+        "roles": ["admin", "operator", "power_user", "viewer"],
+        "approval_required": false
+      },
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "platform": {"type": "string"},
+          "duration": {"type": "string"},
+          "goal": {"type": "string"},
+          "target_audience": {"type": "string"},
+          "style": {"type": "string"},
+          "cta": {"type": "string"}
+        },
+        "required": ["platform", "duration", "goal"]
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "concept": {"type": "string"},
+          "script": {"type": "string"},
+          "shot_list": {"type": "array"},
+          "editing_notes": {"type": "array"},
+          "video_file": {"type": "string"}
+        }
+      },
+      "config_summary": {
+        "skill_asset": "workflow_pack",
+        "pack_key": "video_preprod",
+        "pack_name": "Video Pre-production",
+        "registry_source_file": "skills/clawempire/db-export/workflow_packs.normalized.json",
+        "execution_mode": "metadata_bridge",
+        "prompt_mode": "video_planning"
+      }
+    },
+    {
+      "id": "clawempire-skill-pack-web-research-report",
+      "name": "web_research_report_skill_pack",
+      "type": "skill",
+      "source": "clawempire-skill-library",
+      "source_kind": "external_repo",
+      "enabled": true,
+      "description": "ClawEmpire workflow pack: Web Research Report",
+      "tags": ["skill", "external", "clawempire", "workflow-pack", "research"],
+      "provider": "clawempire-skill-registry",
+      "bridge_mode": "skill_bridge",
+      "health_status": "unknown",
+      "permissions": {
+        "requires_permission": false,
+        "scopes": ["agents:read"],
+        "roles": ["admin", "operator", "power_user", "viewer"],
+        "approval_required": false
+      },
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "topic": {"type": "string"},
+          "time_range": {"type": "string"},
+          "source_policy": {"type": "string"},
+          "language": {"type": "string"},
+          "depth": {"type": "string"}
+        },
+        "required": ["topic", "time_range"]
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "summary": {"type": "string"},
+          "findings": {"type": "array"},
+          "citations": {"type": "array"},
+          "recommendations": {"type": "array"}
+        }
+      },
+      "config_summary": {
+        "skill_asset": "workflow_pack",
+        "pack_key": "web_research_report",
+        "pack_name": "Web Research Report",
+        "registry_source_file": "skills/clawempire/db-export/workflow_packs.normalized.json",
+        "execution_mode": "metadata_bridge",
+        "prompt_mode": "web_research"
+      }
+    },
+    {
+      "id": "clawempire-skill-memory-manager",
+      "name": "memory_manager_skill",
+      "type": "skill",
+      "source": "clawempire-skill-library",
+      "source_kind": "external_repo",
+      "enabled": true,
+      "description": "ClawEmpire markdown skill: memory-manager",
+      "tags": ["skill", "external", "clawempire", "markdown-skill", "memory"],
+      "provider": "markdown-skill-asset",
+      "bridge_mode": "skill_bridge",
+      "health_status": "unknown",
+      "permissions": {
+        "requires_permission": false,
+        "scopes": ["agents:read"],
+        "roles": ["admin", "operator", "power_user", "viewer"],
+        "approval_required": false
+      },
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "content": {"type": "string"},
+          "section": {"type": "string"},
+          "agent_id": {"type": "string"}
+        },
+        "required": ["content", "section"]
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "summary": {"type": "string"},
+          "appended": {"type": "boolean"}
+        }
+      },
+      "config_summary": {
+        "skill_asset": "markdown_skill",
+        "asset_path": "skills/clawempire/skills/memory-manager.md",
+        "execution_mode": "prompt_asset_only"
+      }
+    },
+    {
+      "id": "clawempire-skill-design-taste-frontend",
+      "name": "design_taste_frontend_skill",
+      "type": "skill",
+      "source": "clawempire-skill-library",
+      "source_kind": "external_repo",
+      "enabled": true,
+      "description": "ClawEmpire markdown skill: design-taste-frontend",
+      "tags": ["skill", "external", "clawempire", "markdown-skill", "frontend", "design"],
+      "provider": "markdown-skill-asset",
+      "bridge_mode": "skill_bridge",
+      "health_status": "unknown",
+      "permissions": {
+        "requires_permission": false,
+        "scopes": ["agents:read"],
+        "roles": ["admin", "operator", "power_user", "viewer"],
+        "approval_required": false
+      },
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "project_type": {"type": "string"},
+          "style_goal": {"type": "string"},
+          "constraints": {"type": "string"}
+        }
+      },
+      "output_schema": {
+        "type": "object",
+        "properties": {
+          "summary": {"type": "string"},
+          "ui_direction": {"type": "string"},
+          "implementation_notes": {"type": "array"}
+        }
+      },
+      "config_summary": {
+        "skill_asset": "markdown_skill",
+        "asset_path": "skills/clawempire/taste-skill/skill.md",
+        "execution_mode": "prompt_asset_only"
+      }
+    }
+  ]
+}

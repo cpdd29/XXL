@@ -19,8 +19,28 @@ class AuthUser(APIModel):
     role: str
 
 
+class AuthRoleSummary(APIModel):
+    key: str
+    label: str
+    tier: str
+    description: str
+
+
+class AuthPermissionGroup(APIModel):
+    key: str
+    label: str
+    permissions: list[str]
+
+
 class LoginResponse(APIModel):
     access_token: str
     refresh_token: str
     expires_in: int
     user: AuthUser
+
+
+class AuthSessionResponse(APIModel):
+    user: AuthUser
+    role_summary: AuthRoleSummary
+    permissions: list[str]
+    permission_groups: list[AuthPermissionGroup]

@@ -38,7 +38,11 @@ def webhook_auth_scope(channel: ChannelType | str) -> str:
 
 
 def allowed_ingest_auth_scopes() -> set[str]:
-    return {"messages:ingest", *(webhook_auth_scope(channel) for channel in ChannelType)}
+    return {
+        "messages:ingest",
+        "webhook:workflow",
+        *(webhook_auth_scope(channel) for channel in ChannelType),
+    }
 
 
 class UnifiedMessage(APIModel):
@@ -129,6 +133,46 @@ class MessageRouteDecision(APIModel):
     execution_scope: str | None = None
     evidence_policy: str | None = None
     schedule_plan: dict[str, Any] | None = None
+    route_rationale: dict[str, Any] | None = None
+    fallback_policy: dict[str, Any] | None = None
+
+
+class MessageManagerSummary(APIModel):
+    manager_role: str | None = None
+    manager_action: str | None = None
+    next_owner: str | None = None
+    delivery_mode: str | None = None
+    task_shape: str | None = None
+    response_contract: str | None = None
+    clarify_required: bool | None = None
+    clarify_question: str | None = None
+    handoff_summary: str | None = None
+    session_state: str | None = None
+    state_label: str | None = None
+
+
+class MessageBrainDispatchSummary(APIModel):
+    intent: str | None = None
+    dispatch_type: str | None = None
+    workflow_mode: str | None = None
+    interaction_mode: str | None = None
+    reception_mode: str | None = None
+    workflow_name: str | None = None
+    execution_agent: str | None = None
+    manager_action: str | None = None
+    next_owner: str | None = None
+    delivery_mode: str | None = None
+    response_contract: str | None = None
+    clarify_required: bool | None = None
+    approval_required: bool | None = None
+    execution_scope: str | None = None
+    summary_line: str | None = None
+    routing_strategy: str | None = None
+    execution_topology: str | None = None
+    fallback_mode: str | None = None
+    route_reason_summary: str | None = None
+    session_state: str | None = None
+    state_label: str | None = None
 
 
 class IngestMessageResponse(APIModel):
@@ -147,3 +191,5 @@ class IngestMessageResponse(APIModel):
     warnings: list[str] = Field(default_factory=list)
     merged_into_task_id: str | None = None
     route_decision: MessageRouteDecision | None = None
+    manager_summary: MessageManagerSummary | None = None
+    brain_dispatch_summary: MessageBrainDispatchSummary | None = None

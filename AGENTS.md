@@ -83,3 +83,17 @@
 ```
 [完成] 任务名称 — 简述实现方式或遇到的问题及解法
 ```
+
+## 架构守卫与回归
+
+以下检查在修改主脑、外接治理、TODO 清单后必须执行：
+
+- `python3 backend/scripts/check_architecture_boundaries.py`
+- `python3 backend/scripts/check_todo_sync.py --strict`
+- `python3 -m pytest -q backend/tests/test_architecture_boundaries.py backend/tests/test_todo_sync.py backend/tests/test_package_p_smoke.py`
+
+边界要求：
+
+- `brain_core` 禁止直接 import `workflow_execution_service`、`master_bot_service`、`tentacle_adapters`
+- 主脑内置 `*_skill` 仅允许任务中心只读兜底能力，禁止继续内嵌重执行 skill
+- 完成态 TODO 项必须指向真实存在的文件，Package 完成后必须补 `当前状态`

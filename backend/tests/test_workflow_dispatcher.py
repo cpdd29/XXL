@@ -116,6 +116,7 @@ class FakePersistence:
             "created_at": queued_at,
             "updated_at": queued_at,
         }
+        protocol: dict[str, object] = {}
         for key in (
             "spec_version",
             "message_id",
@@ -133,6 +134,9 @@ class FakePersistence:
         ):
             if key in kwargs:
                 payload[key] = kwargs.get(key)
+                protocol[key] = kwargs.get(key)
+        if protocol:
+            payload["protocol"] = dict(protocol)
         self.execution_job_upserts.append(payload)
         self.execution_jobs[run_id] = deepcopy(payload)
         return deepcopy(payload)
@@ -692,6 +696,60 @@ def test_workflow_dispatcher_service_dispatch_ready_run_publishes_execution_payl
     assert payload["max_attempts"] == dispatcher_module.MAX_DISPATCH_FAILURE_COUNT
     persisted_run = next(item for item in store.workflow_runs if item["id"] == "run-execution-ready")
     assert persisted_run["dispatch_context"]["protocol"]["request_id"] == payload["request_id"]
+
+
+def test_workflow_dispatcher_service_preserves_retry_attempt_from_run_protocol(monkeypatch) -> None:
+    execution_subject = getattr(dispatcher_module, "WORKFLOW_EXECUTION_SUBJECT", None)
+    if not execution_subject:
+        pytest.skip("execution worker subject is not available in this branch")
+
+    event_bus = FakeEventBus()
+    persistence = FakePersistence()
+    service = WorkflowDispatcherService(
+        event_bus=event_bus,
+        persistence=persistence,
+        dispatcher_id="dispatcher-a",
+    )
+
+    run = _workflow_run("run-execution-retry", dispatch_failure_count=0)
+    run["task_id"] = "task-run-execution-retry"
+    run["workflow_id"] = "workflow-1"
+    run["dispatch_context"] = {
+        "state": "queued",
+        "execution_agent_id": "search",
+        "protocol": {
+            "request_id": "req-execution-retry",
+            "correlation_id": "msg-execution-retry-1",
+            "message_id": "msg-execution-retry-1",
+            "attempt": 2,
+            "max_attempts": 4,
+            "last_error": "retry boom",
+        },
+    }
+    store.workflow_runs.insert(0, run)
+
+    monkeypatch.setattr(
+        workflow_execution_service,
+        "dispatch_workflow_run",
+        lambda run_id: {"id": run_id, "status": "running"},
+    )
+    monkeypatch.setattr(
+        workflow_execution_service,
+        "execute_workflow_run",
+        lambda _run_id: (_ for _ in ()).throw(
+            AssertionError("retry-ready run should stay on execution worker path")
+        ),
+    )
+
+    result = service.process_tick("run-execution-retry", step_delay=0.65)
+
+    assert result is not None
+    execution_events = [item for item in event_bus.published if item[0] == execution_subject]
+    assert len(execution_events) == 1
+    payload = execution_events[0][1]
+    assert payload["attempt"] == 2
+    assert payload["max_attempts"] == 4
+    assert payload["request_id"] == "req-execution-retry"
 
 
 def test_workflow_dispatcher_service_dispatch_ready_run_normalizes_camel_case_handoff_fields(

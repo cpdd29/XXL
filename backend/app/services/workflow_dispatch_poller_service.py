@@ -6,6 +6,7 @@ from threading import Event, Lock, Thread
 
 from app.core.agent_protocol import protocol_from_dispatch_context
 from app.services.persistence_service import persistence_service
+from app.services.scheduler_guard_service import scheduler_guard_service
 from app.services.store import store
 from app.services.workflow_dispatcher_service import (
     DEFAULT_DISPATCH_FAILURE_RETRY_DELAY_SECONDS,
@@ -86,6 +87,10 @@ class WorkflowDispatchPollerService:
             "skipped_scheduled": 0,
             "skipped_terminal": 0,
         }
+        scheduler_guard_service.guard_dispatch_runtime(
+            now=_utc_now(),
+            persistence=self._persistence,
+        )
         try:
             from app.services.workflow_service import poll_scheduled_workflows
 
