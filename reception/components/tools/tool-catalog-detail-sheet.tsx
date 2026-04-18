@@ -28,24 +28,24 @@ const healthClasses: Record<ToolHealthStatus, string> = {
 
 const sourceTypeLabels: Record<ToolSource['type'], string> = {
   internal: '内部',
-  local_tool: 'Legacy Fallback',
+  local_tool: '本地兜底',
   external_repo: '外部仓库',
-  mcp_server: 'MCP Server',
+  mcp_server: 'MCP 服务',
   unknown: '未知来源',
 }
 
 const toolTypeLabels: Record<Tool['type'], string> = {
-  skill: 'Skill',
-  tool: 'Tool',
+  skill: '技能',
+  tool: '工具',
   mcp: 'MCP',
   unknown: '未分类',
 }
 
 const sourceModeLabels: Record<string, string> = {
-  external_only: 'external_only',
-  hybrid: 'hybrid',
-  local_only: 'local_only',
-  unknown: 'unknown',
+  external_only: '全外接',
+  hybrid: '混合接入',
+  local_only: '本地主导',
+  unknown: '未识别',
 }
 
 const sourceModeClasses: Record<string, string> = {
@@ -74,6 +74,10 @@ function normalizeSourceModeValue(value: string | null): string | null {
   if (!normalized) return null
   if (normalized === 'external_only' || normalized === 'hybrid' || normalized === 'local_only') return normalized
   return value
+}
+
+function boolLabel(value: boolean) {
+  return value ? '是' : '否'
 }
 
 function MultiBadge({ items, empty }: { items: string[]; empty: string }) {
@@ -119,9 +123,9 @@ function JsonPreview({ value, empty }: { value: Record<string, unknown> | null; 
 }
 
 const migrationStageLabel: Record<string, string> = {
-  retained: '保留',
-  bridging: '桥接中',
-  externalized: '已外置',
+  retained: '保留中',
+  bridging: '接入过渡中',
+  externalized: '已外接',
   pending_removal: '待删除',
   deprecated: '已弃用',
   unknown: '未知',
@@ -146,7 +150,7 @@ export function ToolDetailSheet({
         <SheetHeader className="border-b border-border/70 p-5 pr-12">
           <SheetTitle>{tool?.name ?? '能力详情'}</SheetTitle>
           <SheetDescription>
-            展示能力基本信息、I/O 结构、关联 Agent/workflow、权限与最近调用摘要。
+            展示能力基本信息、输入输出、关联主脑流程、权限要求与最近调用摘要。
           </SheetDescription>
         </SheetHeader>
         <ScrollArea className="h-[calc(100vh-5.5rem)]">
@@ -190,13 +194,13 @@ export function ToolDetailSheet({
                       <div className="mt-1 text-sm text-foreground">{tool.sourceName}</div>
                     </div>
                     <div>
-                      <div className="text-xs text-muted-foreground">迁移阶段</div>
+                      <div className="text-xs text-muted-foreground">接入阶段</div>
                       <div className="mt-1">
                         <Badge variant="secondary">{migrationStageLabel[tool.migrationStage] ?? tool.migrationStage}</Badge>
                       </div>
                     </div>
                     <div>
-                      <div className="text-xs text-muted-foreground">桥接模式</div>
+                      <div className="text-xs text-muted-foreground">接入方式</div>
                       <div className="mt-1 text-sm text-foreground">{tool.bridgeMode || '-'}</div>
                     </div>
                     <div>
@@ -207,28 +211,28 @@ export function ToolDetailSheet({
                   <div className="text-xs text-muted-foreground">{tool.description || '暂无描述'}</div>
                 </Section>
 
-                <Section title="I/O 结构" description="用于判断能力输入输出契约是否可用。">
+                <Section title="输入输出" description="用于判断这项能力接收什么、返回什么。">
                   <div className="space-y-3">
                     <div>
-                      <div className="mb-1 text-xs font-medium text-foreground">Input Schema</div>
+                      <div className="mb-1 text-xs font-medium text-foreground">输入结构</div>
                       <JsonPreview value={tool.inputSchema} empty="暂无输入结构定义" />
                     </div>
                     <div>
-                      <div className="mb-1 text-xs font-medium text-foreground">Output Schema</div>
+                      <div className="mb-1 text-xs font-medium text-foreground">输出结构</div>
                       <JsonPreview value={tool.outputSchema} empty="暂无输出结构定义" />
                     </div>
                   </div>
                 </Section>
 
-                <Section title="关联 Agent / Workflow">
+                <Section title="关联主脑流程">
                   <div className="space-y-3">
                     <div>
-                      <div className="mb-1 text-xs text-muted-foreground">关联 Agent</div>
-                      <MultiBadge items={tool.linkedAgents} empty="未关联 Agent" />
+                      <div className="mb-1 text-xs text-muted-foreground">关联执行角色</div>
+                      <MultiBadge items={tool.linkedAgents} empty="未关联执行角色" />
                     </div>
                     <div>
-                      <div className="mb-1 text-xs text-muted-foreground">关联 Workflow</div>
-                      <MultiBadge items={tool.linkedWorkflows} empty="未关联 Workflow" />
+                      <div className="mb-1 text-xs text-muted-foreground">关联工作流</div>
+                      <MultiBadge items={tool.linkedWorkflows} empty="未关联工作流" />
                     </div>
                     <div>
                       <div className="mb-1 text-xs text-muted-foreground">能力标签</div>
@@ -243,13 +247,13 @@ export function ToolDetailSheet({
                       <div className="mb-1 text-xs text-muted-foreground">权限要求</div>
                       <MultiBadge items={tool.requiredPermissions} empty="当前未声明权限要求" />
                       <div className="mt-2 rounded-md border border-border/70 bg-background/60 p-3 text-xs text-muted-foreground">
-                        requiresPermission: {tool.permissions.requiresPermission ? 'true' : 'false'} | approvalRequired:{' '}
-                        {tool.permissions.approvalRequired ? 'true' : 'false'} | executionScope:{' '}
+                        需要权限控制: {boolLabel(tool.permissions.requiresPermission)} | 需要人工审批:{' '}
+                        {boolLabel(tool.permissions.approvalRequired)} | 生效范围:{' '}
                         {tool.permissions.executionScope || '-'}
                       </div>
                     </div>
                     <div>
-                      <div className="text-xs text-muted-foreground">Provider / Config 摘要</div>
+                      <div className="text-xs text-muted-foreground">接入说明</div>
                       <div className="mt-1 space-y-1 text-sm">
                         <div className="text-foreground">{tool.providerSummary || '-'}</div>
                         <div className="text-xs leading-5 text-muted-foreground">{tool.configSummary || '-'}</div>
@@ -294,7 +298,7 @@ export function ToolDetailSheet({
                   </div>
                   {tool.invocationSummary.lastError ? (
                     <div className="rounded-md border border-destructive/40 bg-destructive/10 p-3 text-xs text-destructive">
-                      lastError: {tool.invocationSummary.lastError}
+                      最近错误: {tool.invocationSummary.lastError}
                     </div>
                   ) : null}
                 </Section>
@@ -339,7 +343,7 @@ export function ToolSourceDetailSheet({
       <SheetContent side="right" className="w-full gap-0 p-0 sm:max-w-xl">
         <SheetHeader className="border-b border-border/70 p-5 pr-12">
           <SheetTitle>{source?.name ?? '来源详情'}</SheetTitle>
-          <SheetDescription>展示来源健康状态、扫描信息、绑定能力与配置。</SheetDescription>
+          <SheetDescription>展示来源健康状态、扫描信息、绑定能力与接入说明。</SheetDescription>
         </SheetHeader>
         <ScrollArea className="h-[calc(100vh-5.5rem)]">
           <div className="space-y-4 p-5">
@@ -377,7 +381,7 @@ export function ToolSourceDetailSheet({
                       <div className="mt-1 text-foreground">{source.scannedCapabilityCount}</div>
                     </div>
                     <div className="md:col-span-2">
-                      <div className="text-xs text-muted-foreground">治理状态</div>
+                      <div className="text-xs text-muted-foreground">接入策略</div>
                       <div className="mt-1 flex flex-wrap items-center gap-2">
                         {source.sourceMode ? (
                           <Badge
@@ -388,28 +392,28 @@ export function ToolSourceDetailSheet({
                                 sourceModeClasses.unknown,
                             )}
                           >
-                            source_mode:{' '}
+                            当前模式:{' '}
                             {sourceModeLabels[normalizeSourceModeValue(source.sourceMode) ?? source.sourceMode] ??
                               source.sourceMode}
                           </Badge>
                         ) : (
                           <Badge variant="secondary" className="text-xs text-muted-foreground">
-                            source_mode: 未声明
+                            当前模式: 未声明
                           </Badge>
                         )}
                         {source.activationMode ? (
                           <Badge variant="secondary" className="text-xs">
-                            activation_mode: {source.activationMode}
+                            启用方式: {source.activationMode}
                           </Badge>
                         ) : null}
                         {source.legacyFallback ? (
                           <Badge variant="secondary" className="bg-warning/20 text-xs text-warning-foreground">
-                            legacy fallback
+                            本地兜底
                           </Badge>
                         ) : null}
                         {source.deprecated ? (
                           <Badge variant="secondary" className="bg-destructive/15 text-xs text-destructive">
-                            deprecated
+                            已弃用
                           </Badge>
                         ) : null}
                       </div>
@@ -454,8 +458,8 @@ export function ToolSourceDetailSheet({
 
                 <Section title="来源关联关系">
                   <div>
-                    <div className="mb-1 text-xs text-muted-foreground">关联 Agent</div>
-                    <MultiBadge items={source.linkedAgents} empty="未关联 Agent" />
+                    <div className="mb-1 text-xs text-muted-foreground">关联执行角色</div>
+                    <MultiBadge items={source.linkedAgents} empty="未关联执行角色" />
                   </div>
                   <div className="pt-2">
                     <div className="mb-1 text-xs text-muted-foreground">来源下能力</div>
@@ -463,31 +467,31 @@ export function ToolSourceDetailSheet({
                   </div>
                 </Section>
 
-                <Section title="Provider / Config">
+                <Section title="接入说明">
                   <div className="space-y-2 text-sm">
                     <div>
-                      <div className="text-xs text-muted-foreground">Provider 摘要</div>
+                      <div className="text-xs text-muted-foreground">接入摘要</div>
                       <div className="mt-1 text-foreground">{source.providerSummary || '-'}</div>
                     </div>
                     <div>
-                      <div className="text-xs text-muted-foreground">Config 摘要</div>
+                      <div className="text-xs text-muted-foreground">配置摘要</div>
                       <div className="mt-1 text-xs leading-5 text-muted-foreground">{source.configSummary || '-'}</div>
                     </div>
                   </div>
                 </Section>
-                <Section title="治理与桥接摘要">
+                <Section title="治理与接入摘要">
                   <div className="space-y-3">
                     <div>
-                      <div className="mb-1 text-xs text-muted-foreground">Registry</div>
-                      <JsonPreview value={source.registrySummary} empty="暂无 registry 摘要" />
+                      <div className="mb-1 text-xs text-muted-foreground">注册信息</div>
+                      <JsonPreview value={source.registrySummary} empty="暂无注册信息摘要" />
                     </div>
                     <div>
-                      <div className="mb-1 text-xs text-muted-foreground">Bridge</div>
-                      <JsonPreview value={source.bridgeSummary} empty="暂无 bridge 摘要" />
+                      <div className="mb-1 text-xs text-muted-foreground">接入桥接</div>
+                      <JsonPreview value={source.bridgeSummary} empty="暂无桥接摘要" />
                     </div>
                     <div>
-                      <div className="mb-1 text-xs text-muted-foreground">Doctor</div>
-                      <JsonPreview value={source.doctorSummary} empty="暂无 doctor 摘要" />
+                      <div className="mb-1 text-xs text-muted-foreground">诊断摘要</div>
+                      <JsonPreview value={source.doctorSummary} empty="暂无诊断摘要" />
                     </div>
                   </div>
                 </Section>

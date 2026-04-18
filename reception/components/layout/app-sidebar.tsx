@@ -3,14 +3,11 @@
 import Link from "next/link"
 import { usePathname } from "next/navigation"
 import {
-  AlertTriangle,
   Bot,
-  CheckCircle2,
+  Building2,
   GitBranch,
   Headphones,
-  Layers3,
   LayoutDashboard,
-  Link2,
   ListTodo,
   Settings,
   Shield,
@@ -36,64 +33,58 @@ type NavSection = {
 
 const navSections: NavSection[] = [
   {
-    title: "工作台",
+    title: "总控视图",
     items: [
       {
-        title: "总览",
+        title: "主脑总控台",
         href: "/dashboard",
         icon: LayoutDashboard,
         permission: "dashboard:read",
       },
       {
-        title: "待办中心",
-        href: "/reception",
-        icon: Headphones,
-      },
-      {
-        title: "任务中心",
+        title: "执行任务",
         href: "/tasks",
         icon: ListTodo,
         permission: "tasks:read",
       },
-    ],
-  },
-  {
-    title: "风险中心",
-    items: [
       {
-        title: "安全中心",
-        href: "/security",
-        icon: Shield,
-        permission: "security:read",
+        title: "待人工处理",
+        href: "/reception",
+        icon: Headphones,
       },
       {
-        title: "告警中心",
-        href: "/security/alerts",
-        icon: AlertTriangle,
-        permission: "security:read",
+        title: "工作流",
+        href: "/workflow",
+        icon: GitBranch,
+        permission: "workflows:read",
       },
       {
-        title: "审批中心",
-        href: "/settings/approvals",
-        icon: CheckCircle2,
-        permission: "approvals:read",
-      },
-    ],
-  },
-  {
-    title: "能力接入",
-    items: [
-      {
-        title: "能力中心",
+        title: "skill/mcp 接入",
         href: "/tools",
         icon: Wrench,
         permission: "tool_sources:read",
       },
+    ],
+  },
+  {
+    title: "可视视图",
+    items: [
       {
-        title: "外接治理",
-        href: "/settings/external-capabilities",
-        icon: Link2,
-        permission: "external:read",
+        title: "摩天大厦",
+        href: "/visualization/skyscraper",
+        icon: Building2,
+        permission: "dashboard:read",
+      },
+    ],
+  },
+  {
+    title: "高级运维",
+    items: [
+      {
+        title: "风险与安全",
+        href: "/security",
+        icon: Shield,
+        permission: "security:read",
       },
       {
         title: "渠道接入",
@@ -102,10 +93,16 @@ const navSections: NavSection[] = [
         permission: "settings:read",
       },
       {
-        title: "工作流设计",
-        href: "/workflow",
-        icon: GitBranch,
-        permission: "workflows:read",
+        title: "模型接入",
+        href: "/settings/agent-api",
+        icon: Sparkles,
+        permission: "settings:read",
+      },
+      {
+        title: "Agent 管理",
+        href: "/agents",
+        icon: Bot,
+        permission: "agents:read",
       },
     ],
   },
@@ -113,34 +110,22 @@ const navSections: NavSection[] = [
     title: "系统设置",
     items: [
       {
-        title: "通用设置",
-        href: "/settings/general",
-        icon: Settings,
-        permission: "settings:read",
+        title: "租户管理",
+        href: "/settings/tenants",
+        icon: Building2,
+        permission: "users:read",
       },
       {
-        title: "模型与 Provider",
-        href: "/settings/agent-api",
-        icon: Sparkles,
-        permission: "settings:read",
-      },
-      {
-        title: "配置来源与优先级",
-        href: "/settings/governance",
-        icon: Layers3,
-        permission: "settings:read",
-      },
-      {
-        title: "用户管理",
+        title: "人员画像",
         href: "/users",
         icon: Users,
         permission: "users:read",
       },
       {
-        title: "Agent 管理",
-        href: "/agents",
-        icon: Bot,
-        permission: "agents:read",
+        title: "通用设置",
+        href: "/settings/general",
+        icon: Settings,
+        permission: "settings:read",
       },
     ],
   },
@@ -156,7 +141,8 @@ function isNavItemActive(pathname: string, href: string) {
     href === "/users" ||
     href === "/agents" ||
     href === "/tools" ||
-    href === "/workflow"
+    href === "/workflow" ||
+    href === "/visualization/skyscraper"
   ) {
     return pathname.startsWith(`${href}/`)
   }
@@ -182,7 +168,7 @@ export function AppSidebar() {
         </div>
         <div>
           <div className="text-lg font-semibold text-sidebar-foreground">WorkBot</div>
-          <div className="text-[11px] text-sidebar-foreground/60">主脑控制面</div>
+          <div className="text-[11px] text-sidebar-foreground/60">主脑运行总控台</div>
         </div>
       </div>
 

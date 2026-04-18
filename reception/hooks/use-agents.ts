@@ -3,7 +3,13 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { apiRequest } from '@/lib/api/client'
 import { queryKeys } from '@/lib/api/query-keys'
-import type { Agent, AgentActionResponse, AgentListResponse, AgentRuntimeStatus } from '@/types'
+import type {
+  Agent,
+  AgentActionResponse,
+  AgentConfigRequest,
+  AgentListResponse,
+  AgentRuntimeStatus,
+} from '@/types'
 
 export function useAgents() {
   return useQuery({
@@ -38,19 +44,47 @@ export function useReloadAgent() {
   const queryClient = useQueryClient()
 
   return useMutation({
-    mutationFn: async (agentId: string) => {
-      const payload = await apiRequest<AgentActionResponse>(`/api/agents/${encodeURIComponent(agentId)}/reload`, {
+    mutationFn: (agentId: string) =>
+      apiRequest<AgentActionResponse>(`/api/agents/${encodeURIComponent(agentId)}/reload`, {
         method: 'POST',
-      })
-      return {
-        message: payload.message,
-        agentId: payload.agent.id,
-        status: payload.agent.status,
-      }
-    },
+      }),
     onSuccess: (_, agentId) => {
       queryClient.invalidateQueries({ queryKey: queryKeys.agents.list })
       queryClient.invalidateQueries({ queryKey: queryKeys.agents.status(agentId) })
+    },
+  })
+}
+
+export function useCreateAgent() {
+  const queryClient = useQueryClient()
+
+  return useMutation({
+    mutationFn: (payload: AgentConfigRequest) =>
+      apiRequest<AgentActionResponse, AgentConfigRequest>('/api/agents', {
+        method: 'POST',
+        body: payload,
+      }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.agents.list })
+    },
+  })
+}
+
+export function useUpdateAgentConfig() {
+  const queryClient = useQueryClient()
+
+  return useMutation({
+    mutationFn: ({ agentId, payload }: { agentId: string; payload: AgentConfigRequest }) =>
+      apiRequest<AgentActionResponse, AgentConfigRequest>(
+        `/api/agents/${encodeURIComponent(agentId)}/config`,
+        {
+          method: 'PUT',
+          body: payload,
+        },
+      ),
+    onSuccess: (_, variables) => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.agents.list })
+      queryClient.invalidateQueries({ queryKey: queryKeys.agents.status(variables.agentId) })
     },
   })
 }

@@ -1,0 +1,23 @@
+policy:
+  execution_scope: "local_control_plane"
+  direct_external_execution: false
+  hidden_tool_access: false
+  publish_or_execute: false
+tools:
+  - name: "conversation_context_reader"
+    scope: "local"
+    mode: "read_only"
+    purpose: "读取当前会话上下文和最近轮次摘要。"
+  - name: "manager_packet_reader"
+    scope: "local"
+    mode: "read_only"
+    purpose: "读取主脑路由层提供的 manager packet。"
+  - name: "memory_summary_reader"
+    scope: "local"
+    mode: "read_only"
+    purpose: "读取已经治理过的记忆摘要，不访问原始长期记忆。"
+  - name: "grounding_summary_reader"
+    scope: "local"
+    mode: "read_only"
+    purpose: "读取已验证的外部依据摘要，避免无依据猜测。"
+mcp: []

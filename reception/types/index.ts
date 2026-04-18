@@ -1,6 +1,7 @@
 export * from '@/types/auth'
 export * from '@/types/agent'
 export * from '@/types/approval'
+export * from '@/types/brain-skill'
 export * from '@/types/collaboration'
 export * from '@/types/dashboard'
 export * from '@/types/external-connection'

@@ -40,6 +40,8 @@ DEFAULT_TRIGGER = {
     "max_dispatch_retry": 6,
     "dispatch_retry_backoff_seconds": 2.0,
     "execution_timeout_seconds": 45.0,
+    "natural_language_rule": None,
+    "schedule_plan": None,
 }
 logger = logging.getLogger(__name__)
 _INTERNAL_EVENT_DELIVERIES_BY_ID: dict[str, dict] = {}
@@ -47,6 +49,10 @@ _INTERNAL_EVENT_DELIVERIES_BY_KEY: dict[str, str] = {}
 WORKFLOW_STORAGE_UNAVAILABLE_DETAIL = "Workflow configuration storage unavailable"
 WORKFLOW_INTERNAL_TRIGGER_NOT_FOUND_DETAIL = "Workflow internal trigger not found"
 INTERNAL_EVENT_STATUS_IGNORED = "ignored"
+WORKFLOW_LIST_PRIORITY_BY_ID = {
+    "workflow-1": 0,
+    "mandatory-workflow-external-tentacle-dispatch": 1,
+}
 
 
 def _parse_datetime(value: str | None) -> datetime | None:
@@ -630,6 +636,12 @@ def _normalize_trigger(trigger: dict | str | None) -> dict:
         trigger.get("execution_timeout_seconds") or trigger.get("executionTimeoutSeconds"),
         default=float(DEFAULT_TRIGGER["execution_timeout_seconds"]),
     )
+    normalized["natural_language_rule"] = (
+        str(trigger.get("natural_language_rule") or trigger.get("naturalLanguageRule") or "").strip()
+        or None
+    )
+    raw_schedule_plan = trigger.get("schedule_plan") or trigger.get("schedulePlan")
+    normalized["schedule_plan"] = store.clone(raw_schedule_plan) if isinstance(raw_schedule_plan, dict) else None
     normalized["webhook_path"] = _normalize_webhook_path(normalized.get("webhook_path"))
     raw_internal_event = trigger.get("internal_event") or trigger.get("internalEvent")
     if normalized["type"] == "internal" and not raw_internal_event:
@@ -1458,6 +1470,13 @@ def list_workflows() -> dict:
         items = []
     else:
         items = store.clone(store.workflows)
+    items = sorted(
+        items,
+        key=lambda workflow: (
+            WORKFLOW_LIST_PRIORITY_BY_ID.get(str(workflow.get("id") or "").strip(), 100),
+            str(workflow.get("name") or "").strip(),
+        ),
+    )
     return {"items": items, "total": len(items)}
 
 

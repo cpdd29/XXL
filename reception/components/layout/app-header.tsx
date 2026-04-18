@@ -21,7 +21,7 @@ export function AppHeader() {
         <div className="relative">
           <Search className="absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
           <Input
-            placeholder="搜索工作流、Agent、任务..."
+            placeholder="搜索工作流、执行任务、skill/mcp 接入..."
             className="w-80 bg-secondary pl-10"
           />
         </div>
@@ -54,7 +54,7 @@ export function AppHeader() {
 
         <div className="ml-2 flex items-center gap-2 border-l border-border pl-4">
           <div className="flex size-2 animate-pulse rounded-full bg-success" />
-          <span className="text-sm text-muted-foreground">系统正常</span>
+          <span className="text-sm text-muted-foreground">主脑正常</span>
         </div>
       </div>
     </header>

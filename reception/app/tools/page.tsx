@@ -1,10 +1,14 @@
 "use client"
 
 import { startTransition, useDeferredValue, useMemo, useState } from "react"
+import { BrainSkillManagementActions } from "@/components/tools/brain-skill-management-actions"
+import { BrainSkillRegistrationActions } from "@/components/tools/brain-skill-registration-actions"
 import { ToolDetailSheet, ToolSourceDetailSheet } from "@/components/tools/tool-catalog-detail-sheet"
+import { ToolManagementActions, isControlPlaneManagedTool } from "@/components/tools/tool-management-actions"
+import { useBrainSkills } from "@/hooks/use-brain-skills"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
+import { Card, CardContent } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
 import { Skeleton } from "@/components/ui/skeleton"
 import {
@@ -26,21 +30,23 @@ import {
 import { useToolSourceDetail, useToolSources } from "@/hooks/use-tool-sources"
 import { useToolDetail, useTools } from "@/hooks/use-tools"
 import { cn } from "@/lib/utils"
-import type { Tool, ToolHealthStatus, ToolSource, ToolSourceType, ToolType } from "@/types"
+import type { BrainSkillItem, Tool, ToolHealthStatus, ToolSource, ToolSourceType, ToolType } from "@/types"
 import { RefreshCw, Search, Wrench } from "lucide-react"
 
+const BRAIN_PRIVATE_SOURCE_ID = "local-agents"
+
 const toolTypeLabels: Record<ToolType, string> = {
-  skill: "Skill",
-  tool: "Tool",
+  skill: "技能",
+  tool: "工具",
   mcp: "MCP",
   unknown: "未分类",
 }
 
 const sourceTypeLabels: Record<ToolSourceType, string> = {
   internal: "内部",
-  local_tool: "Legacy Fallback",
+  local_tool: "本地兜底",
   external_repo: "外部仓库",
-  mcp_server: "MCP Server",
+  mcp_server: "MCP 服务",
   unknown: "未知来源",
 }
 
@@ -66,9 +72,9 @@ const healthPriority: Record<ToolHealthStatus, number> = {
 }
 
 const migrationStageLabel: Record<string, string> = {
-  retained: "保留",
-  bridging: "桥接中",
-  externalized: "已外置",
+  retained: "保留中",
+  bridging: "接入过渡中",
+  externalized: "已外接",
   pending_removal: "待删除",
   deprecated: "已弃用",
   unknown: "未知",
@@ -84,11 +90,11 @@ const migrationStageClass: Record<string, string> = {
 }
 
 const sourceModeLabels: Record<string, string> = {
-  external_only: "external_only",
-  hybrid: "hybrid",
-  local_only: "local_only",
-  unknown: "unknown",
-  mixed: "mixed",
+  external_only: "全外接",
+  hybrid: "混合接入",
+  local_only: "本地主导",
+  unknown: "未识别",
+  mixed: "多种模式",
 }
 
 const sourceModeClasses: Record<string, string> = {
@@ -97,6 +103,10 @@ const sourceModeClasses: Record<string, string> = {
   local_only: "bg-secondary text-foreground",
   unknown: "bg-muted text-muted-foreground",
   mixed: "bg-warning/20 text-warning-foreground",
+}
+
+function boolLabel(value: boolean) {
+  return value ? "是" : "否"
 }
 
 function toDisplayDate(value: string | null) {
@@ -130,8 +140,8 @@ function isRecentlyInvoked(tool: Tool) {
   return tool.invocationSummary.callCount > 0 || Boolean(tool.invocationSummary.lastCalledAt)
 }
 
-function isExternalSource(source: ToolSource) {
-  return source.type === "external_repo" || source.type === "mcp_server"
+function isBrainPrivateTool(tool: Tool) {
+  return tool.sourceId === BRAIN_PRIVATE_SOURCE_ID || tool.sourceKind === "local_agents"
 }
 
 function normalizeSourceModeValue(value: string | null): string | null {
@@ -264,14 +274,14 @@ function SourceTypeSelect({
   return (
     <Select value={value} onValueChange={onChange}>
       <SelectTrigger className="w-full bg-background sm:w-[180px]">
-        <SelectValue placeholder="来源类型" />
+        <SelectValue placeholder="类型" />
       </SelectTrigger>
         <SelectContent>
-          <SelectItem value="all">全部来源类型</SelectItem>
+          <SelectItem value="all">全部类型</SelectItem>
           <SelectItem value="internal">内部</SelectItem>
-          <SelectItem value="local_tool">Legacy Fallback</SelectItem>
+          <SelectItem value="local_tool">本地兜底</SelectItem>
           <SelectItem value="external_repo">外部仓库</SelectItem>
-          <SelectItem value="mcp_server">MCP Server</SelectItem>
+          <SelectItem value="mcp_server">MCP 服务</SelectItem>
           <SelectItem value="unknown">未知来源</SelectItem>
       </SelectContent>
     </Select>
@@ -290,17 +300,17 @@ function SourceGovernanceBadges({ source }: { source: ToolSource }) {
       ) : null}
       {source.activationMode ? (
         <Badge variant="secondary" className="text-xs">
-          activation: {source.activationMode}
+          启用方式: {source.activationMode}
         </Badge>
       ) : null}
       {source.legacyFallback ? (
         <Badge variant="secondary" className="bg-warning/20 text-xs text-warning-foreground">
-          legacy fallback
+          本地兜底
         </Badge>
       ) : null}
       {source.deprecated ? (
         <Badge variant="secondary" className="bg-destructive/15 text-xs text-destructive">
-          deprecated
+          已弃用
         </Badge>
       ) : null}
       {!mode && !source.activationMode && !source.legacyFallback && !source.deprecated ? (
@@ -310,16 +320,53 @@ function SourceGovernanceBadges({ source }: { source: ToolSource }) {
   )
 }
 
+function getBrainSkillFileName(skill: BrainSkillItem) {
+  if (skill.fileName?.trim()) return skill.fileName.trim()
+  return skill.name
+}
+
+function getBrainSkillFormat(skill: BrainSkillItem) {
+  if (skill.format?.trim()) return skill.format.trim().toUpperCase()
+  const fileName = getBrainSkillFileName(skill)
+  const extension = fileName.includes(".") ? fileName.split(".").pop() ?? "" : ""
+  if (extension.trim()) return extension.trim().toUpperCase()
+  return "-"
+}
+
+function getBrainSkillDescription(skill: BrainSkillItem) {
+  return skill.description?.trim() || "-"
+}
+
+function getBrainSkillUploadedAt(skill: BrainSkillItem) {
+  return skill.uploadedAt ?? null
+}
+
+function getBrainSkillCapabilities(skill: BrainSkillItem) {
+  const values = [...(skill.capabilities ?? []), ...(skill.tags ?? [])]
+  return [...new Set(values.map((item) => item.trim()).filter(Boolean))]
+}
+
+function getBrainSkillSearchValues(skill: BrainSkillItem) {
+  return [
+    skill.name,
+    getBrainSkillFileName(skill),
+    skill.format,
+    skill.description,
+    ...(skill.capabilities ?? []),
+    ...(skill.tags ?? []),
+  ]
+    .filter(Boolean)
+    .map((value) => String(value).toLowerCase())
+}
+
 export default function ToolsPage() {
   const [activeTab, setActiveTab] = useState("tools")
   const [searchQuery, setSearchQuery] = useState("")
   const [toolTypeFilter, setToolTypeFilter] = useState("all")
   const [toolSourceFilter, setToolSourceFilter] = useState("all")
-  const [toolMigrationFilter, setToolMigrationFilter] = useState("all")
-  const [toolHealthFilter, setToolHealthFilter] = useState("all")
   const [toolEnabledFilter, setToolEnabledFilter] = useState("all")
   const [sourceTypeFilter, setSourceTypeFilter] = useState("all")
-  const [sourceHealthFilter, setSourceHealthFilter] = useState("all")
+  const [sourceNameFilter, setSourceNameFilter] = useState("all")
   const [sourceEnabledFilter, setSourceEnabledFilter] = useState("all")
   const [selectedToolId, setSelectedToolId] = useState<string | null>(null)
   const [selectedSourceId, setSelectedSourceId] = useState<string | null>(null)
@@ -347,24 +394,36 @@ export default function ToolsPage() {
     isFetching: toolDetailFetching,
     refetch: refetchToolDetail,
   } = useToolDetail(selectedToolId)
+  const {
+    data: brainSkillsData,
+    isLoading: brainSkillsLoading,
+    isFetching: brainSkillsFetching,
+    error: brainSkillsError,
+    refetch: refetchBrainSkills,
+  } = useBrainSkills()
 
   const tools = toolsData?.items ?? []
   const sources = sourceData?.items ?? []
-  const governanceSummary = sourceData?.governanceSummary ?? null
-  const selectedToolFromList = tools.find((tool) => tool.id === selectedToolId) ?? null
+  const externalTools = tools.filter((tool) => !isBrainPrivateTool(tool))
+  const externalSources = sources.filter((source) => source.id !== BRAIN_PRIVATE_SOURCE_ID)
+  const brainSkills = brainSkillsData?.items ?? []
+  const selectedToolFromList = externalTools.find((tool) => tool.id === selectedToolId) ?? null
   const selectedTool = toolDetailData ?? selectedToolFromList
   const selectedSourceFromTools =
-    sources.find((source) => source.id === selectedTool?.sourceId) ??
-    sources.find((source) => source.name === selectedTool?.sourceName) ??
+    externalSources.find((source) => source.id === selectedTool?.sourceId) ??
+    externalSources.find((source) => source.name === selectedTool?.sourceName) ??
     null
-  const selectedSource = sourceDetailData ?? sources.find((source) => source.id === selectedSourceId) ?? null
+  const selectedSource = sourceDetailData ?? externalSources.find((source) => source.id === selectedSourceId) ?? null
 
-  const sourceNameOptions = [...new Set(tools.map((tool) => tool.sourceName).filter(Boolean))].sort((a, b) =>
+  const toolSourceNameOptions = [...new Set(externalTools.map((tool) => tool.sourceName).filter(Boolean))].sort((a, b) =>
+    a.localeCompare(b, "zh-CN"),
+  )
+  const sourceNameOptions = [...new Set(externalSources.map((source) => source.name).filter(Boolean))].sort((a, b) =>
     a.localeCompare(b, "zh-CN"),
   )
 
   const filteredTools = useMemo(() => {
-    const matched = tools.filter((tool) => {
+    const matched = externalTools.filter((tool) => {
       const matchesSearch =
         !deferredSearch ||
         tool.name.toLowerCase().includes(deferredSearch) ||
@@ -379,29 +438,19 @@ export default function ToolsPage() {
 
       const matchesType = toolTypeFilter === "all" || tool.type === toolTypeFilter
       const matchesSource = toolSourceFilter === "all" || tool.sourceName === toolSourceFilter
-      const matchesMigration = toolMigrationFilter === "all" || tool.migrationStage === toolMigrationFilter
-      const matchesHealth = toolHealthFilter === "all" || tool.healthStatus === toolHealthFilter
       const matchesEnabled =
         toolEnabledFilter === "all" ||
         (toolEnabledFilter === "enabled" && tool.enabled) ||
         (toolEnabledFilter === "disabled" && !tool.enabled)
 
-      return matchesSearch && matchesType && matchesSource && matchesMigration && matchesHealth && matchesEnabled
+      return matchesSearch && matchesType && matchesSource && matchesEnabled
     })
 
     return sortToolsByPriority(matched)
-  }, [
-    deferredSearch,
-    toolEnabledFilter,
-    toolHealthFilter,
-    toolMigrationFilter,
-    toolSourceFilter,
-    toolTypeFilter,
-    tools,
-  ])
+  }, [deferredSearch, externalTools, toolEnabledFilter, toolSourceFilter, toolTypeFilter])
 
   const filteredSources = useMemo(() => {
-    const matched = sources.filter((source) => {
+    const matched = externalSources.filter((source) => {
       const matchesSearch =
         !deferredSearch ||
         source.name.toLowerCase().includes(deferredSearch) ||
@@ -413,208 +462,98 @@ export default function ToolsPage() {
         source.linkedAgents.some((agent) => agent.toLowerCase().includes(deferredSearch))
 
       const matchesType = sourceTypeFilter === "all" || source.type === sourceTypeFilter
-      const matchesHealth = sourceHealthFilter === "all" || source.healthStatus === sourceHealthFilter
+      const matchesSource = sourceNameFilter === "all" || source.name === sourceNameFilter
       const matchesEnabled =
         sourceEnabledFilter === "all" ||
         (sourceEnabledFilter === "enabled" && source.enabled) ||
         (sourceEnabledFilter === "disabled" && !source.enabled)
 
-      return matchesSearch && matchesType && matchesHealth && matchesEnabled
+      return matchesSearch && matchesType && matchesSource && matchesEnabled
     })
 
     return sortSourcesByPriority(matched)
-  }, [
-    deferredSearch,
-    sourceEnabledFilter,
-    sourceHealthFilter,
-    sourceTypeFilter,
-    sources,
-  ])
+  }, [deferredSearch, externalSources, sourceEnabledFilter, sourceNameFilter, sourceTypeFilter])
 
-  const toolHealthStats = {
-    healthy: tools.filter((tool) => tool.healthStatus === "healthy").length,
-    degraded: tools.filter((tool) => tool.healthStatus === "degraded").length,
-    unhealthy: tools.filter((tool) => tool.healthStatus === "unhealthy").length,
-  }
+  const filteredBrainSkills = useMemo(() => {
+    return brainSkills
+      .filter((skill) => {
+        if (!deferredSearch) return true
+        return getBrainSkillSearchValues(skill).some((value) => value.includes(deferredSearch))
+      })
+      .sort((left, right) => {
+        const uploadedDiff = toTimestamp(getBrainSkillUploadedAt(right)) - toTimestamp(getBrainSkillUploadedAt(left))
+        if (uploadedDiff !== 0) return uploadedDiff
+        return left.name.localeCompare(right.name, "zh-CN")
+      })
+  }, [brainSkills, deferredSearch])
 
-  const sourceHealthStats = {
-    healthy: sources.filter((source) => source.healthStatus === "healthy").length,
-    degraded: sources.filter((source) => source.healthStatus === "degraded").length,
-    unhealthy: sources.filter((source) => source.healthStatus === "unhealthy").length,
-  }
-
-  const availableToolCount = tools.filter(isCurrentlyAvailable).length
-  const enabledToolCount = tools.filter((tool) => tool.enabled).length
-  const connectableToolCount = tools.filter(isConnectableTool).length
-  const recentInvokedToolCount = tools.filter(isRecentlyInvoked).length
-  const externalSourceCount = sources.filter(isExternalSource).length
-  const sourceTypeStats = {
-    internal: sources.filter((source) => source.type === "internal").length,
-    local_tool: sources.filter((source) => source.type === "local_tool").length,
-    external_repo: sources.filter((source) => source.type === "external_repo").length,
-    mcp_server: sources.filter((source) => source.type === "mcp_server").length,
-  }
-  const legacyFallbackCount = sources.filter((source) => source.legacyFallback).length
-  const deprecatedSourceCount = sources.filter((source) => source.deprecated).length
-  const activationModes = [...new Set(sources.map((source) => source.activationMode).filter(Boolean))] as string[]
-  const declaredModes = [
-    ...new Set(sources.map((source) => normalizeSourceModeValue(source.sourceMode)).filter(Boolean)),
-  ] as string[]
-  const declaredGlobalMode = normalizeSourceModeValue(
-    typeof governanceSummary?.mode === "string" ? governanceSummary.mode : null,
-  )
-  const runtimeMode = (() => {
-    if (declaredGlobalMode) return declaredGlobalMode
-    if (declaredModes.length === 1) return declaredModes[0]
-    if (declaredModes.length > 1) return "mixed"
-    if (sources.length === 0) return "unknown"
-    const externalCount = sources.filter(isExternalSource).length
-    const localCount = sources.filter((source) => source.type === "local_tool" || source.type === "internal").length
-    if (externalCount > 0 && localCount === 0) return "external_only"
-    if (externalCount > 0 && localCount > 0) return "hybrid"
-    if (externalCount === 0 && localCount > 0) return "local_only"
-    return "unknown"
-  })()
-  const totalScannedCapabilities = tools.reduce((total, tool) => total + tool.capabilityCount, 0)
-  const isRefreshing = toolsFetching || sourcesFetching
+  const totalScannedCapabilities = externalTools.reduce((total, tool) => total + tool.capabilityCount, 0)
+  const isRefreshing = toolsFetching || sourcesFetching || brainSkillsFetching
 
   const relatedToolNamesForSource = selectedSource
     ? sortToolsByPriority(
-        tools.filter((tool) => tool.sourceId === selectedSource.id || tool.sourceName === selectedSource.name),
+        externalTools.filter((tool) => tool.sourceId === selectedSource.id || tool.sourceName === selectedSource.name),
       ).map((tool) => tool.name)
     : []
 
   const handleRefresh = async () => {
-    await Promise.all([refetchTools(), refetchSources()])
+    await Promise.all([refetchTools(), refetchSources(), refetchBrainSkills()])
     if (selectedToolId) {
       await refetchToolDetail()
+    }
+  }
+
+  const handleToolDeleted = (toolId: string) => {
+    if (selectedToolId === toolId) {
+      setSelectedToolId(null)
+      setToolDetailOpen(false)
     }
   }
 
   return (
     <>
       <div className="flex h-full min-h-0 w-full flex-col p-6">
-        <div className="mb-6 flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
-          <div>
-            <h1 className="text-2xl font-bold text-foreground">能力中心</h1>
-            <p className="text-sm text-muted-foreground">
-              统一查看当前系统中已扫描的 Skill / MCP / Tool 以及外部来源状态。
-            </p>
-          </div>
-          <Button variant="outline" size="sm" onClick={() => void handleRefresh()} disabled={isRefreshing}>
-            <RefreshCw className={cn("mr-2 size-4", isRefreshing && "animate-spin")} />
-            {isRefreshing ? "同步中..." : "刷新"}
-          </Button>
-        </div>
+        <Card className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-card">
+          <CardContent className="flex min-h-0 min-w-0 flex-1 flex-col space-y-4 p-6">
+            <Tabs value={activeTab} onValueChange={setActiveTab} className="flex min-h-0 w-full flex-1 min-w-0 flex-col">
+              <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
+                <TabsList className="grid w-full grid-cols-3 md:w-[520px]">
+                  <TabsTrigger value="tools">触手能力</TabsTrigger>
+                  <TabsTrigger value="sources">触手来源</TabsTrigger>
+                  <TabsTrigger value="brain-skills">主脑 Skill</TabsTrigger>
+                </TabsList>
 
-        <div className="mb-6 grid gap-3 sm:grid-cols-2 lg:grid-cols-5">
-          <Card className="bg-card">
-            <CardContent className="p-4">
-              <div className="text-xs text-muted-foreground">能力总数</div>
-              <div className="mt-1 text-2xl font-semibold text-foreground">{tools.length}</div>
-            </CardContent>
-          </Card>
-          <Card className="bg-card">
-            <CardContent className="p-4">
-              <div className="text-xs text-muted-foreground">已启用能力</div>
-              <div className="mt-1 text-2xl font-semibold text-success">{enabledToolCount}</div>
-            </CardContent>
-          </Card>
-          <Card className="bg-card">
-            <CardContent className="p-4">
-              <div className="text-xs text-muted-foreground">可接入能力</div>
-              <div className="mt-1 text-2xl font-semibold text-success">{availableToolCount}</div>
-              <div className="mt-1 text-[11px] text-muted-foreground">未启用且健康状态可接入：{connectableToolCount}</div>
-            </CardContent>
-          </Card>
-          <Card className="bg-card">
-            <CardContent className="p-4">
-              <div className="text-xs text-muted-foreground">外部来源</div>
-              <div className="mt-1 text-2xl font-semibold text-foreground">{externalSourceCount}</div>
-              <div className="mt-1 text-[11px] text-muted-foreground">总来源 {sources.length}</div>
-            </CardContent>
-          </Card>
-          <Card className="bg-card">
-            <CardContent className="p-4">
-              <div className="text-xs text-muted-foreground">最近被调用能力</div>
-              <div className="mt-1 text-2xl font-semibold text-foreground">{recentInvokedToolCount}</div>
-            </CardContent>
-          </Card>
-        </div>
-
-        <Card className="mb-6 border-primary/30 bg-primary/5">
-          <CardContent className="p-4">
-            <div className="flex flex-col gap-2 lg:flex-row lg:items-center lg:justify-between">
-              <div>
-                <div className="text-xs text-muted-foreground">治理状态</div>
-                <div className="mt-1 flex flex-wrap items-center gap-2">
-                  <Badge variant="secondary" className={cn("text-xs", sourceModeClasses[runtimeMode] ?? sourceModeClasses.unknown)}>
-                    运行模式: {sourceModeLabels[runtimeMode] ?? runtimeMode}
-                  </Badge>
-                  {declaredModes.length === 0 ? (
-                    <Badge variant="secondary" className="text-xs text-muted-foreground">
-                      mode: {declaredGlobalMode ? "governance" : "inferred"}
-                    </Badge>
-                  ) : (
-                    <Badge variant="secondary" className="text-xs">
-                      mode: {declaredGlobalMode ? "governance" : "declared"}
-                    </Badge>
-                  )}
+                <div className="flex w-full flex-col gap-3 sm:flex-row sm:items-center xl:w-auto">
+                  <div className="relative w-full xl:w-80">
+                    <Search className="absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
+                    <Input
+                      placeholder={
+                        activeTab === "brain-skills"
+                          ? "搜索 Skill 名称 / 文件名 / 标签..."
+                          : "搜索名称 / 来源 / 关联角色 / 接入说明..."
+                      }
+                      value={searchQuery}
+                      onChange={(event) =>
+                        startTransition(() => {
+                          setSearchQuery(event.target.value)
+                        })
+                      }
+                      className="w-full bg-secondary pl-10"
+                    />
+                  </div>
+                  {activeTab === "brain-skills" ? <BrainSkillRegistrationActions /> : null}
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => void handleRefresh()}
+                    disabled={isRefreshing}
+                    className="shrink-0"
+                  >
+                    <RefreshCw className={cn("mr-2 size-4", isRefreshing && "animate-spin")} />
+                    {isRefreshing ? "同步中..." : "刷新"}
+                  </Button>
                 </div>
               </div>
-              <div className="flex flex-wrap items-center gap-2 text-xs">
-                <Badge variant="secondary" className={legacyFallbackCount > 0 ? "bg-warning/20 text-warning-foreground" : "text-muted-foreground"}>
-                  legacy fallback {legacyFallbackCount}
-                </Badge>
-                <Badge variant="secondary" className={deprecatedSourceCount > 0 ? "bg-destructive/15 text-destructive" : "text-muted-foreground"}>
-                  deprecated {deprecatedSourceCount}
-                </Badge>
-                <Badge variant="secondary" className="text-xs">
-                  activation_mode {activationModes.length}
-                </Badge>
-              </div>
-            </div>
-            {runtimeMode !== "external_only" ? (
-              <div className="mt-3 rounded-lg border border-warning/40 bg-warning/10 px-3 py-2 text-xs text-warning-foreground">
-                当前不是 `external_only` 主链模式，系统仍允许部分 legacy fallback 路径参与运行或应急兜底。生产目标应保持大脑封闭、触手外接。
-              </div>
-            ) : null}
-          </CardContent>
-        </Card>
-
-        <Card className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-card">
-          <CardHeader className="space-y-4 pb-3">
-            <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
-              <div>
-                <CardTitle className="text-base">能力与来源总览</CardTitle>
-                <p className="mt-1 text-sm text-muted-foreground">
-                  {activeTab === "tools"
-                    ? `当前显示 ${filteredTools.length} / ${tools.length} 个能力，默认按“可用 + 最近调用”优先排序`
-                    : `当前显示 ${filteredSources.length} / ${sources.length} 个来源`}
-                </p>
-              </div>
-              <div className="relative w-full xl:w-80">
-                <Search className="absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
-                <Input
-                  placeholder="搜索名称 / 来源 / Agent / provider..."
-                  value={searchQuery}
-                  onChange={(event) =>
-                    startTransition(() => {
-                      setSearchQuery(event.target.value)
-                    })
-                  }
-                  className="w-full bg-secondary pl-10"
-                />
-              </div>
-            </div>
-          </CardHeader>
-
-          <CardContent className="flex min-h-0 min-w-0 flex-1 flex-col space-y-4">
-            <Tabs value={activeTab} onValueChange={setActiveTab} className="flex min-h-0 w-full flex-1 min-w-0 flex-col">
-              <TabsList className="grid w-full grid-cols-2 md:w-[360px]">
-                <TabsTrigger value="tools">能力列表</TabsTrigger>
-                <TabsTrigger value="sources">外部来源</TabsTrigger>
-              </TabsList>
 
               <TabsContent value="tools" className="mt-4 flex min-h-0 min-w-0 flex-1 flex-col space-y-4">
                 <div className="shrink-0 flex flex-col gap-3 rounded-xl border border-border bg-secondary/20 p-4 md:flex-row md:flex-wrap md:items-center">
@@ -624,8 +563,8 @@ export default function ToolsPage() {
                     </SelectTrigger>
                     <SelectContent>
                       <SelectItem value="all">全部类型</SelectItem>
-                      <SelectItem value="skill">Skill</SelectItem>
-                      <SelectItem value="tool">Tool</SelectItem>
+                      <SelectItem value="skill">技能</SelectItem>
+                      <SelectItem value="tool">工具</SelectItem>
                       <SelectItem value="mcp">MCP</SelectItem>
                       <SelectItem value="unknown">未分类</SelectItem>
                     </SelectContent>
@@ -636,37 +575,11 @@ export default function ToolsPage() {
                     </SelectTrigger>
                     <SelectContent>
                       <SelectItem value="all">全部来源</SelectItem>
-                      {sourceNameOptions.map((sourceName) => (
+                      {toolSourceNameOptions.map((sourceName) => (
                         <SelectItem key={sourceName} value={sourceName}>
                           {sourceName}
                         </SelectItem>
                       ))}
-                    </SelectContent>
-                  </Select>
-                  <Select value={toolMigrationFilter} onValueChange={setToolMigrationFilter}>
-                    <SelectTrigger className="w-full bg-background sm:w-[170px]">
-                      <SelectValue placeholder="迁移阶段" />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="all">全部迁移阶段</SelectItem>
-                      <SelectItem value="retained">保留</SelectItem>
-                      <SelectItem value="bridging">桥接中</SelectItem>
-                      <SelectItem value="externalized">已外置</SelectItem>
-                      <SelectItem value="pending_removal">待删除</SelectItem>
-                      <SelectItem value="deprecated">已弃用</SelectItem>
-                      <SelectItem value="unknown">未知</SelectItem>
-                    </SelectContent>
-                  </Select>
-                  <Select value={toolHealthFilter} onValueChange={setToolHealthFilter}>
-                    <SelectTrigger className="w-full bg-background sm:w-[150px]">
-                      <SelectValue placeholder="健康状态" />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="all">全部健康状态</SelectItem>
-                      <SelectItem value="healthy">健康</SelectItem>
-                      <SelectItem value="degraded">降级</SelectItem>
-                      <SelectItem value="unhealthy">异常</SelectItem>
-                      <SelectItem value="unknown">未知</SelectItem>
                     </SelectContent>
                   </Select>
                   <Select value={toolEnabledFilter} onValueChange={setToolEnabledFilter}>
@@ -679,24 +592,13 @@ export default function ToolsPage() {
                       <SelectItem value="disabled">已停用</SelectItem>
                     </SelectContent>
                   </Select>
-                  <div className="flex flex-wrap gap-2 md:ml-auto">
-                    <Badge variant="secondary" className={cn("text-xs", healthClasses.healthy)}>
-                      健康 {toolHealthStats.healthy}
-                    </Badge>
-                    <Badge variant="secondary" className={cn("text-xs", healthClasses.degraded)}>
-                      降级 {toolHealthStats.degraded}
-                    </Badge>
-                    <Badge variant="secondary" className={cn("text-xs", healthClasses.unhealthy)}>
-                      异常 {toolHealthStats.unhealthy}
-                    </Badge>
-                  </div>
                 </div>
 
                 <div className="relative min-h-0 min-w-0 flex-1 overflow-hidden rounded-lg border border-border">
                   <div className="h-full overflow-y-auto">
                   <Table className="min-w-[1760px] table-fixed">
                     <colgroup>
-                      <col className="w-[320px]" />
+                      <col className="w-[390px]" />
                       <col className="w-[96px]" />
                       <col className="w-[160px]" />
                       <col className="w-[140px]" />
@@ -713,12 +615,12 @@ export default function ToolsPage() {
                         <TableHead className={tableHeadClassName}>能力</TableHead>
                         <TableHead className={tableHeadClassName}>类型</TableHead>
                         <TableHead className={tableHeadClassName}>来源</TableHead>
-                        <TableHead className={tableHeadClassName}>迁移阶段</TableHead>
-                        <TableHead className={tableHeadClassName}>桥接治理</TableHead>
+                        <TableHead className={tableHeadClassName}>接入阶段</TableHead>
+                        <TableHead className={tableHeadClassName}>接入策略</TableHead>
                         <TableHead className={tableHeadClassName}>健康</TableHead>
-                        <TableHead className={tableHeadClassName}>关联 Agent</TableHead>
-                        <TableHead className={tableHeadClassName}>Provider / Config</TableHead>
-                        <TableHead className={tableHeadClassName}>能力/权限</TableHead>
+                        <TableHead className={tableHeadClassName}>关联角色</TableHead>
+                        <TableHead className={tableHeadClassName}>接入说明</TableHead>
+                        <TableHead className={tableHeadClassName}>调用要求</TableHead>
                         <TableHead className={tableHeadClassName}>状态</TableHead>
                         <TableHead className={tableHeadClassName}>最近调用 / 扫描</TableHead>
                       </TableRow>
@@ -741,17 +643,22 @@ export default function ToolsPage() {
                               <div className="min-w-0 space-y-2">
                                 <div className="flex items-start justify-between gap-2">
                                   <div className="font-medium text-foreground">{tool.name}</div>
-                                  <Button
-                                    variant="secondary"
-                                    size="sm"
-                                    className="h-7 px-2 text-xs"
-                                    onClick={() => {
-                                      setSelectedToolId(tool.id)
-                                      setToolDetailOpen(true)
-                                    }}
-                                  >
-                                    详情
-                                  </Button>
+                                  <div className="flex items-center gap-1">
+                                    <Button
+                                      variant="secondary"
+                                      size="sm"
+                                      className="h-7 px-2 text-xs"
+                                      onClick={() => {
+                                        setSelectedToolId(tool.id)
+                                        setToolDetailOpen(true)
+                                      }}
+                                    >
+                                      详情
+                                    </Button>
+                                    {isControlPlaneManagedTool(tool) ? (
+                                      <ToolManagementActions tool={tool} onDeleted={handleToolDeleted} />
+                                    ) : null}
+                                  </div>
                                 </div>
                                 <div className="text-xs leading-5 text-muted-foreground">{tool.description || "-"}</div>
                                 <div className="flex flex-wrap gap-1">
@@ -787,12 +694,12 @@ export default function ToolsPage() {
                             </TableCell>
                             <TableCell className={wrapCellClassName}>
                               <div className="space-y-1 text-xs">
-                                <div className="text-foreground">bridge: {tool.bridgeMode}</div>
+                                <div className="text-foreground">接入方式: {tool.bridgeMode || "-"}</div>
                                 <div className="text-muted-foreground">
-                                  policy: {tool.trafficPolicy ? "双跑/灰度已配置" : "默认"}
+                                  流量策略: {tool.trafficPolicy ? "已配置灰度/双跑" : "默认"}
                                 </div>
                                 <div className="text-muted-foreground">
-                                  rollback: {tool.rollbackSummary ? "可回滚" : "未声明"}
+                                  回滚预案: {tool.rollbackSummary ? "已准备" : "未声明"}
                                 </div>
                               </div>
                             </TableCell>
@@ -809,9 +716,9 @@ export default function ToolsPage() {
                               </div>
                             </TableCell>
                             <TableCell className="align-top text-xs text-muted-foreground">
-                              <div className="font-medium text-foreground">cap: {tool.capabilityCount}</div>
-                              <div className="mt-1">perm: {tool.permissions.requiresPermission ? "需要" : "无需"}</div>
-                              <div>approval: {tool.permissions.approvalRequired ? "需要" : "无需"}</div>
+                              <div className="font-medium text-foreground">能力点 {tool.capabilityCount}</div>
+                              <div className="mt-1">权限控制: {boolLabel(tool.permissions.requiresPermission)}</div>
+                              <div>人工审批: {boolLabel(tool.permissions.approvalRequired)}</div>
                             </TableCell>
                             <TableCell className={compactCellClassName}>
                               <Badge
@@ -824,9 +731,9 @@ export default function ToolsPage() {
                             <TableCell className="align-top text-xs text-muted-foreground">
                               <div>{toDisplayDate(tool.invocationSummary.lastCalledAt)}</div>
                               <div className="mt-1 text-[11px]">
-                                {`ok ${tool.invocationSummary.successCalls} / fail ${tool.invocationSummary.failedCalls}`}
+                                成功 {tool.invocationSummary.successCalls} / 失败 {tool.invocationSummary.failedCalls}
                               </div>
-                              <div className="text-[11px]">状态: {tool.invocationSummary.lastStatus}</div>
+                              <div className="text-[11px]">最近结果: {tool.invocationSummary.lastStatus}</div>
                               <div className="mt-1 text-[11px]">
                                 扫描: {toDisplayDate(tool.lastScannedAt)}
                               </div>
@@ -843,16 +750,17 @@ export default function ToolsPage() {
               <TabsContent value="sources" className="mt-4 flex min-h-0 min-w-0 flex-1 flex-col space-y-4">
                 <div className="shrink-0 flex flex-col gap-3 rounded-xl border border-border bg-secondary/20 p-4 md:flex-row md:flex-wrap md:items-center">
                   <SourceTypeSelect value={sourceTypeFilter} onChange={setSourceTypeFilter} />
-                  <Select value={sourceHealthFilter} onValueChange={setSourceHealthFilter}>
-                    <SelectTrigger className="w-full bg-background sm:w-[150px]">
-                      <SelectValue placeholder="健康状态" />
+                  <Select value={sourceNameFilter} onValueChange={setSourceNameFilter}>
+                    <SelectTrigger className="w-full bg-background sm:w-[180px]">
+                      <SelectValue placeholder="来源" />
                     </SelectTrigger>
                     <SelectContent>
-                      <SelectItem value="all">全部健康状态</SelectItem>
-                      <SelectItem value="healthy">健康</SelectItem>
-                      <SelectItem value="degraded">降级</SelectItem>
-                      <SelectItem value="unhealthy">异常</SelectItem>
-                      <SelectItem value="unknown">未知</SelectItem>
+                      <SelectItem value="all">全部来源</SelectItem>
+                      {sourceNameOptions.map((sourceName) => (
+                        <SelectItem key={sourceName} value={sourceName}>
+                          {sourceName}
+                        </SelectItem>
+                      ))}
                     </SelectContent>
                   </Select>
                   <Select value={sourceEnabledFilter} onValueChange={setSourceEnabledFilter}>
@@ -865,41 +773,6 @@ export default function ToolsPage() {
                       <SelectItem value="disabled">已停用</SelectItem>
                     </SelectContent>
                   </Select>
-                  <div className="flex flex-wrap gap-2 md:ml-auto">
-                    <Badge variant="secondary" className="text-xs">
-                      外部仓库 {sourceTypeStats.external_repo}
-                    </Badge>
-                    <Badge variant="secondary" className="text-xs">
-                      MCP Server {sourceTypeStats.mcp_server}
-                    </Badge>
-                    <Badge variant="secondary" className="text-xs">
-                      内部 {sourceTypeStats.internal}
-                    </Badge>
-                    <Badge variant="secondary" className="text-xs">
-                      Legacy {sourceTypeStats.local_tool}
-                    </Badge>
-                    <Badge variant="secondary" className={cn("text-xs", healthClasses.healthy)}>
-                      健康 {sourceHealthStats.healthy}
-                    </Badge>
-                    <Badge variant="secondary" className={cn("text-xs", healthClasses.degraded)}>
-                      降级 {sourceHealthStats.degraded}
-                    </Badge>
-                    <Badge variant="secondary" className={cn("text-xs", healthClasses.unhealthy)}>
-                      异常 {sourceHealthStats.unhealthy}
-                    </Badge>
-                    <Badge
-                      variant="secondary"
-                      className={legacyFallbackCount > 0 ? "bg-warning/20 text-xs text-warning-foreground" : "text-xs"}
-                    >
-                      legacy {legacyFallbackCount}
-                    </Badge>
-                    <Badge
-                      variant="secondary"
-                      className={deprecatedSourceCount > 0 ? "bg-destructive/15 text-xs text-destructive" : "text-xs"}
-                    >
-                      deprecated {deprecatedSourceCount}
-                    </Badge>
-                  </div>
                 </div>
 
                 <div className="relative min-h-0 min-w-0 flex-1 overflow-hidden rounded-lg border border-border">
@@ -921,12 +794,12 @@ export default function ToolsPage() {
                       <TableRow className="border-border">
                         <TableHead className={tableHeadClassName}>来源</TableHead>
                         <TableHead className={tableHeadClassName}>类型</TableHead>
-                        <TableHead className={tableHeadClassName}>路径 / Provider</TableHead>
+                        <TableHead className={tableHeadClassName}>接入位置 / 说明</TableHead>
                         <TableHead className={tableHeadClassName}>已扫描能力</TableHead>
                         <TableHead className={tableHeadClassName}>健康</TableHead>
-                        <TableHead className={tableHeadClassName}>关联 Agent</TableHead>
-                        <TableHead className={tableHeadClassName}>Config 摘要</TableHead>
-                        <TableHead className={tableHeadClassName}>治理状态</TableHead>
+                        <TableHead className={tableHeadClassName}>关联角色</TableHead>
+                        <TableHead className={tableHeadClassName}>接入配置</TableHead>
+                        <TableHead className={tableHeadClassName}>接入策略</TableHead>
                         <TableHead className={tableHeadClassName}>状态</TableHead>
                         <TableHead className={tableHeadClassName}>最近检查 / 扫描</TableHead>
                       </TableRow>
@@ -965,12 +838,12 @@ export default function ToolsPage() {
                                 <div className="flex flex-wrap gap-1">
                                   {source.legacyFallback ? (
                                     <Badge variant="secondary" className="bg-warning/20 text-xs text-warning-foreground">
-                                      legacy fallback
+                                      本地兜底
                                     </Badge>
                                   ) : null}
                                   {source.deprecated ? (
                                     <Badge variant="secondary" className="bg-destructive/15 text-xs text-destructive">
-                                      deprecated
+                                      已弃用
                                     </Badge>
                                   ) : null}
                                   {source.tags.slice(0, 3).map((tag) => (
@@ -1021,37 +894,135 @@ export default function ToolsPage() {
                   </div>
                 </div>
               </TabsContent>
+
+              <TabsContent value="brain-skills" className="mt-4 flex min-h-0 min-w-0 flex-1 flex-col space-y-4">
+                <div className="relative min-h-0 min-w-0 flex-1 overflow-hidden rounded-lg border border-border">
+                  <div className="h-full overflow-y-auto">
+                    <Table className="min-w-[1120px] table-fixed">
+                      <colgroup>
+                        <col className="w-[260px]" />
+                        <col className="w-[220px]" />
+                        <col className="w-[120px]" />
+                        <col className="w-[240px]" />
+                        <col className="w-[320px]" />
+                        <col className="w-[160px]" />
+                        <col className="w-[120px]" />
+                      </colgroup>
+                      <TableHeader className="sticky top-0 z-10 bg-card/95 backdrop-blur supports-[backdrop-filter]:bg-card/80">
+                        <TableRow className="border-border">
+                          <TableHead className={tableHeadClassName}>Skill</TableHead>
+                          <TableHead className={tableHeadClassName}>文件名</TableHead>
+                          <TableHead className={tableHeadClassName}>格式</TableHead>
+                          <TableHead className={tableHeadClassName}>能力 / 标签</TableHead>
+                          <TableHead className={tableHeadClassName}>说明</TableHead>
+                          <TableHead className={tableHeadClassName}>上传时间</TableHead>
+                          <TableHead className={tableHeadClassName}>操作</TableHead>
+                        </TableRow>
+                      </TableHeader>
+                      <TableBody>
+                        {brainSkillsLoading ? (
+                          Array.from({ length: 6 }).map((_, index) => (
+                            <TableRow key={`brain-skill-skeleton-${index}`}>
+                              <TableCell colSpan={7}>
+                                <Skeleton className="h-7 w-full" />
+                              </TableCell>
+                            </TableRow>
+                          ))
+                        ) : filteredBrainSkills.length === 0 ? (
+                          <EmptyRow
+                            colSpan={7}
+                            title="还没有本地 Skill"
+                            description="点击右上角上传 Skill 文件。"
+                          />
+                        ) : (
+                          filteredBrainSkills.map((skill) => (
+                            <TableRow key={skill.id} className="border-border">
+                              <TableCell className={wrapCellClassName}>
+                                <div className="space-y-2">
+                                  <div className="font-medium text-foreground">{skill.name}</div>
+                                  {skill.description ? (
+                                    <div className="text-xs leading-5 text-muted-foreground">{skill.description}</div>
+                                  ) : null}
+                                  {skill.enabled === false ? (
+                                    <Badge variant="secondary" className="w-fit bg-muted text-xs text-muted-foreground">
+                                      已停用
+                                    </Badge>
+                                  ) : null}
+                                </div>
+                              </TableCell>
+                              <TableCell className={wrapCellClassName}>
+                                <div className="text-sm text-foreground">{getBrainSkillFileName(skill)}</div>
+                              </TableCell>
+                              <TableCell className={compactCellClassName}>
+                                <Badge variant="secondary">{getBrainSkillFormat(skill)}</Badge>
+                              </TableCell>
+                              <TableCell className={wrapCellClassName}>
+                                <div className="flex flex-wrap gap-1">
+                                  {getBrainSkillCapabilities(skill).length > 0 ? (
+                                    getBrainSkillCapabilities(skill).map((item) => (
+                                      <Badge key={`${skill.id}-${item}`} variant="secondary" className="text-xs">
+                                        {item}
+                                      </Badge>
+                                    ))
+                                  ) : (
+                                    <span className="text-xs text-muted-foreground">未解析</span>
+                                  )}
+                                </div>
+                              </TableCell>
+                              <TableCell className={wrapCellClassName}>
+                                <div className="text-sm leading-6 text-foreground">{getBrainSkillDescription(skill)}</div>
+                              </TableCell>
+                              <TableCell className="align-top text-xs text-muted-foreground">
+                                {toDisplayDate(getBrainSkillUploadedAt(skill))}
+                              </TableCell>
+                              <TableCell className="align-top">
+                                <BrainSkillManagementActions skill={skill} />
+                              </TableCell>
+                            </TableRow>
+                          ))
+                        )}
+                      </TableBody>
+                    </Table>
+                  </div>
+                </div>
+              </TabsContent>
             </Tabs>
 
-            {(toolsError || sourcesError) && (
+            {(toolsError || sourcesError || brainSkillsError) && (
               <div className="rounded-lg border border-destructive/40 bg-destructive/10 p-3 text-sm text-destructive">
                 <div className="mb-1 font-medium">数据加载存在异常</div>
                 <div className="space-y-1 text-xs">
                   {toolsError ? (
-                    <div>能力接口 `/api/tools`：{toolsError instanceof Error ? toolsError.message : "未知错误"}</div>
+                    <div>触手能力接口 `/api/tools`：{toolsError instanceof Error ? toolsError.message : "未知错误"}</div>
                   ) : null}
                   {sourcesError ? (
                     <div>
-                      来源接口 `/api/tool-sources`：{sourcesError instanceof Error ? sourcesError.message : "未知错误"}
+                      触手来源接口 `/api/tool-sources`：{sourcesError instanceof Error ? sourcesError.message : "未知错误"}
+                    </div>
+                  ) : null}
+                  {brainSkillsError ? (
+                    <div>
+                      主脑 Skill 接口 `/api/agents/brain-skills`：
+                      {brainSkillsError instanceof Error ? brainSkillsError.message : "未知错误"}
                     </div>
                   ) : null}
                 </div>
               </div>
             )}
 
-            {!toolsLoading && !sourcesLoading && tools.length === 0 && sources.length === 0 ? (
+            {!toolsLoading && !sourcesLoading && externalTools.length === 0 && externalSources.length === 0 && activeTab !== "brain-skills" ? (
               <div className="mt-4 flex min-h-44 flex-col items-center justify-center rounded-xl border border-dashed border-border bg-secondary/20 text-center">
                 <Wrench className="mb-3 size-8 text-muted-foreground" />
-                <div className="text-sm font-medium text-foreground">能力中心暂时为空</div>
+                <div className="text-sm font-medium text-foreground">外部触手中心暂时为空</div>
                 <p className="mt-1 max-w-[520px] text-xs text-muted-foreground">
                   当前未发现可展示的能力或来源。请确认后端已实现 `/api/tools` 与 `/api/tool-sources`，并已完成一次扫描。
                 </p>
               </div>
             ) : null}
 
-            {tools.length > 0 ? (
+            {externalTools.length > 0 && activeTab !== "brain-skills" ? (
               <div className="text-[11px] text-muted-foreground">
-                已扫描能力点总计 {totalScannedCapabilities}。点击“详情”可查看 I/O、权限、配置与最近调用摘要。
+                已扫描能力点总计 {totalScannedCapabilities}。点击“详情”可查看输入输出、权限要求、接入说明和最近调用摘要。
               </div>
             ) : null}
           </CardContent>

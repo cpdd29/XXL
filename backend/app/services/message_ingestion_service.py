@@ -15,6 +15,7 @@ from app.services.language_service import detect_language
 from app.services.memory_service import memory_service
 from app.services.operational_log_service import append_realtime_event
 from app.services.persistence_service import persistence_service
+from app.services.settings_service import get_channel_integration_runtime_settings
 from app.services.security_gateway_service import security_gateway_service
 from app.services.store import store
 from app.services.workflow_execution_service import (
@@ -63,6 +64,8 @@ PROFILE_NAME_METADATA_KEYS = (
     "fullName",
 )
 PROFILE_EMAIL_METADATA_KEYS = ("email", "mail")
+PROFILE_TENANT_ID_METADATA_KEYS = ("tenant_id", "tenantId")
+PROFILE_TENANT_NAME_METADATA_KEYS = ("tenant_name", "tenantName")
 ALLOWED_CONTROL_PLANE_ROLES = {"admin", "operator", "viewer"}
 INTERACTION_MODES = {"chat", "task", "workflow_or_direct"}
 PROFESSIONAL_CONFIRM_TIMEOUT_SECONDS = 1800
@@ -258,6 +261,62 @@ def _metadata_profile_id(metadata: dict) -> str | None:
     return _metadata_text(metadata, *PROFILE_ID_METADATA_KEYS)
 
 
+def _metadata_tenant_id(metadata: dict) -> str | None:
+    return _metadata_text(metadata, *PROFILE_TENANT_ID_METADATA_KEYS)
+
+
+def _metadata_tenant_name(metadata: dict) -> str | None:
+    return _metadata_text(metadata, *PROFILE_TENANT_NAME_METADATA_KEYS)
+
+
+def _normalize_tenant_binding_value(value: object) -> str | None:
+    normalized = str(value or "").strip()
+    return normalized or None
+
+
+def _channel_tenant_binding(channel: str) -> tuple[str | None, str | None]:
+    settings = get_channel_integration_runtime_settings()
+    if not isinstance(settings, dict):
+        return None, None
+
+    channel_settings = settings.get(channel)
+    if not isinstance(channel_settings, dict):
+        return None, None
+
+    candidate_sources = [channel_settings]
+    for key in ("tenant_binding", "tenantBinding", "tenant"):
+        nested = channel_settings.get(key)
+        if isinstance(nested, dict):
+            candidate_sources.append(nested)
+
+    for source in candidate_sources:
+        tenant_id = _normalize_tenant_binding_value(
+            source.get("tenant_id") or source.get("tenantId") or source.get("id")
+        )
+        if not tenant_id:
+            continue
+        tenant_name = _normalize_tenant_binding_value(
+            source.get("tenant_name") or source.get("tenantName") or source.get("name")
+        )
+        return tenant_id, tenant_name
+    return None, None
+
+
+def _resolved_message_tenant_binding(message: UnifiedMessage) -> tuple[str | None, str | None]:
+    metadata = message.metadata if isinstance(message.metadata, dict) else {}
+    metadata_tenant_id = _metadata_tenant_id(metadata)
+    metadata_tenant_name = _metadata_tenant_name(metadata)
+    if metadata_tenant_id:
+        return metadata_tenant_id, metadata_tenant_name or f"{metadata_tenant_id} 租户"
+
+    channel_tenant_id, channel_tenant_name = _channel_tenant_binding(
+        str(message.channel.value or "").strip().lower()
+    )
+    if not channel_tenant_id:
+        return None, None
+    return channel_tenant_id, channel_tenant_name or f"{channel_tenant_id} 租户"
+
+
 def _profile_preferred_language(profile: dict | None) -> str | None:
     if not isinstance(profile, dict):
         return None
@@ -325,9 +384,28 @@ def _profile_matches_platform_account(
     return False
 
 
-def _find_runtime_profile_by_platform_account(*, platform: str, account_id: str) -> dict | None:
+def _profile_matches_tenant(profile: dict | None, *, tenant_id: str | None) -> bool:
+    if not tenant_id:
+        return True
+    profile_tenant_id = _profile_tenant_id(profile)
+    return bool(profile_tenant_id) and profile_tenant_id == tenant_id
+
+
+def _profile_tenant_id(profile: dict | None) -> str | None:
+    if not isinstance(profile, dict):
+        return None
+    normalized = str(profile.get("tenant_id") or profile.get("tenantId") or "").strip()
+    return normalized or None
+
+
+def _find_runtime_profile_by_platform_account(
+    *,
+    platform: str,
+    account_id: str,
+    tenant_id: str | None = None,
+) -> dict | None:
     for profile in store.user_profiles.values():
-        if _profile_matches_platform_account(
+        if _profile_matches_tenant(profile, tenant_id=tenant_id) and _profile_matches_platform_account(
             profile,
             platform=platform,
             account_id=account_id,
@@ -340,11 +418,27 @@ def _find_profile_by_platform_account_with_source(
     *,
     platform: str,
     account_id: str,
+    tenant_id: str | None = None,
 ) -> tuple[dict | None, bool]:
-    persisted_profile = persistence_service.find_user_profile_by_platform_account(
-        platform=platform,
-        account_id=account_id,
-    )
+    persisted_profile = None
+    list_profiles = getattr(persistence_service, "list_user_profiles", None)
+    if callable(list_profiles):
+        persisted_profiles = list_profiles() or []
+        for candidate in persisted_profiles:
+            if not _profile_matches_tenant(candidate, tenant_id=tenant_id):
+                continue
+            if _profile_matches_platform_account(
+                candidate,
+                platform=platform,
+                account_id=account_id,
+            ):
+                persisted_profile = candidate
+                break
+    elif tenant_id is None:
+        persisted_profile = persistence_service.find_user_profile_by_platform_account(
+            platform=platform,
+            account_id=account_id,
+        )
     if persisted_profile is not None:
         profile_id = str(persisted_profile.get("id") or "").strip()
         if profile_id:
@@ -354,13 +448,23 @@ def _find_profile_by_platform_account_with_source(
     if getattr(persistence_service, "enabled", False):
         return None, True
 
-    return _find_runtime_profile_by_platform_account(platform=platform, account_id=account_id), False
+    return _find_runtime_profile_by_platform_account(
+        platform=platform,
+        account_id=account_id,
+        tenant_id=tenant_id,
+    ), False
 
 
-def _find_profile_by_platform_account(*, platform: str, account_id: str) -> dict | None:
+def _find_profile_by_platform_account(
+    *,
+    platform: str,
+    account_id: str,
+    tenant_id: str | None = None,
+) -> dict | None:
     profile, _ = _find_profile_by_platform_account_with_source(
         platform=platform,
         account_id=account_id,
+        tenant_id=tenant_id,
     )
     return profile
 
@@ -531,14 +635,23 @@ def _sync_message_user_profile(
         return
 
     explicit_profile_id = _metadata_profile_id(message.metadata)
+    message_tenant_id, message_tenant_name = _resolved_message_tenant_binding(message)
+    # Only tenant-bound messages are allowed to mutate user/profile state.
+    if not message_tenant_id:
+        return
+
     existing_profile = None
     profile_from_database = False
     if explicit_profile_id:
         existing_profile, profile_from_database = _load_user_profile_with_source(explicit_profile_id)
+        existing_profile_tenant_id = _profile_tenant_id(existing_profile)
+        if existing_profile_tenant_id and existing_profile_tenant_id != message_tenant_id:
+            return
     if existing_profile is None:
         existing_profile, profile_from_database = _find_profile_by_platform_account_with_source(
             platform=normalized_channel,
             account_id=platform_user_id,
+            tenant_id=message_tenant_id,
         )
 
     profile_id = (
@@ -556,6 +669,19 @@ def _sync_message_user_profile(
     if database_user_authoritative and database_user is not None and not profile_from_database:
         profile = _runtime_profile_supplement(profile)
     authoritative_profile = profile if profile_from_database else {}
+    resolved_tenant_id = (
+        str(authoritative_profile.get("tenant_id") or "").strip()
+        or str(profile.get("tenant_id") or "").strip()
+        or message_tenant_id
+    )
+    if not resolved_tenant_id:
+        return
+    resolved_tenant_name = (
+        str(authoritative_profile.get("tenant_name") or "").strip()
+        or str(profile.get("tenant_name") or "").strip()
+        or message_tenant_name
+        or f"{resolved_tenant_id} 租户"
+    )
     fallback_created_at = (str(message.received_at or "").strip() or store.now_string()).split(
         "T",
         maxsplit=1,
@@ -574,6 +700,9 @@ def _sync_message_user_profile(
         **profile,
         "id": profile_id,
         "user_id": profile_id,
+        "tenant_id": resolved_tenant_id,
+        "tenant_name": resolved_tenant_name,
+        "tenant_status": "active",
         "name": (
             str(authoritative_profile.get("name") or "").strip()
             or str(existing_user_payload.get("name") or "").strip()
@@ -630,6 +759,7 @@ def _sync_message_user_profile(
             channel=normalized_channel,
             account_id=platform_user_id,
         ),
+        "last_active_at": str(message.received_at or store.now_string()),
     }
     updated_user = {
         **existing_user_payload,

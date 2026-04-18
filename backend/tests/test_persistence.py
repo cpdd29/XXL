@@ -1754,6 +1754,118 @@ def test_persistence_service_appends_and_lists_conversation_messages(tmp_path: P
     assert [item["id"] for item in latest_two] == ["msg-raw-2", "msg-raw-3"]
 
 
+def test_persistence_service_deletes_profile_messages_and_session_state_by_user_ids(tmp_path: Path) -> None:
+    database_path = tmp_path / "workbot-conversation-delete.db"
+    database_url = f"sqlite:///{database_path}"
+
+    service = StatePersistenceService(runtime_store=InMemoryStore(), database_url=database_url)
+    assert service.initialize() is True
+
+    try:
+        assert (
+            service.persist_user_state(
+                profile={
+                    "id": "tenant-user-delete",
+                    "tenant_id": "tenant-delete",
+                    "tenant_name": "Delete Corp",
+                    "name": "待删除画像",
+                }
+            )
+            is True
+        )
+        assert (
+            service.persist_user_state(
+                profile={
+                    "id": "tenant-user-keep",
+                    "tenant_id": "tenant-keep",
+                    "tenant_name": "Keep Corp",
+                    "name": "保留画像",
+                }
+            )
+            is True
+        )
+        assert (
+            service.append_conversation_message(
+                {
+                    "id": "msg-delete-1",
+                    "user_id": "tenant-user-delete",
+                    "session_id": "session-delete",
+                    "role": "user",
+                    "content": "待删除消息",
+                    "detected_lang": "zh",
+                    "created_at": "2026-04-18T10:00:00+00:00",
+                }
+            )
+            is True
+        )
+        assert (
+            service.append_conversation_message(
+                {
+                    "id": "msg-keep-1",
+                    "user_id": "tenant-user-keep",
+                    "session_id": "session-keep",
+                    "role": "user",
+                    "content": "保留消息",
+                    "detected_lang": "zh",
+                    "created_at": "2026-04-18T10:01:00+00:00",
+                }
+            )
+            is True
+        )
+        assert (
+            service.upsert_memory_session_state(
+                {
+                    "user_id": "tenant-user-delete",
+                    "session_id": "session-delete",
+                    "last_distilled_message_created_at": "2026-04-18T10:00:00+00:00",
+                    "last_distilled_message_ids_at_created_at": ["msg-delete-1"],
+                    "updated_at": "2026-04-18T10:00:01+00:00",
+                }
+            )
+            is True
+        )
+        assert (
+            service.upsert_memory_session_state(
+                {
+                    "user_id": "tenant-user-keep",
+                    "session_id": "session-keep",
+                    "last_distilled_message_created_at": "2026-04-18T10:01:00+00:00",
+                    "last_distilled_message_ids_at_created_at": ["msg-keep-1"],
+                    "updated_at": "2026-04-18T10:01:01+00:00",
+                }
+            )
+            is True
+        )
+
+        assert service.delete_user_profiles(user_ids=["tenant-user-delete"]) == 1
+        assert service.delete_conversation_messages(user_ids=["tenant-user-delete"]) == 1
+        assert service.delete_memory_session_states(user_ids=["tenant-user-delete"]) == 1
+
+        assert service.get_user_profile("tenant-user-delete") is None
+        assert service.list_conversation_messages(user_id="tenant-user-delete") == []
+        assert (
+            service.get_memory_session_state(
+                user_id="tenant-user-delete",
+                session_id="session-delete",
+            )
+            is None
+        )
+
+        assert service.get_user_profile("tenant-user-keep") is not None
+        kept_messages = service.list_conversation_messages(user_id="tenant-user-keep")
+        assert kept_messages is not None
+        assert [item["id"] for item in kept_messages] == ["msg-keep-1"]
+        assert (
+            service.get_memory_session_state(
+                user_id="tenant-user-keep",
+                session_id="session-keep",
+            )
+            is not None
+        )
+    finally:
+        service.close()
+
+
 def test_persistence_service_encrypts_sensitive_conversation_and_profile_storage(tmp_path: Path) -> None:
     database_path = tmp_path / "workbot-encrypted-storage.db"
     database_url = f"sqlite:///{database_path}"

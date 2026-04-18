@@ -1,0 +1,31 @@
+policy:
+  execution_scope: "local_control_plane"
+  direct_external_execution: false
+  hidden_tool_access: false
+  publish_or_execute: false
+tools:
+  - name: "security_gateway_state_reader"
+    scope: "local"
+    mode: "read_write"
+    purpose: "读取和维护本地安全网关状态。"
+  - name: "auth_scope_validator"
+    scope: "local"
+    mode: "read_only"
+    purpose: "校验当前请求 scope、租户边界和来源合法性。"
+  - name: "prompt_injection_detector"
+    scope: "local"
+    mode: "read_only"
+    purpose: "识别提示词注入、越狱和策略绕过信号。"
+  - name: "redaction_rewriter"
+    scope: "local"
+    mode: "read_only"
+    purpose: "生成脱敏或改写建议，不直接替代最终裁决。"
+  - name: "penalty_state_manager"
+    scope: "local"
+    mode: "read_write"
+    purpose: "维护处罚状态、恢复窗口和升级动作记录。"
+  - name: "audit_append"
+    scope: "local"
+    mode: "append_only"
+    purpose: "追加安全审计注记并保留 trace 链路。"
+mcp: []

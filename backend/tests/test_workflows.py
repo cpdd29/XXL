@@ -7,6 +7,8 @@ import pytest
 from app.main import app
 from app.services.agent_execution_service import agent_execution_service
 from app.services.channel_outbound_service import channel_outbound_service
+from app.services.mandatory_agent_registry_service import ensure_mandatory_agents_registered
+from app.services.mandatory_workflow_registry_service import ensure_mandatory_workflows_registered
 from app.services.store import store
 from app.services import workflow_execution_service, workflow_service
 
@@ -1277,6 +1279,7 @@ def test_create_workflow_persists_trigger_and_agent_binding(auth_headers) -> Non
                 "priority": 180,
                 "channels": ["telegram"],
                 "preferredLanguage": "en",
+                "naturalLanguageRule": "仅在整点时段执行汇总",
             },
             "nodes": [
                 {
@@ -1292,7 +1295,12 @@ def test_create_workflow_persists_trigger_and_agent_binding(auth_headers) -> Non
                     "label": "搜索 Agent",
                     "x": 280,
                     "y": 120,
+                    "description": "负责定时检索关键指标并整理摘要",
                     "agentId": "3",
+                    "config": {
+                        "instruction": "优先查询内部项目资料库",
+                        "inputSchema": "任务标题, 时间窗口, 渠道上下文",
+                    },
                 },
             ],
             "edges": [
@@ -1313,7 +1321,11 @@ def test_create_workflow_persists_trigger_and_agent_binding(auth_headers) -> Non
     assert body["workflow"]["trigger"]["priority"] == 180
     assert body["workflow"]["trigger"]["channels"] == ["telegram"]
     assert body["workflow"]["trigger"]["preferredLanguage"] == "en"
+    assert body["workflow"]["trigger"]["naturalLanguageRule"] == "仅在整点时段执行汇总"
     assert body["workflow"]["nodes"][1]["agentId"] == "3"
+    assert body["workflow"]["nodes"][1]["description"] == "负责定时检索关键指标并整理摘要"
+    assert body["workflow"]["nodes"][1]["config"]["instruction"] == "优先查询内部项目资料库"
+    assert body["workflow"]["nodes"][1]["config"]["inputSchema"] == "任务标题, 时间窗口, 渠道上下文"
     assert body["workflow"]["agentBindings"] == ["3"]
 
 
@@ -1336,16 +1348,18 @@ def test_workflow_upsert_preserves_extended_node_types_and_policy_fields(auth_he
                 "maxDispatchRetry": 5,
                 "dispatchRetryBackoffSeconds": 3.5,
                 "executionTimeoutSeconds": 90,
+                "naturalLanguageRule": "仅当外部系统推送扩展节点演练任务时命中",
             },
             "nodes": [
                 {"id": "1", "type": "trigger", "label": "Webhook 触发", "x": 40, "y": 80},
                 {"id": "2", "type": "agent", "label": "搜索 Agent", "x": 220, "y": 80, "agentId": "3"},
                 {"id": "3", "type": "condition", "label": "条件判断", "x": 420, "y": 80},
                 {"id": "4", "type": "parallel", "label": "并行分发", "x": 620, "y": 80},
-                {"id": "5", "type": "tool", "label": "工具调用", "x": 820, "y": 40},
-                {"id": "6", "type": "transform", "label": "结果转换", "x": 820, "y": 140},
-                {"id": "7", "type": "merge", "label": "结果归并", "x": 1040, "y": 80},
-                {"id": "8", "type": "output", "label": "输出结果", "x": 1240, "y": 80},
+                {"id": "5", "type": "workflow", "label": "调用审批子流程", "x": 820, "y": 10, "workflowId": "workflow-approval"},
+                {"id": "6", "type": "tool", "label": "工具调用", "x": 820, "y": 110, "toolId": "tool-weather"},
+                {"id": "7", "type": "transform", "label": "结果转换", "x": 1040, "y": 140},
+                {"id": "8", "type": "merge", "label": "结果归并", "x": 1240, "y": 80},
+                {"id": "9", "type": "output", "label": "输出结果", "x": 1440, "y": 80},
             ],
             "edges": [
                 {"id": "e1-2", "source": "1", "target": "2"},
@@ -1355,6 +1369,7 @@ def test_workflow_upsert_preserves_extended_node_types_and_policy_fields(auth_he
                 {"id": "e5-6", "source": "5", "target": "6"},
                 {"id": "e6-7", "source": "6", "target": "7"},
                 {"id": "e7-8", "source": "7", "target": "8"},
+                {"id": "e8-9", "source": "8", "target": "9"},
             ],
         },
         headers=auth_headers,
@@ -1368,11 +1383,15 @@ def test_workflow_upsert_preserves_extended_node_types_and_policy_fields(auth_he
         "agent",
         "condition",
         "parallel",
+        "workflow",
         "tool",
         "transform",
         "merge",
         "output",
     ]
+    assert created_workflow["nodes"][4]["workflowId"] == "workflow-approval"
+    assert created_workflow["nodes"][5]["toolId"] == "tool-weather"
+    assert created_workflow["trigger"]["naturalLanguageRule"] == "仅当外部系统推送扩展节点演练任务时命中"
     assert created_workflow["trigger"]["stepDelaySeconds"] == 1.25
     assert created_workflow["trigger"]["maxDispatchRetry"] == 5
     assert created_workflow["trigger"]["dispatchRetryBackoffSeconds"] == 3.5
@@ -1435,6 +1454,307 @@ def test_workflow_upsert_preserves_extended_node_types_and_policy_fields(auth_he
     assert updated_workflow["trigger"]["dispatchRetryBackoffSeconds"] == 4.5
     assert updated_workflow["trigger"]["executionTimeoutSeconds"] == 120
     assert updated_workflow["agentBindings"] == []
+
+
+def test_manual_tool_node_workflow_run_invokes_bound_tool_and_completes(
+    auth_headers,
+    monkeypatch,
+) -> None:
+    captured_payloads: list[dict] = []
+    monkeypatch.setattr(
+        workflow_execution_service.mcp_runtime_service,
+        "invoke_tool",
+        lambda *, tool_id, payload=None, trace_context=None, **kwargs: captured_payloads.append(payload or {}) or {
+            "ok": True,
+            "trace_id": "mcp-trace-tool-node",
+            "tool": {"id": tool_id, "name": "天气查询"},
+            "result": {
+                "location": (payload or {}).get("query"),
+                "mode": (payload or {}).get("mode"),
+                "status": "sunny",
+                "temperature": "26C",
+            },
+        },
+    )
+
+    create = client.post(
+        "/api/workflows",
+        json={
+            "name": "工具节点演练工作流",
+            "description": "验证工具节点不再只是占位结构",
+            "version": "v1.0",
+            "status": "active",
+            "trigger": {
+                "type": "manual",
+                "description": "手动启动工具节点流程",
+            },
+            "nodes": [
+                {"id": "1", "type": "trigger", "label": "手动触发", "x": 40, "y": 60},
+                {
+                    "id": "2",
+                    "type": "tool",
+                    "label": "天气工具",
+                    "x": 280,
+                    "y": 60,
+                    "description": "负责从天气服务拉取结构化结果",
+                    "toolId": "tool-weather",
+                    "config": {
+                        "payloadTemplate": '{"query":"上海天气","mode":"structured"}',
+                        "resultMapping": "将温度和天气状态整理成客户可读摘要",
+                    },
+                },
+            ],
+            "edges": [{"id": "e1-2", "source": "1", "target": "2"}],
+        },
+        headers=auth_headers,
+    )
+    assert create.status_code == 200
+    workflow_id = create.json()["workflow"]["id"]
+
+    run_response = client.post(f"/api/workflows/{workflow_id}/run", headers=auth_headers)
+    assert run_response.status_code == 200
+    run_id = run_response.json()["runId"]
+    task_id = run_response.json()["taskId"]
+
+    run_body = wait_for_run_status(run_id, auth_headers, "completed")
+    assert any(
+        node["type"] == "tool" and node["status"] == "completed"
+        for node in run_body["nodes"]
+    )
+
+    task = next(item for item in store.tasks if item["id"] == task_id)
+    assert captured_payloads
+    assert captured_payloads[0]["query"] == "上海天气"
+    assert captured_payloads[0]["mode"] == "structured"
+    assert task["result"]["kind"] == "tool_execution"
+    assert task["result"]["title"] == "天气查询 执行结果"
+    assert "temperature" in task["result"]["content"]
+    assert "结果映射说明：将温度和天气状态整理成客户可读摘要" in task["result"]["content"]
+
+
+def test_manual_parent_workflow_run_executes_bound_child_workflow(
+    auth_headers,
+    monkeypatch,
+) -> None:
+    captured_child_descriptions: list[str] = []
+    monkeypatch.setattr(
+        agent_execution_service,
+        "execute_task",
+        lambda *, task, run, execution_agent=None: captured_child_descriptions.append(
+            str(task.get("description") or "")
+        ) or {
+            "kind": "chat_reply",
+            "title": "子工作流执行结果",
+            "summary": f"已完成 {task['title']}",
+            "content": "子工作流已返回可直接交付的结果",
+        },
+    )
+
+    child_create = client.post(
+        "/api/workflows",
+        json={
+            "name": "审批子工作流",
+            "description": "由父工作流嵌套触发",
+            "version": "v1.0",
+            "status": "active",
+            "trigger": {
+                "type": "manual",
+                "description": "由父流程转入",
+            },
+            "nodes": [
+                {"id": "1", "type": "trigger", "label": "手动触发", "x": 40, "y": 60},
+                {"id": "2", "type": "agent", "label": "搜索 Agent", "x": 260, "y": 60, "agentId": "3"},
+            ],
+            "edges": [{"id": "e1-2", "source": "1", "target": "2"}],
+        },
+        headers=auth_headers,
+    )
+    assert child_create.status_code == 200
+    child_workflow_id = child_create.json()["workflow"]["id"]
+    child_workflow_name = child_create.json()["workflow"]["name"]
+
+    parent_create = client.post(
+        "/api/workflows",
+        json={
+            "name": "父工作流嵌套演练",
+            "description": "验证 workflow 节点会真正触发子工作流",
+            "version": "v1.0",
+            "status": "active",
+            "trigger": {
+                "type": "manual",
+                "description": "手动启动父流程",
+            },
+            "nodes": [
+                {"id": "1", "type": "trigger", "label": "手动触发", "x": 40, "y": 60},
+                {
+                    "id": "2",
+                    "type": "workflow",
+                    "label": "调用审批子流程",
+                    "x": 280,
+                    "y": 60,
+                    "description": "把高风险工单转交审批子流程",
+                    "workflowId": child_workflow_id,
+                    "config": {
+                        "handoffNote": "父流程已完成初筛，请子流程继续审批并回传结论",
+                    },
+                },
+            ],
+            "edges": [{"id": "e1-2", "source": "1", "target": "2"}],
+        },
+        headers=auth_headers,
+    )
+    assert parent_create.status_code == 200
+    parent_workflow_id = parent_create.json()["workflow"]["id"]
+
+    run_response = client.post(f"/api/workflows/{parent_workflow_id}/run", headers=auth_headers)
+    assert run_response.status_code == 200
+    parent_run_id = run_response.json()["runId"]
+    parent_task_id = run_response.json()["taskId"]
+
+    parent_run = wait_for_run_status(parent_run_id, auth_headers, "completed")
+    assert any(
+        node["type"] == "workflow" and node["status"] == "completed"
+        for node in parent_run["nodes"]
+    )
+
+    child_runs = [
+        run
+        for run in store.workflow_runs
+        if run["workflow_id"] == child_workflow_id and run["id"] != parent_run_id
+    ]
+    assert child_runs
+    assert child_runs[0]["status"] == "completed"
+    assert child_runs[0]["trigger"].startswith("workflow:")
+    assert captured_child_descriptions
+    assert "父流程节点说明：把高风险工单转交审批子流程" in captured_child_descriptions[0]
+    assert "父子流程交接说明：父流程已完成初筛，请子流程继续审批并回传结论" in captured_child_descriptions[0]
+
+    parent_task = next(item for item in store.tasks if item["id"] == parent_task_id)
+    assert parent_task["result"]["summary"] == f"已通过子工作流“{child_workflow_name}”完成执行"
+    assert "交接说明：父流程已完成初筛，请子流程继续审批并回传结论" in parent_task["result"]["bullets"]
+
+
+def test_main_brain_workflow_dispatches_into_external_tentacle_child_with_parent_intent(
+    auth_headers,
+    monkeypatch,
+) -> None:
+    ensure_mandatory_agents_registered()
+    ensure_mandatory_workflows_registered()
+    captured_write_descriptions: list[str] = []
+
+    monkeypatch.setattr(
+        agent_execution_service,
+        "_execute_write",
+        lambda *, task, run, execution_agent=None: captured_write_descriptions.append(
+            str(task.get("description") or "")
+        ) or {
+            "kind": "draft_message",
+            "title": "外接写作触手结果",
+            "summary": "已完成外接写作触手执行",
+            "content": "外接写作触手已根据父流程意图完成草稿生成",
+        },
+    )
+    monkeypatch.setattr(
+        agent_execution_service,
+        "_execute_search",
+        lambda *, task, run, execution_agent=None: pytest.fail("write intent should not dispatch to search branch"),
+    )
+
+    run_response = client.post(
+        "/api/workflows/workflow-1/run",
+        headers=auth_headers,
+        json={"intent": "write"},
+    )
+    assert run_response.status_code == 200
+    parent_run_id = run_response.json()["runId"]
+    parent_task_id = run_response.json()["taskId"]
+
+    parent_run = wait_for_run_status(parent_run_id, auth_headers, "completed")
+    assert parent_run["workflowId"] == "workflow-1"
+    assert any(
+        node["type"] == "workflow" and node["status"] == "completed"
+        for node in parent_run["nodes"]
+    )
+
+    child_runs = [
+        run
+        for run in store.workflow_runs
+        if run["workflow_id"] == "mandatory-workflow-external-tentacle-dispatch"
+        and run["id"] != parent_run_id
+    ]
+    assert child_runs
+    assert child_runs[0]["intent"] == "write"
+    assert child_runs[0]["trigger"].startswith("workflow:workflow-1:")
+    assert captured_write_descriptions
+    assert "父流程节点说明：进入外接触手执行子工作流，按意图选择外接检索或写作能力。" in captured_write_descriptions[0]
+
+    parent_task = next(item for item in store.tasks if item["id"] == parent_task_id)
+    assert parent_task["result"]["title"] == "外接写作触手结果"
+
+
+def test_manual_agent_node_workflow_run_injects_node_guidance_into_execution(
+    auth_headers,
+    monkeypatch,
+) -> None:
+    captured_descriptions: list[str] = []
+
+    monkeypatch.setattr(
+        agent_execution_service,
+        "_execute_search",
+        lambda *, task, run, execution_agent=None: captured_descriptions.append(
+            str(task.get("description") or "")
+        ) or {
+            "kind": "search_report",
+            "title": "节点配置搜索结果",
+            "summary": "已按节点配置完成搜索执行",
+            "content": "搜索结果已根据节点职责生成",
+        },
+    )
+
+    create = client.post(
+        "/api/workflows",
+        json={
+            "name": "执行角色节点配置演练",
+            "description": "验证执行角色节点配置会进入真实执行上下文",
+            "version": "v1.0",
+            "status": "active",
+            "trigger": {
+                "type": "manual",
+                "description": "手动启动执行角色节点流程",
+            },
+            "nodes": [
+                {"id": "1", "type": "trigger", "label": "手动触发", "x": 40, "y": 60},
+                {
+                    "id": "2",
+                    "type": "agent",
+                    "label": "搜索 Agent",
+                    "x": 280,
+                    "y": 60,
+                    "description": "负责内部知识检索与摘要整理",
+                    "agentId": "3",
+                    "config": {
+                        "instruction": "优先返回架构文档要点，再补充关键限制条件",
+                        "inputSchema": "用户问题, 会话上下文, 目标系统范围",
+                    },
+                },
+            ],
+            "edges": [{"id": "e1-2", "source": "1", "target": "2"}],
+        },
+        headers=auth_headers,
+    )
+    assert create.status_code == 200
+    workflow_id = create.json()["workflow"]["id"]
+
+    run_response = client.post(f"/api/workflows/{workflow_id}/run", headers=auth_headers)
+    assert run_response.status_code == 200
+    run_id = run_response.json()["runId"]
+
+    wait_for_run_status(run_id, auth_headers, "completed")
+
+    assert captured_descriptions
+    assert "搜索 Agent 节点说明：负责内部知识检索与摘要整理" in captured_descriptions[0]
+    assert "搜索 Agent 执行要求：优先返回架构文档要点，再补充关键限制条件" in captured_descriptions[0]
+    assert "搜索 Agent 输入约束：用户问题, 会话上下文, 目标系统范围" in captured_descriptions[0]
 
 
 def test_internal_trigger_route_starts_matching_workflow_and_injects_event_context(

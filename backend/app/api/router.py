@@ -11,6 +11,7 @@ from app.api.routes import (
     events,
     messages,
     memory,
+    profiles,
     settings,
     security,
     tasks,
@@ -31,6 +32,7 @@ api_router.include_router(events.router, prefix="/events", tags=["events"])
 api_router.include_router(collaboration.router, prefix="/collaboration", tags=["collaboration"])
 api_router.include_router(tasks.router, prefix="/tasks", tags=["tasks"])
 api_router.include_router(agents.router, prefix="/agents", tags=["agents"])
+api_router.include_router(profiles.router, prefix="/profiles", tags=["profiles"])
 api_router.include_router(users.router, prefix="/users", tags=["users"])
 api_router.include_router(workflows.router, prefix="/workflows", tags=["workflows"])
 api_router.include_router(security.router, prefix="/security", tags=["security"])

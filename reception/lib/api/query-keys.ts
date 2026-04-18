@@ -21,6 +21,7 @@ export const queryKeys = {
   agents: {
     list: ['agents'] as const,
     status: (agentId: string) => ['agents', agentId, 'status'] as const,
+    brainSkills: ['agents', 'brain-skills'] as const,
   },
   tools: {
     list: ['tools'] as const,
@@ -32,6 +33,7 @@ export const queryKeys = {
     list: ['schedules'] as const,
   },
   users: {
+    tenants: ['users', 'tenants'] as const,
     list: ['users'] as const,
     profile: (userId: string) => ['users', userId, 'profile'] as const,
     activity: (userId: string) => ['users', userId, 'activity'] as const,

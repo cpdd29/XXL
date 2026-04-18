@@ -111,11 +111,15 @@ DEFAULT_CHANNEL_INTEGRATION_SETTINGS = {
         "enabled": True,
         "api_base_url": str(_runtime_defaults.telegram_api_base_url),
         "http_timeout_seconds": float(_runtime_defaults.telegram_http_timeout_seconds),
+        "tenant_id": None,
+        "tenant_name": None,
         "bot_token": str(_runtime_defaults.telegram_bot_token or "").strip() or None,
         "webhook_secret": str(_runtime_defaults.telegram_webhook_secret or "").strip() or None,
     },
     "wecom": {
         "enabled": True,
+        "tenant_id": None,
+        "tenant_name": None,
         "webhook_secret": str(_runtime_defaults.wecom_webhook_secret or "").strip() or None,
         "webhook_secret_header": str(
             getattr(_runtime_defaults, "wecom_webhook_secret_header", DEFAULT_WEBHOOK_SECRET_HEADER)
@@ -138,6 +142,8 @@ DEFAULT_CHANNEL_INTEGRATION_SETTINGS = {
     },
     "feishu": {
         "enabled": True,
+        "tenant_id": None,
+        "tenant_name": None,
         "webhook_secret": str(_runtime_defaults.feishu_webhook_secret or "").strip() or None,
         "webhook_secret_header": str(
             getattr(_runtime_defaults, "feishu_webhook_secret_header", DEFAULT_WEBHOOK_SECRET_HEADER)
@@ -160,6 +166,8 @@ DEFAULT_CHANNEL_INTEGRATION_SETTINGS = {
     },
     "dingtalk": {
         "enabled": True,
+        "tenant_id": None,
+        "tenant_name": None,
         "app_id": str(getattr(_runtime_defaults, "dingtalk_app_id", "") or "").strip(),
         "agent_id": str(getattr(_runtime_defaults, "dingtalk_agent_id", "") or "").strip(),
         "client_id": str(getattr(_runtime_defaults, "dingtalk_client_id", "") or "").strip(),
@@ -514,6 +522,39 @@ def _clear_channel_secret_value(source: dict[str, Any], field: str) -> bool:
     )
 
 
+def _normalize_channel_tenant_binding(
+    channel_payload: dict[str, Any],
+    *,
+    base: dict[str, Any],
+) -> tuple[str | None, str | None]:
+    has_tenant_id = "tenant_id" in channel_payload or "tenantId" in channel_payload
+    has_tenant_name = "tenant_name" in channel_payload or "tenantName" in channel_payload
+    base_tenant_id = _coerce_string(base.get("tenant_id"), default="") or None
+    tenant_id = base_tenant_id
+    tenant_name = _coerce_string(base.get("tenant_name"), default="") or None
+
+    if has_tenant_id:
+        tenant_id = _coerce_string(
+            _channel_payload_value(channel_payload, "tenant_id", "tenantId"),
+            default="",
+        ) or None
+        if tenant_id is None:
+            tenant_name = None
+
+    if has_tenant_name:
+        tenant_name = _coerce_string(
+            _channel_payload_value(channel_payload, "tenant_name", "tenantName"),
+            default="",
+        ) or None
+    elif has_tenant_id and tenant_id is not None and tenant_id != base_tenant_id:
+        tenant_name = tenant_id
+
+    if tenant_id is None:
+        tenant_name = None
+
+    return tenant_id, tenant_name
+
+
 def _normalize_channel_integration_settings(
     payload: dict[str, Any] | None,
     *,
@@ -537,6 +578,9 @@ def _normalize_channel_integration_settings(
             _channel_payload_value(channel_payload, "enabled", "enabled"),
             default=bool(base.get("enabled", True)),
         )
+        tenant_id, tenant_name = _normalize_channel_tenant_binding(channel_payload, base=base)
+        channel_settings["tenant_id"] = tenant_id
+        channel_settings["tenant_name"] = tenant_name
 
         for field in secret_fields:
             normalized_secret = _normalize_secret_value(base.get(field))
@@ -630,6 +674,8 @@ def _to_channel_integration_response_settings(payload: dict[str, Any] | None) ->
             "enabled": bool(normalized["telegram"].get("enabled", True)),
             "api_base_url": str(normalized["telegram"]["api_base_url"]),
             "http_timeout_seconds": float(normalized["telegram"]["http_timeout_seconds"]),
+            "tenant_id": normalized["telegram"].get("tenant_id"),
+            "tenant_name": normalized["telegram"].get("tenant_name"),
             "has_bot_token": normalized["telegram"].get("bot_token") is not None,
             "bot_token_masked": _mask_secret_value(normalized["telegram"].get("bot_token")),
             "has_webhook_secret": normalized["telegram"].get("webhook_secret") is not None,
@@ -637,6 +683,8 @@ def _to_channel_integration_response_settings(payload: dict[str, Any] | None) ->
         },
         "wecom": {
             "enabled": bool(normalized["wecom"].get("enabled", True)),
+            "tenant_id": normalized["wecom"].get("tenant_id"),
+            "tenant_name": normalized["wecom"].get("tenant_name"),
             "webhook_secret_header": str(normalized["wecom"]["webhook_secret_header"]),
             "webhook_secret_query_param": str(normalized["wecom"]["webhook_secret_query_param"]),
             "bot_webhook_base_url": str(normalized["wecom"]["bot_webhook_base_url"]),
@@ -648,6 +696,8 @@ def _to_channel_integration_response_settings(payload: dict[str, Any] | None) ->
         },
         "feishu": {
             "enabled": bool(normalized["feishu"].get("enabled", True)),
+            "tenant_id": normalized["feishu"].get("tenant_id"),
+            "tenant_name": normalized["feishu"].get("tenant_name"),
             "webhook_secret_header": str(normalized["feishu"]["webhook_secret_header"]),
             "webhook_secret_query_param": str(normalized["feishu"]["webhook_secret_query_param"]),
             "bot_webhook_base_url": str(normalized["feishu"]["bot_webhook_base_url"]),
@@ -659,6 +709,8 @@ def _to_channel_integration_response_settings(payload: dict[str, Any] | None) ->
         },
         "dingtalk": {
             "enabled": bool(normalized["dingtalk"].get("enabled", True)),
+            "tenant_id": normalized["dingtalk"].get("tenant_id"),
+            "tenant_name": normalized["dingtalk"].get("tenant_name"),
             "app_id": str(normalized["dingtalk"]["app_id"]),
             "agent_id": str(normalized["dingtalk"].get("agent_id") or ""),
             "client_id": str(normalized["dingtalk"]["client_id"]),

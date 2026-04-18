@@ -6,6 +6,7 @@ export type WorkflowNodeType =
   | 'condition'
   | 'parallel'
   | 'merge'
+  | 'workflow'
   | 'tool'
   | 'transform'
   | 'output'
@@ -26,6 +27,8 @@ export interface WorkflowTrigger {
   maxDispatchRetry?: number | null
   dispatchRetryBackoffSeconds?: number | null
   executionTimeoutSeconds?: number | null
+  naturalLanguageRule?: string | null
+  schedulePlan?: Record<string, unknown> | null
 }
 
 export interface WorkflowNode {
@@ -34,7 +37,11 @@ export interface WorkflowNode {
   label: string
   x: number
   y: number
+  description?: string | null
+  config?: Record<string, unknown> | null
   agentId?: string | null
+  toolId?: string | null
+  workflowId?: string | null
 }
 
 export interface WorkflowEdge {

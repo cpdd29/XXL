@@ -206,6 +206,39 @@ def _task_with_added_context(task: dict, *lines: str) -> dict:
     return cloned_task
 
 
+def _selected_workflow_node_config(run: dict) -> dict[str, Any]:
+    dispatch_context = dispatch_context_from_run(run)
+    if not isinstance(dispatch_context, dict):
+        return {}
+    config = dispatch_context.get("selected_node_config") or dispatch_context.get("selectedNodeConfig")
+    return store.clone(config) if isinstance(config, dict) else {}
+
+
+def _selected_workflow_node_guidance(run: dict) -> list[str]:
+    dispatch_context = dispatch_context_from_run(run)
+    if not isinstance(dispatch_context, dict):
+        return []
+
+    label = str(
+        dispatch_context.get("selected_node_label") or dispatch_context.get("selectedNodeLabel") or "当前工作流节点"
+    ).strip()
+    description = str(
+        dispatch_context.get("selected_node_description") or dispatch_context.get("selectedNodeDescription") or ""
+    ).strip()
+    config = _selected_workflow_node_config(run)
+    instruction = str(config.get("instruction") or "").strip()
+    input_schema = str(config.get("inputSchema") or config.get("input_schema") or "").strip()
+
+    lines: list[str] = []
+    if description:
+        lines.append(f"{label} 节点说明：{description}")
+    if instruction:
+        lines.append(f"{label} 执行要求：{instruction}")
+    if input_schema:
+        lines.append(f"{label} 输入约束：{input_schema}")
+    return lines
+
+
 def _combined_references(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
     merged: list[dict[str, Any]] = []
     seen: set[tuple[str, str]] = set()
@@ -735,9 +768,19 @@ def _resolve_provider_key(execution_agent: dict | None, profile: dict[str, Any])
         return None
 
     snapshot = execution_agent.get("config_snapshot") if isinstance(execution_agent, dict) else None
+    runtime = snapshot.get("runtime") if isinstance(snapshot, dict) and isinstance(snapshot.get("runtime"), dict) else {}
+    binding = (
+        runtime.get("agent_binding")
+        if isinstance(runtime, dict) and isinstance(runtime.get("agent_binding"), dict)
+        else {}
+    )
     agent_doc = snapshot.get("agent") if isinstance(snapshot, dict) and isinstance(snapshot.get("agent"), dict) else {}
     explicit_provider = str(
-        agent_doc.get("provider") or (execution_agent or {}).get("provider") or ""
+        binding.get("provider_key")
+        or binding.get("providerKey")
+        or agent_doc.get("provider")
+        or (execution_agent or {}).get("provider")
+        or ""
     ).strip().lower()
     if explicit_provider in enabled_provider_keys:
         return explicit_provider
@@ -791,6 +834,8 @@ def _provider_headers(provider_key: str, provider: dict[str, Any]) -> dict[str, 
 
 
 def _provider_model(profile: dict[str, Any], provider: dict[str, Any]) -> str:
+    if str(profile.get("model_source") or "").strip().lower() == "manual_binding":
+        return str(profile.get("model") or provider.get("model") or "").strip()
     return str(provider.get("model") or profile.get("model") or "").strip()
 
 
@@ -1177,12 +1222,28 @@ def _safe_execution_profile(execution_agent: dict | None, run: dict) -> dict[str
     agent_doc = snapshot.get("agent") if isinstance(snapshot, dict) else None
     if not isinstance(agent_doc, dict):
         agent_doc = {}
+    runtime = snapshot.get("runtime") if isinstance(snapshot, dict) and isinstance(snapshot.get("runtime"), dict) else {}
+    runtime_binding = (
+        runtime.get("agent_binding")
+        if isinstance(runtime, dict) and isinstance(runtime.get("agent_binding"), dict)
+        else {}
+    )
     execution_settings = agent_doc.get("execution") if isinstance(agent_doc.get("execution"), dict) else {}
     supported_intents = [item.lower() for item in _string_list(agent_doc.get("trigger_intents"))]
     capabilities = [item.lower() for item in _string_list(agent_doc.get("capabilities"))]
     warnings = _string_list((snapshot or {}).get("warnings"))
     if warning:
         warnings.append(warning)
+    model = str(
+        runtime_binding.get("model")
+        or agent_doc.get("model")
+        or ""
+    ).strip() or None
+    model_source = (
+        "manual_binding"
+        if str(runtime_binding.get("model") or "").strip()
+        else ("agent_config" if model else None)
+    )
 
     supports_intent: bool | None = None
     if intent:
@@ -1198,7 +1259,8 @@ def _safe_execution_profile(execution_agent: dict | None, run: dict) -> dict[str
         "status": str((summary or {}).get("status") or ("error" if warning else "missing")),
         "agent_name": str(execution_agent.get("name") or "").strip() or None,
         "agent_type": str(execution_agent.get("type") or "").strip().lower() or None,
-        "model": str(agent_doc.get("model") or "").strip() or None,
+        "model": model,
+        "model_source": model_source,
         "version": str(agent_doc.get("version") or (snapshot or {}).get("version") or "").strip() or None,
         "supported_intents": supported_intents,
         "capabilities": capabilities,
@@ -2622,62 +2684,63 @@ class AgentExecutionService:
         run: dict,
         execution_agent: dict | None,
     ) -> dict:
+        effective_task = _task_with_added_context(task, *_selected_workflow_node_guidance(run))
         execution_plan = _planned_execution(run)
         if execution_plan is not None:
             return self._execute_multi_agent(
-                task=task,
+                task=effective_task,
                 run=run,
                 execution_agent=execution_agent,
                 execution_plan=execution_plan,
             )
-        workflow_mode = _resolve_workflow_mode(task, run)
-        if workflow_mode == "free_workflow" and _should_use_free_workflow_runtime(task, run):
+        workflow_mode = _resolve_workflow_mode(effective_task, run)
+        if workflow_mode == "free_workflow" and _should_use_free_workflow_runtime(effective_task, run):
             return self._execute_free_workflow(
-                task=task,
+                task=effective_task,
                 run=run,
                 execution_agent=execution_agent,
             )
         if workflow_mode == "professional_workflow":
             return self._execute_professional_workflow(
-                task=task,
+                task=effective_task,
                 run=run,
                 execution_agent=execution_agent,
             )
         profile = _safe_execution_profile(execution_agent, run)
-        execution_mode = _resolve_execution_mode(task, execution_agent, run, profile)
+        execution_mode = _resolve_execution_mode(effective_task, execution_agent, run, profile)
         if execution_mode == "chat":
             return self._attach_execution_contracts(
-                task=task,
+                task=effective_task,
                 run=run,
                 execution_agent=execution_agent,
-                result=self._execute_chat(task=task, run=run, execution_agent=execution_agent),
+                result=self._execute_chat(task=effective_task, run=run, execution_agent=execution_agent),
             )
         if execution_mode == "search":
             return self._attach_execution_contracts(
-                task=task,
+                task=effective_task,
                 run=run,
                 execution_agent=execution_agent,
-                result=self._execute_search(task=task, run=run, execution_agent=execution_agent),
+                result=self._execute_search(task=effective_task, run=run, execution_agent=execution_agent),
             )
         if execution_mode == "write":
             return self._attach_execution_contracts(
-                task=task,
+                task=effective_task,
                 run=run,
                 execution_agent=execution_agent,
-                result=self._execute_write(task=task, run=run, execution_agent=execution_agent),
+                result=self._execute_write(task=effective_task, run=run, execution_agent=execution_agent),
             )
         if execution_mode == "help":
             return self._attach_execution_contracts(
-                task=task,
+                task=effective_task,
                 run=run,
                 execution_agent=execution_agent,
-                result=self._execute_help(task=task, run=run, execution_agent=execution_agent),
+                result=self._execute_help(task=effective_task, run=run, execution_agent=execution_agent),
             )
         return self._attach_execution_contracts(
-            task=task,
+            task=effective_task,
             run=run,
             execution_agent=execution_agent,
-            result=self._execute_default(task=task, run=run, execution_agent=execution_agent),
+            result=self._execute_default(task=effective_task, run=run, execution_agent=execution_agent),
         )
 
     def build_search_result(

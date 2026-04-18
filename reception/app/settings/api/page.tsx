@@ -7,7 +7,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Switch } from "@/components/ui/switch"
-import { Textarea } from "@/components/ui/textarea"
+import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { useAuth } from "@/hooks/use-auth"
 import { useAgentApiSettings, useUpdateAgentApiSettings } from "@/hooks/use-settings"
 import { toast } from "@/hooks/use-toast"
@@ -187,6 +187,26 @@ const providerMeta: Array<{
   },
 ]
 
+function formatSavedAt(value?: string | null): string | null {
+  const normalized = String(value ?? "").trim()
+  if (!normalized) {
+    return null
+  }
+
+  const directMatch = normalized.match(/^(\d{4}-\d{2}-\d{2})[T\s](\d{2}:\d{2}:\d{2})/)
+  if (directMatch) {
+    return `${directMatch[1]} ${directMatch[2]}`
+  }
+
+  const parsed = new Date(normalized)
+  if (Number.isNaN(parsed.getTime())) {
+    return normalized
+  }
+
+  const pad = (part: number) => String(part).padStart(2, "0")
+  return `${parsed.getFullYear()}-${pad(parsed.getMonth() + 1)}-${pad(parsed.getDate())} ${pad(parsed.getHours())}:${pad(parsed.getMinutes())}:${pad(parsed.getSeconds())}`
+}
+
 function toDraftProvider(settings?: AgentApiProviderSettings): AgentApiProviderDraft {
   const source = settings ?? defaultProviderSettings
   return {
@@ -246,6 +266,7 @@ export default function AgentApiSettingsPage() {
   const savedSettings = data?.settings ?? defaultSettings
   const savedDraft = useMemo(() => toDraftSettings(savedSettings), [savedSettings])
   const [draft, setDraft] = useState<AgentApiDraftSettings>(savedDraft)
+  const [activeProvider, setActiveProvider] = useState<ProviderKey>("openai")
 
   useEffect(() => {
     setDraft(savedDraft)
@@ -258,6 +279,10 @@ export default function AgentApiSettingsPage() {
     () => JSON.stringify(buildUpdatePayload(draft)) !== JSON.stringify(buildUpdatePayload(savedDraft)),
     [draft, savedDraft],
   )
+  const currentProviderMeta =
+    providerMeta.find((provider) => provider.key === activeProvider) ?? providerMeta[0]
+  const currentSettings = draft.providers[activeProvider]
+  const currentSavedProvider = savedSettings.providers[activeProvider]
 
   const updateProvider = (provider: ProviderKey, patch: Partial<AgentApiProviderDraft>) => {
     setDraft((current) => ({
@@ -276,7 +301,7 @@ export default function AgentApiSettingsPage() {
       const response = await updateAgentApiSettings.mutateAsync(buildUpdatePayload(draft))
       setDraft(toDraftSettings(response.settings))
       toast({
-        title: "模型与 Provider 已保存",
+        title: "模型接入已保存",
         description: "新的供应商配置已经写入后端，密钥按掩码方式回显。",
       })
     } catch (saveError) {
@@ -292,25 +317,22 @@ export default function AgentApiSettingsPage() {
   }
 
   return (
-    <div className="space-y-6 p-6">
-      <div className="flex flex-wrap items-start justify-between gap-3">
+    <div className="space-y-4 p-6">
+      <div className="flex flex-wrap items-end justify-between gap-3">
         <div className="space-y-1">
-          <h1 className="text-2xl font-bold text-foreground">模型与 Provider</h1>
-          <p className="text-sm text-muted-foreground">
-            为不同 Agent 绑定主流模型供应商入口，统一维护 API Key、模型和网关地址。
-          </p>
+          <h1 className="text-2xl font-bold text-foreground">模型接入</h1>
+          <p className="text-sm text-muted-foreground">统一维护模型入口、默认模型和网关地址。</p>
         </div>
         <div className="space-y-1 text-right">
           <p className="text-xs text-muted-foreground">
             {hasLoadedSettings
               ? data?.updatedAt
-                ? `最近保存：${data.updatedAt}`
+                ? `最近保存：${formatSavedAt(data.updatedAt) ?? data.updatedAt}`
                 : "当前为默认配置"
               : isLoading
                 ? "正在读取配置..."
                 : "尚未加载到可编辑配置"}
           </p>
-          <p className="text-xs text-muted-foreground">敏感信息会以加密形式落库。</p>
         </div>
       </div>
 
@@ -326,185 +348,149 @@ export default function AgentApiSettingsPage() {
         </div>
       ) : null}
 
-      <div className="grid gap-4 xl:grid-cols-2">
-        {providerMeta.map((provider) => {
-          const settings = draft.providers[provider.key]
-          const savedProvider = savedSettings.providers[provider.key]
-          const Icon = provider.icon
-          const keyHint = settings.clearApiKey
-            ? "当前保存的 API Key 将在下次保存时清空。"
-            : settings.apiKey
-              ? "已录入新的 API Key，保存后会替换当前密钥。"
-              : savedProvider.hasApiKey
-                ? `当前已保存密钥：${savedProvider.apiKeyMasked ?? "已配置"}`
-                : "当前未保存 API Key。"
-
-          return (
-            <Card key={provider.key} className="bg-card">
-              <CardHeader className="pb-3">
-                <div className="flex items-start justify-between gap-3">
-                  <div className="flex items-center gap-3">
-                    <div className="flex size-10 items-center justify-center rounded-xl bg-secondary/60">
-                      <Icon className={`size-5 ${provider.accent}`} />
-                    </div>
-                    <div>
-                      <CardTitle className="text-base">{provider.label}</CardTitle>
-                      <p className="text-sm text-muted-foreground">{provider.description}</p>
-                    </div>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <span className="text-xs text-muted-foreground">
-                      {settings.enabled ? "已启用" : "未启用"}
-                    </span>
-                    <Switch
-                      checked={settings.enabled}
-                      disabled={!canEditSettings || !hasLoadedSettings || isSaving}
-                      onCheckedChange={(checked) => updateProvider(provider.key, { enabled: checked })}
-                    />
-                  </div>
-                </div>
-              </CardHeader>
-              <CardContent className="space-y-4">
-                <div className="grid gap-4 md:grid-cols-2">
-                  <div className="space-y-2 md:col-span-2">
-                    <div className="flex items-center justify-between gap-3">
-                      <Label htmlFor={`${provider.key}-api-key`}>API Key</Label>
-                      {savedProvider.hasApiKey ? (
-                        <Button
-                          type="button"
-                          variant="ghost"
-                          size="sm"
-                          disabled={!canEditSettings || !hasLoadedSettings || isSaving}
-                          onClick={() =>
-                            updateProvider(provider.key, {
-                              apiKey: "",
-                              clearApiKey: !settings.clearApiKey,
-                            })
-                          }
-                        >
-                          {settings.clearApiKey ? "保留现有 Key" : "清空已保存 Key"}
-                        </Button>
-                      ) : null}
-                    </div>
-                    <Input
-                      id={`${provider.key}-api-key`}
-                      type="password"
-                      autoComplete="off"
-                      value={settings.apiKey}
-                      disabled={!canEditSettings || !hasLoadedSettings || isSaving}
-                      placeholder="留空表示保留当前 Key，输入则替换"
-                      onChange={(event) =>
-                        updateProvider(provider.key, {
-                          apiKey: event.target.value,
-                          clearApiKey: false,
-                        })
-                      }
-                    />
-                    <p className="text-xs text-muted-foreground">{keyHint}</p>
-                  </div>
-                  <div className="space-y-2 md:col-span-2">
-                    <Label htmlFor={`${provider.key}-base-url`}>Base URL</Label>
-                    <Input
-                      id={`${provider.key}-base-url`}
-                      value={settings.baseUrl}
-                      disabled={!canEditSettings || !hasLoadedSettings || isSaving}
-                      onChange={(event) => updateProvider(provider.key, { baseUrl: event.target.value })}
-                    />
-                  </div>
-                  <div className="space-y-2">
-                    <Label htmlFor={`${provider.key}-model`}>默认模型</Label>
-                    <Input
-                      id={`${provider.key}-model`}
-                      value={settings.model}
-                      disabled={!canEditSettings || !hasLoadedSettings || isSaving}
-                      onChange={(event) => updateProvider(provider.key, { model: event.target.value })}
-                    />
-                  </div>
-                  <div className="space-y-2">
-                    <Label htmlFor={`${provider.key}-endpoint-path`}>Endpoint Path</Label>
-                    <Input
-                      id={`${provider.key}-endpoint-path`}
-                      value={settings.endpointPath}
-                      disabled={!canEditSettings || !hasLoadedSettings || isSaving}
-                      onChange={(event) =>
-                        updateProvider(provider.key, { endpointPath: event.target.value })
-                      }
-                    />
-                  </div>
-                  {provider.fields.includes("organizationId") ? (
-                    <div className="space-y-2">
-                      <Label htmlFor={`${provider.key}-organization`}>Organization</Label>
-                      <Input
-                        id={`${provider.key}-organization`}
-                        value={settings.organizationId}
-                        disabled={!canEditSettings || !hasLoadedSettings || isSaving}
-                        onChange={(event) =>
-                          updateProvider(provider.key, { organizationId: event.target.value })
-                        }
-                      />
-                    </div>
-                  ) : null}
-                  {provider.fields.includes("projectId") ? (
-                    <div className="space-y-2">
-                      <Label htmlFor={`${provider.key}-project`}>Project</Label>
-                      <Input
-                        id={`${provider.key}-project`}
-                        value={settings.projectId}
-                        disabled={!canEditSettings || !hasLoadedSettings || isSaving}
-                        onChange={(event) =>
-                          updateProvider(provider.key, { projectId: event.target.value })
-                        }
-                      />
-                    </div>
-                  ) : null}
-                  {provider.fields.includes("groupId") ? (
-                    <div className="space-y-2">
-                      <Label htmlFor={`${provider.key}-group-id`}>Group ID</Label>
-                      <Input
-                        id={`${provider.key}-group-id`}
-                        value={settings.groupId}
-                        disabled={!canEditSettings || !hasLoadedSettings || isSaving}
-                        onChange={(event) => updateProvider(provider.key, { groupId: event.target.value })}
-                      />
-                    </div>
-                  ) : null}
-                  <div className="space-y-2 md:col-span-2">
-                    <Label htmlFor={`${provider.key}-notes`}>备注</Label>
-                    <Textarea
-                      id={`${provider.key}-notes`}
-                      rows={3}
-                      value={settings.notes}
-                      disabled={!canEditSettings || !hasLoadedSettings || isSaving}
-                      onChange={(event) => updateProvider(provider.key, { notes: event.target.value })}
-                    />
-                  </div>
-                </div>
-              </CardContent>
-            </Card>
-          )
-        })}
-      </div>
-
       <Card className="bg-card">
-        <CardHeader>
-          <CardTitle className="text-base">联调地址</CardTitle>
-        </CardHeader>
-        <CardContent className="grid gap-4 md:grid-cols-2">
-          <div className="space-y-2">
-            <Label htmlFor="api-base-url">后端 API</Label>
-            <Input
-              id="api-base-url"
-              readOnly
-              value={process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8080"}
-            />
+        <CardHeader className="space-y-4 pb-4">
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div className="flex items-center gap-3">
+              <div className="flex size-10 items-center justify-center rounded-xl bg-secondary/60">
+                <currentProviderMeta.icon className={`size-5 ${currentProviderMeta.accent}`} />
+              </div>
+              <div>
+                <CardTitle className="text-base">{currentProviderMeta.label}</CardTitle>
+                <p className="text-sm text-muted-foreground">{currentProviderMeta.description}</p>
+              </div>
+            </div>
+            <div className="flex items-center gap-2">
+              <span className="text-xs text-muted-foreground">
+                {currentSettings.enabled ? "已启用" : "未启用"}
+              </span>
+              <Switch
+                checked={currentSettings.enabled}
+                disabled={!canEditSettings || !hasLoadedSettings || isSaving}
+                onCheckedChange={(checked) => updateProvider(activeProvider, { enabled: checked })}
+              />
+            </div>
           </div>
-          <div className="space-y-2">
-            <Label htmlFor="ws-base-url">实时 WebSocket</Label>
-            <Input
-              id="ws-base-url"
-              readOnly
-              value={process.env.NEXT_PUBLIC_WS_BASE_URL ?? "ws://127.0.0.1:8080"}
-            />
+          <Tabs value={activeProvider} onValueChange={(value) => setActiveProvider(value as ProviderKey)}>
+            <TabsList className="flex h-auto w-full flex-wrap justify-start gap-2 bg-transparent p-0">
+              {providerMeta.map((provider) => (
+                <TabsTrigger
+                  key={provider.key}
+                  value={provider.key}
+                  className="h-8 rounded-md border border-border bg-background px-3 text-xs data-[state=active]:border-primary data-[state=active]:bg-primary/10"
+                >
+                  {provider.label}
+                </TabsTrigger>
+              ))}
+            </TabsList>
+          </Tabs>
+        </CardHeader>
+        <CardContent className="space-y-4 pt-0">
+          <div className="grid gap-4 md:grid-cols-2">
+            <div className="space-y-2 md:col-span-2">
+              <div className="flex items-center justify-between gap-3">
+                <Label htmlFor={`${activeProvider}-api-key`}>API Key</Label>
+                {currentSavedProvider.hasApiKey ? (
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    disabled={!canEditSettings || !hasLoadedSettings || isSaving}
+                    onClick={() =>
+                      updateProvider(activeProvider, {
+                        apiKey: "",
+                        clearApiKey: !currentSettings.clearApiKey,
+                      })
+                    }
+                  >
+                    {currentSettings.clearApiKey ? "保留现有 Key" : "清空已保存 Key"}
+                  </Button>
+                ) : null}
+              </div>
+              <Input
+                id={`${activeProvider}-api-key`}
+                type="password"
+                autoComplete="off"
+                value={currentSettings.apiKey}
+                disabled={!canEditSettings || !hasLoadedSettings || isSaving}
+                placeholder="留空表示保留当前 Key，输入则替换"
+                onChange={(event) =>
+                  updateProvider(activeProvider, {
+                    apiKey: event.target.value,
+                    clearApiKey: false,
+                  })
+                }
+              />
+              <p className="text-xs text-muted-foreground">
+                {currentSettings.clearApiKey
+                  ? "当前保存的 API Key 将在下次保存时清空。"
+                  : currentSettings.apiKey
+                    ? "已录入新的 API Key，保存后会替换当前密钥。"
+                    : currentSavedProvider.hasApiKey
+                      ? `当前已保存密钥：${currentSavedProvider.apiKeyMasked ?? "已配置"}`
+                      : "当前未保存 API Key。"}
+              </p>
+            </div>
+            <div className="space-y-2 md:col-span-2">
+              <Label htmlFor={`${activeProvider}-base-url`}>Base URL</Label>
+              <Input
+                id={`${activeProvider}-base-url`}
+                value={currentSettings.baseUrl}
+                disabled={!canEditSettings || !hasLoadedSettings || isSaving}
+                onChange={(event) => updateProvider(activeProvider, { baseUrl: event.target.value })}
+              />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor={`${activeProvider}-model`}>默认模型</Label>
+              <Input
+                id={`${activeProvider}-model`}
+                value={currentSettings.model}
+                disabled={!canEditSettings || !hasLoadedSettings || isSaving}
+                onChange={(event) => updateProvider(activeProvider, { model: event.target.value })}
+              />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor={`${activeProvider}-endpoint-path`}>Endpoint Path</Label>
+              <Input
+                id={`${activeProvider}-endpoint-path`}
+                value={currentSettings.endpointPath}
+                disabled={!canEditSettings || !hasLoadedSettings || isSaving}
+                onChange={(event) => updateProvider(activeProvider, { endpointPath: event.target.value })}
+              />
+            </div>
+            {currentProviderMeta.fields.includes("organizationId") ? (
+              <div className="space-y-2">
+                <Label htmlFor={`${activeProvider}-organization`}>Organization</Label>
+                <Input
+                  id={`${activeProvider}-organization`}
+                  value={currentSettings.organizationId}
+                  disabled={!canEditSettings || !hasLoadedSettings || isSaving}
+                  onChange={(event) => updateProvider(activeProvider, { organizationId: event.target.value })}
+                />
+              </div>
+            ) : null}
+            {currentProviderMeta.fields.includes("projectId") ? (
+              <div className="space-y-2">
+                <Label htmlFor={`${activeProvider}-project`}>Project</Label>
+                <Input
+                  id={`${activeProvider}-project`}
+                  value={currentSettings.projectId}
+                  disabled={!canEditSettings || !hasLoadedSettings || isSaving}
+                  onChange={(event) => updateProvider(activeProvider, { projectId: event.target.value })}
+                />
+              </div>
+            ) : null}
+            {currentProviderMeta.fields.includes("groupId") ? (
+              <div className="space-y-2">
+                <Label htmlFor={`${activeProvider}-group-id`}>Group ID</Label>
+                <Input
+                  id={`${activeProvider}-group-id`}
+                  value={currentSettings.groupId}
+                  disabled={!canEditSettings || !hasLoadedSettings || isSaving}
+                  onChange={(event) => updateProvider(activeProvider, { groupId: event.target.value })}
+                />
+              </div>
+            ) : null}
           </div>
         </CardContent>
       </Card>

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+import json
 import logging
 from threading import Lock
+from typing import Any
 from uuid import uuid4
 
 from fastapi import HTTPException, status
@@ -24,6 +26,7 @@ from app.services.channel_outbound_service import channel_outbound_service
 from app.services.document_search_service import document_search_service
 from app.services.language_service import detect_language
 from app.services.memory_service import memory_service
+from app.services.mcp_runtime_service import mcp_runtime_service
 from app.services.persistence_service import persistence_service
 from app.services.trace_exporter_service import trace_exporter_service
 from app.services.workflow_scheduler_service import workflow_scheduler_service
@@ -33,11 +36,13 @@ from app.services.store import store
 LABEL_AGENT_TYPE_MAP = {
     "安全检测": "security",
     "意图识别": "intent",
+    "对话 Agent": "conversation",
+    "需求分析任务分发 Agent": "task_dispatcher",
     "搜索 Agent": "search",
     "写作 Agent": "write",
     "发送结果": "output",
 }
-KNOWN_AGENT_TYPES = {"security", "intent", "search", "write", "output"}
+KNOWN_AGENT_TYPES = {"security", "intent", "conversation", "task_dispatcher", "search", "write", "output"}
 INTENT_AGENT_TYPE_MAP = {
     "search": "search",
     "write": "write",
@@ -78,6 +83,8 @@ WRITE_INTENT_HINTS = (
 STEP_HINTS_BY_AGENT_TYPE = {
     "security": ("安全", "网关"),
     "intent": ("意图", "路由", "Master Bot"),
+    "conversation": ("对话", "澄清", "handoff"),
+    "task_dispatcher": ("分发", "路由", "执行意图"),
     "search": ("搜索", "检索", "知识库"),
     "write": ("写作", "回复", "生成"),
     "output": ("发送结果", "输出", "回传"),
@@ -565,17 +572,126 @@ def _resolve_agent_type(agent_binding: str | None) -> str | None:
     return str(agent_binding)
 
 
+def _normalize_node_binding(value: object) -> str | None:
+    normalized = str(value or "").strip()
+    return normalized or None
+
+
 def _derive_agent_binding(node: dict) -> str | None:
-    agent_binding = node.get("agent_id")
+    agent_binding = _normalize_node_binding(node.get("agent_id") or node.get("agentId"))
     if agent_binding is not None:
-        return str(agent_binding)
+        return agent_binding
 
     fallback_type = LABEL_AGENT_TYPE_MAP.get(node.get("label"))
     return fallback_type
 
 
 def _derive_agent_type(node: dict) -> str | None:
-    return _resolve_agent_type(node.get("agent_id")) or LABEL_AGENT_TYPE_MAP.get(node.get("label"))
+    return _resolve_agent_type(_derive_agent_binding(node)) or LABEL_AGENT_TYPE_MAP.get(node.get("label"))
+
+
+def _derive_tool_binding(node: dict) -> str | None:
+    return _normalize_node_binding(node.get("tool_id") or node.get("toolId"))
+
+
+def _derive_workflow_binding(node: dict) -> str | None:
+    return _normalize_node_binding(node.get("workflow_id") or node.get("workflowId"))
+
+
+def _execution_node_label(node: dict, *, fallback: str) -> str:
+    return str(node.get("label") or "").strip() or fallback
+
+
+def _node_config(node: dict | None) -> dict[str, Any]:
+    config = (node or {}).get("config")
+    return store.clone(config) if isinstance(config, dict) else {}
+
+
+def _node_config_text(node: dict | None, *keys: str) -> str | None:
+    config = _node_config(node)
+    for key in keys:
+        value = config.get(key)
+        if value in {None, ""}:
+            continue
+        normalized = str(value).strip()
+        if normalized:
+            return normalized
+    return None
+
+
+def _append_description_text(base_text: str | None, *extra_lines: str | None) -> str | None:
+    parts = [str(base_text or "").strip()]
+    parts.extend(str(line or "").strip() for line in extra_lines)
+    normalized = [part for part in parts if part]
+    return "\n".join(normalized) if normalized else None
+
+
+def _workflow_node_template_context(*, task: dict, run: dict, node: dict) -> dict[str, str]:
+    request_text = _primary_request_text(task)
+    return {
+        "input": request_text,
+        "query": request_text,
+        "text": request_text,
+        "task_id": str(task.get("id") or "").strip(),
+        "task_title": str(task.get("title") or "").strip(),
+        "task_description": str(task.get("description") or "").strip(),
+        "workflow_run_id": str(run.get("id") or "").strip(),
+        "workflow_id": str(run.get("workflow_id") or "").strip(),
+        "workflow_name": str(run.get("workflow_name") or "").strip(),
+        "node_id": str(node.get("id") or "").strip(),
+        "node_label": _execution_node_label(node, fallback="工作流节点"),
+        "node_description": str(node.get("description") or "").strip(),
+        "intent": str(run.get("intent") or "").strip(),
+        "trigger": str(run.get("trigger") or "").strip(),
+    }
+
+
+def _render_node_template(template: str, *, context: dict[str, str]) -> object:
+    rendered = str(template)
+    for key, value in context.items():
+        rendered = rendered.replace(f"{{{{{key}}}}}", value)
+    stripped = rendered.strip()
+    if stripped.startswith("{") or stripped.startswith("["):
+        try:
+            return json.loads(rendered)
+        except json.JSONDecodeError:
+            return rendered
+    return rendered
+
+
+def _build_tool_payload(*, task: dict, run: dict, node: dict) -> dict[str, object]:
+    request_text = _primary_request_text(task)
+    base_payload: dict[str, object] = {
+        "query": request_text,
+        "text": request_text,
+        "task_id": str(task.get("id") or ""),
+        "workflow_run_id": str(run.get("id") or ""),
+        "workflow_id": str(run.get("workflow_id") or ""),
+        "node_id": str(node.get("id") or ""),
+        "node_label": _execution_node_label(node, fallback="工具节点"),
+    }
+    payload_template = _node_config_text(node, "payloadTemplate", "payload_template")
+    if not payload_template:
+        return base_payload
+
+    rendered_template = _render_node_template(
+        payload_template,
+        context=_workflow_node_template_context(task=task, run=run, node=node),
+    )
+    if isinstance(rendered_template, dict):
+        return {**base_payload, **rendered_template}
+    if isinstance(rendered_template, list):
+        return {**base_payload, "items": rendered_template}
+
+    rendered_text = str(rendered_template or "").strip()
+    if not rendered_text:
+        return base_payload
+    return {
+        **base_payload,
+        "query": rendered_text,
+        "text": rendered_text,
+        "payload_template": payload_template,
+    }
 
 
 def _message_trigger_keywords(workflow: dict) -> list[str]:
@@ -1749,6 +1865,9 @@ def _requeue_dispatch_context(run: dict, *, queued_at: str | None = None) -> Non
         "delivery_failed_at",
         "result_kind",
         "delivery_fact_context",
+        "execution_target_type",
+        "execution_target_id",
+        "execution_target",
     ):
         dispatch_context.pop(key, None)
     dispatch_context["execution_agent_id"] = None
@@ -1886,29 +2005,8 @@ def _workflow_has_execution_target(
     run: dict,
     intent: str | None,
 ) -> bool:
-    selected_agent_type = INTENT_AGENT_TYPE_MAP.get(intent)
-    if not selected_agent_type:
-        return False
-
-    if _selected_branch_node(workflow, intent) is not None:
-        return True
-
-    for node in workflow.get("nodes") or []:
-        if _normalize_workflow_node_type(node.get("type")) != "agent":
-            continue
-        if _derive_agent_type(node) == selected_agent_type:
-            return True
-        if LABEL_AGENT_TYPE_MAP.get(node.get("label")) == selected_agent_type:
-            return True
-        if selected_agent_type in str(node.get("agent_id") or "").strip().lower():
-            return True
-
-    for binding in workflow.get("agent_bindings") or []:
-        if _resolve_agent_binding(str(binding), expected_type=selected_agent_type) is not None:
-            return True
-        if selected_agent_type in str(binding).strip().lower():
-            return True
-    return False
+    del run
+    return _selected_branch_node(workflow, intent) is not None
 
 
 def _refresh_agent_success_rate(agent: dict) -> None:
@@ -1958,20 +2056,73 @@ def _mark_execution_agent_failed(agent: dict | None) -> None:
 
 def _selected_branch_node(workflow: dict, intent: str | None) -> dict | None:
     selected_agent_type = INTENT_AGENT_TYPE_MAP.get(intent)
+    nodes = workflow.get("nodes") or []
     if not selected_agent_type:
+        for node in nodes:
+            if _normalize_workflow_node_type(node.get("type")) == "workflow" and _derive_workflow_binding(node):
+                return node
+            if _normalize_workflow_node_type(node.get("type")) == "tool" and _derive_tool_binding(node):
+                return node
+        for node in nodes:
+            if _normalize_workflow_node_type(node.get("type")) != "agent":
+                continue
+            if _derive_agent_binding(node) or _derive_agent_type(node) or str(node.get("label") or "").strip():
+                return node
         return None
 
-    for node in workflow["nodes"]:
+    for node in nodes:
         if _normalize_workflow_node_type(node.get("type")) != "agent":
             continue
         if _derive_agent_type(node) == selected_agent_type:
             return node
 
-    for node in workflow["nodes"]:
+    for node in nodes:
         if _normalize_workflow_node_type(node.get("type")) != "agent":
             continue
         if selected_agent_type in str(node.get("label", "")).lower():
             return node
+
+    for node in nodes:
+        if _normalize_workflow_node_type(node.get("type")) == "workflow" and _derive_workflow_binding(node):
+            return node
+        if _normalize_workflow_node_type(node.get("type")) == "tool" and _derive_tool_binding(node):
+            return node
+    return None
+
+
+def _manager_packet_for_run(task: dict, run: dict) -> dict[str, Any]:
+    dispatch_context = _run_dispatch_context(run) or {}
+    manager_packet = dispatch_context.get("manager_packet")
+    if isinstance(manager_packet, dict):
+        return manager_packet
+    manager_packet = task.get("manager_packet")
+    return manager_packet if isinstance(manager_packet, dict) else {}
+
+
+def _conversation_node_message(task: dict, run: dict) -> str | None:
+    manager_packet = _manager_packet_for_run(task, run)
+    handoff_summary = str(
+        manager_packet.get("handoff_summary") or manager_packet.get("handoffSummary") or ""
+    ).strip()
+    if handoff_summary:
+        return handoff_summary
+    normalized_intent = str(run.get("intent") or "").strip().lower()
+    if normalized_intent and normalized_intent != "manual":
+        return "已完成需求澄清，并整理出可供分发层消费的 handoff summary"
+    return None
+
+
+def _task_dispatcher_node_message(task: dict, run: dict) -> str | None:
+    dispatch_context = _run_dispatch_context(run) or {}
+    route_decision = route_decision_from_payload(dispatch_context) or route_decision_from_task(task) or {}
+    route_reason = str(
+        route_decision.get("route_reason_summary") or route_decision.get("routeReasonSummary") or ""
+    ).strip()
+    if route_reason:
+        return route_reason
+    normalized_intent = str(run.get("intent") or "").strip().lower()
+    if normalized_intent and normalized_intent != "manual":
+        return f"已完成需求分析，并选定执行意图: {normalized_intent}"
     return None
 
 
@@ -2533,6 +2684,36 @@ def _build_run_nodes(workflow: dict, task: dict, run: dict, steps: list[dict]) -
             else:
                 node_state["status"] = "idle"
                 node_state["message"] = "尚未进入意图识别"
+        elif agent_type == "conversation":
+            conversation_message = _conversation_node_message(task, run)
+            if conversation_message:
+                node_state["status"] = "completed"
+                node_state["message"] = conversation_message
+                node_state["finished_at"] = run["updated_at"]
+            elif task["status"] == "pending":
+                node_state["status"] = "waiting"
+                node_state["message"] = "等待对话澄清"
+            else:
+                node_state["status"] = "idle"
+                node_state["message"] = "尚未进入对话接待"
+        elif agent_type == "task_dispatcher":
+            dispatcher_message = _task_dispatcher_node_message(task, run)
+            if route_step:
+                node_state["status"] = _status_from_step(route_step, "completed")
+                node_state["message"] = route_step.get("message")
+                node_state["tokens"] = route_step.get("tokens", 0)
+                node_state["started_at"] = route_step.get("started_at") or run["started_at"]
+                node_state["finished_at"] = route_step.get("finished_at")
+            elif dispatcher_message:
+                node_state["status"] = "completed"
+                node_state["message"] = dispatcher_message
+                node_state["finished_at"] = run["updated_at"]
+            elif task["status"] == "pending":
+                node_state["status"] = "waiting"
+                node_state["message"] = "等待需求分析与任务分发"
+            else:
+                node_state["status"] = "idle"
+                node_state["message"] = "尚未进入任务分发"
         elif node_type == "condition":
             if selected_node:
                 node_state["status"] = "completed"
@@ -2582,7 +2763,7 @@ def _build_run_nodes(workflow: dict, task: dict, run: dict, steps: list[dict]) -
             else:
                 node_state["status"] = "idle"
                 node_state["message"] = "等待上游触发"
-        elif node_type == "tool":
+        elif node_type == "tool" and selected_node and node["id"] == selected_node["id"]:
             if task["status"] == "completed":
                 node_state["status"] = "completed"
                 node_state["message"] = "工具调用已完成"
@@ -2599,6 +2780,29 @@ def _build_run_nodes(workflow: dict, task: dict, run: dict, steps: list[dict]) -
             else:
                 node_state["status"] = "idle"
                 node_state["message"] = "等待执行"
+        elif node_type == "tool":
+            node_state["status"] = "idle"
+            node_state["message"] = "当前运行未命中该工具"
+        elif node_type == "workflow" and selected_node and node["id"] == selected_node["id"]:
+            if task["status"] == "completed":
+                node_state["status"] = "completed"
+                node_state["message"] = "子工作流已完成"
+                node_state["finished_at"] = task.get("completed_at") or run["updated_at"]
+            elif task["status"] == "failed":
+                node_state["status"] = "error"
+                node_state["message"] = "子工作流执行失败"
+            elif selected_execution_status == "running":
+                node_state["status"] = "running"
+                node_state["message"] = "子工作流执行中"
+            elif selected_execution_status == "waiting":
+                node_state["status"] = "waiting"
+                node_state["message"] = "等待子工作流启动"
+            else:
+                node_state["status"] = "idle"
+                node_state["message"] = "等待执行"
+        elif node_type == "workflow":
+            node_state["status"] = "idle"
+            node_state["message"] = "当前运行未命中该子工作流"
         elif node_type == "transform":
             if task["status"] == "completed":
                 node_state["status"] = "completed"
@@ -3693,6 +3897,306 @@ def _execute_agent_task_with_locked_failures(
     return task_result, None
 
 
+def _preview_execution_payload(value: object, *, limit: int = 1200) -> str:
+    if value is None or value == "":
+        return ""
+    try:
+        if isinstance(value, (dict, list)):
+            rendered = json.dumps(value, ensure_ascii=False, indent=2, default=str)
+        else:
+            rendered = str(value)
+    except Exception:
+        rendered = str(value)
+    return _truncate_text(rendered, limit=limit)
+
+
+def _fail_workflow_run_due_execution_target_error_locked(
+    *,
+    task: dict,
+    run: dict,
+    steps: list[dict],
+    failure_message: str,
+    failure_stage: str = "execution",
+) -> dict:
+    recovered_run = _attempt_fallback_recovery_locked(
+        task=task,
+        run=run,
+        failure_stage=failure_stage,
+        failure_message=failure_message,
+        state="failed",
+        recovery_trigger=f"fallback.{failure_stage}_failure",
+    )
+    if recovered_run is not None:
+        return recovered_run
+
+    timestamp = store.now_string()
+    running_step = next(
+        (step for step in reversed(steps) if step.get("status") == "running"),
+        None,
+    )
+    if running_step is not None:
+        running_step["status"] = "failed"
+        running_step["finished_at"] = timestamp
+        running_step["message"] = failure_message
+    else:
+        _append_step(
+            task_id=task["id"],
+            title="执行失败",
+            status="failed",
+            agent="Workflow Execution Worker",
+            message=failure_message,
+            tokens=0,
+        )
+
+    task["status"] = "failed"
+    task["completed_at"] = timestamp
+    task["duration"] = task.get("duration") or "执行失败"
+    task["result"] = None
+    _append_assistant_conversation_message(
+        task,
+        channel_outbound_service.render_task_failure_text(task, failure_message),
+    )
+    _mark_dispatch_context_failure(
+        run,
+        state="failed",
+        failure_stage=failure_stage,
+        failure_message=failure_message,
+    )
+    refreshed_run = _refresh_run_state(run, task)
+    _publish_run_event(refreshed_run, "workflow_run.updated")
+    _persist_execution_state(task=task, steps=steps, run=refreshed_run)
+    _cancel_scheduled_run(refreshed_run["id"])
+    return refreshed_run
+
+
+def _execute_tool_node_locked(
+    *,
+    task: dict,
+    run: dict,
+    steps: list[dict],
+    node: dict,
+) -> tuple[dict | None, dict | None]:
+    tool_id = _derive_tool_binding(node)
+    if not tool_id:
+        return None, _fail_workflow_run_due_execution_target_error_locked(
+            task=task,
+            run=run,
+            steps=steps,
+            failure_message="工具节点未绑定可执行工具，任务已终止",
+            failure_stage="dispatch",
+        )
+
+    runtime_response = mcp_runtime_service.invoke_tool(
+        tool_id=tool_id,
+        payload=_build_tool_payload(task=task, run=run, node=node),
+        trace_context={
+            "workflow_id": str(run.get("workflow_id") or ""),
+            "workflow_run_id": str(run.get("id") or ""),
+            "task_id": str(task.get("id") or ""),
+            "node_id": str(node.get("id") or ""),
+            "node_type": "tool",
+        },
+    )
+    if not runtime_response.get("ok"):
+        error = runtime_response.get("error") or {}
+        failure_message = (
+            str(error.get("message") or "").strip()
+            or f"工具 {tool_id} 执行失败"
+        )
+        return None, _fail_workflow_run_due_execution_target_error_locked(
+            task=task,
+            run=run,
+            steps=steps,
+            failure_message=failure_message,
+            failure_stage="execution",
+        )
+
+    tool_meta = runtime_response.get("tool") or {}
+    tool_name = str(tool_meta.get("name") or _execution_node_label(node, fallback=tool_id)).strip()
+    preview = _preview_execution_payload(runtime_response.get("result"))
+    result_mapping = _node_config_text(node, "resultMapping", "result_mapping")
+    node_description = str(node.get("description") or "").strip()
+    content_parts = [preview or "工具调用已完成，但本次没有返回可展示的结构化结果。"]
+    if result_mapping:
+        content_parts.append(f"结果映射说明：{result_mapping}")
+    elif node_description:
+        content_parts.append(f"节点说明：{node_description}")
+    task_result = {
+        "kind": "tool_execution",
+        "title": f"{tool_name} 执行结果",
+        "summary": f"已完成工具调用：{tool_name}",
+        "content": "\n\n".join(part for part in content_parts if part),
+        "bullets": [
+            f"工具 ID：{tool_id}",
+            f"调用 Trace：{runtime_response.get('trace_id')}",
+            *([f"结果映射：{result_mapping}"] if result_mapping else []),
+        ],
+        "orchestration_steps": [
+            {
+                "title": "工具调用",
+                "status": "completed",
+                "agent": tool_name,
+                "message": f"已调用工具 {tool_name}（{tool_id}）并回收执行结果",
+                "tokens": 0,
+            }
+        ],
+    }
+    return task_result, None
+
+
+def _execute_workflow_node_locked(
+    *,
+    task: dict,
+    run: dict,
+    steps: list[dict],
+    node: dict,
+) -> tuple[dict | None, dict | None]:
+    child_workflow_id = _derive_workflow_binding(node)
+    if not child_workflow_id:
+        return None, _fail_workflow_run_due_execution_target_error_locked(
+            task=task,
+            run=run,
+            steps=steps,
+            failure_message="子工作流节点未绑定目标工作流，任务已终止",
+            failure_stage="dispatch",
+        )
+
+    child_workflow = _find_workflow(child_workflow_id)
+    parent_dispatch_context = _run_dispatch_context(run) or {}
+    workflow_call_stack = parent_dispatch_context.get("workflow_call_stack")
+    normalized_stack = [str(item).strip() for item in workflow_call_stack or [] if str(item).strip()]
+    current_workflow_id = str(run.get("workflow_id") or "").strip()
+    next_stack = [*normalized_stack, *([current_workflow_id] if current_workflow_id else [])]
+    handoff_note = _node_config_text(node, "handoffNote", "handoff_note")
+    node_description = str(node.get("description") or "").strip()
+    if child_workflow_id in next_stack:
+        return None, _fail_workflow_run_due_execution_target_error_locked(
+            task=task,
+            run=run,
+            steps=steps,
+            failure_message=f"检测到子工作流循环引用：{child_workflow_id}",
+            failure_stage="dispatch",
+        )
+
+    inherited_intent = _normalize_intent(run.get("intent"))
+    if inherited_intent == "manual" or _selected_branch_node(child_workflow, inherited_intent) is None:
+        inherited_intent = None
+
+    child_bundle = create_manual_workflow_run(
+        child_workflow_id,
+        trigger=f"workflow:{current_workflow_id or 'parent'}:{str(node.get('id') or '').strip() or 'node'}",
+        intent=inherited_intent,
+        task_title=f"子工作流触发 - {child_workflow['name']}",
+        task_description=_append_description_text(
+            task.get("description") or child_workflow.get("description"),
+            *(
+                [
+                    f"父流程节点说明：{node_description}",
+                    f"父子流程交接说明：{handoff_note}",
+                ]
+                if handoff_note or node_description
+                else []
+            ),
+        ),
+        trigger_title="子工作流触发",
+        trigger_agent=_execution_node_label(node, fallback="子工作流节点"),
+        trigger_message=(
+            f"父工作流 {current_workflow_id or '-'} 已触发子工作流 {child_workflow['name']}"
+            + (f"；交接说明：{handoff_note}" if handoff_note else "")
+        ),
+    )
+    child_run_id = str(child_bundle["run"]["id"] or "")
+    _cancel_scheduled_run(child_run_id)
+    child_run = _find_run(child_run_id)
+    child_dispatch_context = _run_dispatch_context(child_run)
+    if isinstance(child_dispatch_context, dict):
+        child_dispatch_context["workflow_call_stack"] = next_stack
+        child_dispatch_context["parent_workflow_id"] = current_workflow_id or None
+        child_dispatch_context["parent_run_id"] = str(run.get("id") or "").strip() or None
+        child_dispatch_context["parent_node_id"] = str(node.get("id") or "").strip() or None
+
+    refreshed_child_run = child_run
+    for _ in range(3):
+        refreshed_child_run = _advance_workflow_run_locked(
+            child_run_id,
+            mode="tick",
+            auto_schedule=False,
+        )
+        if str(refreshed_child_run.get("status") or "").strip().lower() in TERMINAL_TASK_STATUSES:
+            break
+
+    child_task = _find_task(refreshed_child_run.get("task_id"))
+    if child_task is None:
+        return None, _fail_workflow_run_due_execution_target_error_locked(
+            task=task,
+            run=run,
+            steps=steps,
+            failure_message=f"子工作流 {child_workflow['name']} 未生成可追踪任务",
+            failure_stage="execution",
+        )
+
+    child_status = str(refreshed_child_run.get("status") or "").strip().lower()
+    if child_status != "completed":
+        child_failure_message = str(
+            (_run_dispatch_context(refreshed_child_run) or {}).get("failure_message")
+            or child_task.get("duration")
+            or refreshed_child_run.get("current_stage")
+            or "子工作流执行失败"
+        ).strip()
+        return None, _fail_workflow_run_due_execution_target_error_locked(
+            task=task,
+            run=run,
+            steps=steps,
+            failure_message=f"子工作流 {child_workflow['name']} 未完成：{child_failure_message}",
+            failure_stage="execution",
+        )
+
+    child_result = store.clone(child_task.get("result"))
+    if _is_valid_task_result_payload(child_result):
+        child_result["summary"] = f"已通过子工作流“{child_workflow['name']}”完成执行"
+        orchestration_steps = child_result.get("orchestration_steps")
+        if not isinstance(orchestration_steps, list):
+            orchestration_steps = []
+            child_result["orchestration_steps"] = orchestration_steps
+        if handoff_note:
+            child_result.setdefault("bullets", [])
+            if isinstance(child_result["bullets"], list):
+                child_result["bullets"].append(f"交接说明：{handoff_note}")
+        orchestration_steps.insert(
+            0,
+            {
+                "title": "子工作流执行",
+                "status": "completed",
+                "agent": _execution_node_label(node, fallback="子工作流节点"),
+                "message": f"已完成子工作流 {child_workflow['name']}（run={child_run_id}）",
+                "tokens": 0,
+            },
+        )
+        return child_result, None
+
+    fallback_result = {
+        "kind": "workflow_execution",
+        "title": f"{child_workflow['name']} 执行完成",
+        "summary": f"子工作流 {child_workflow['name']} 已完成",
+        "content": (
+            f"子工作流运行 ID：{child_run_id}\n"
+            f"任务 ID：{child_task['id']}\n"
+            f"当前阶段：{refreshed_child_run.get('current_stage') or '执行完成'}"
+            + (f"\n交接说明：{handoff_note}" if handoff_note else "")
+        ),
+        "orchestration_steps": [
+            {
+                "title": "子工作流执行",
+                "status": "completed",
+                "agent": _execution_node_label(node, fallback="子工作流节点"),
+                "message": f"已完成子工作流 {child_workflow['name']}（run={child_run_id}）",
+                "tokens": 0,
+            }
+        ],
+    }
+    return fallback_result, None
+
+
 def _trigger_display_name(trigger: str) -> str:
     normalized = str(trigger or "").strip().lower()
     if normalized.startswith("webhook:"):
@@ -4488,7 +4992,8 @@ def _dispatch_workflow_run_locked(
         return _refresh_confirmation_pending_run_locked(run=run, task=task)
     resolved_intent = _resolve_tick_intent(run, workflow)
     run["intent"] = resolved_intent
-    if not _workflow_has_execution_target(workflow, run, resolved_intent):
+    selected_node = _selected_branch_node(workflow, resolved_intent)
+    if selected_node is None or not _workflow_has_execution_target(workflow, run, resolved_intent):
         return _fail_workflow_run_due_unavailable_agent(
             task,
             run,
@@ -4496,16 +5001,31 @@ def _dispatch_workflow_run_locked(
             failure_message="选定工作流缺少可执行节点，任务已终止",
         )
 
-    execution_agent = _resolve_dispatch_execution_agent(workflow, run, resolved_intent)
-    if execution_agent is None:
-        return _fail_workflow_run_due_unavailable_agent(
-            task,
-            run,
-            steps,
-            failure_message="选定工作流缺少可用的执行 Agent，任务已终止",
+    selected_node_type = _normalize_workflow_node_type(selected_node.get("type"))
+    execution_agent = None
+    execution_target_id = None
+    execution_target_name = _execution_node_label(selected_node, fallback="执行节点")
+    if selected_node_type == "agent":
+        execution_agent = _resolve_dispatch_execution_agent(workflow, run, resolved_intent)
+        if execution_agent is None:
+            return _fail_workflow_run_due_unavailable_agent(
+                task,
+                run,
+                steps,
+                failure_message="选定工作流缺少可用的执行 Agent，任务已终止",
+            )
+        execution_target_id = str(execution_agent.get("id") or "").strip() or _derive_agent_binding(selected_node)
+        execution_target_name = (
+            str(execution_agent.get("name") or "").strip()
+            or _execution_node_label(selected_node, fallback=_agent_name_for_intent(resolved_intent))
         )
+    elif selected_node_type == "tool":
+        execution_target_id = _derive_tool_binding(selected_node)
+    elif selected_node_type == "workflow":
+        execution_target_id = _derive_workflow_binding(selected_node)
+
     task["status"] = "running"
-    task["agent"] = _agent_name_for_intent(resolved_intent)
+    task["agent"] = execution_target_name
 
     waiting_step = next((step for step in reversed(steps) if step.get("status") == "running"), None)
     if waiting_step:
@@ -4513,7 +5033,7 @@ def _dispatch_workflow_run_locked(
         waiting_step["finished_at"] = store.now_string()
         waiting_step["message"] = (
             f"Dispatcher 已接管 dispatch context，准备派发到 "
-            f"{str(execution_agent.get('name') or _agent_name_for_intent(resolved_intent))}"
+            f"{execution_target_name}"
         )
 
     if not _find_step(steps, "安全", "网关"):
@@ -4540,19 +5060,32 @@ def _dispatch_workflow_run_locked(
         task_id=task["id"],
         title="执行节点",
         status="running",
-        agent=_agent_name_for_intent(resolved_intent),
-        message=f"已按 dispatch context 派发到 {_agent_name_for_intent(resolved_intent)} 执行",
+        agent=execution_target_name,
+        message=f"已按 dispatch context 派发到 {execution_target_name} 执行",
         tokens=64,
     )
+    dispatch_context = _run_dispatch_context(run)
+    if isinstance(dispatch_context, dict):
+        selected_node_config = _node_config(selected_node)
+        dispatch_context["selected_node_id"] = str(selected_node.get("id") or "").strip() or None
+        dispatch_context["selected_node_label"] = execution_target_name
+        dispatch_context["selected_node_type"] = selected_node_type
+        dispatch_context["selected_node_description"] = str(
+            selected_node.get("description") or ""
+        ).strip() or None
+        dispatch_context["selected_node_config"] = selected_node_config or None
     _mark_dispatch_context_state(
         run,
         "dispatched",
         dispatched_at=store.now_string(),
-        execution_agent_id=str(execution_agent.get("id") or "").strip() or None,
-        execution_agent=str(execution_agent.get("name") or "").strip()
-        or _agent_name_for_intent(resolved_intent),
+        execution_agent_id=(str(execution_agent.get("id") or "").strip() or None) if execution_agent else None,
+        execution_agent=execution_target_name,
+        execution_target_type=selected_node_type,
+        execution_target_id=execution_target_id,
+        execution_target=execution_target_name,
     )
-    _mark_execution_agent_started(execution_agent)
+    if execution_agent is not None:
+        _mark_execution_agent_started(execution_agent)
     task["tokens"] = sum(step.get("tokens", 0) for step in steps)
     refreshed_run = _refresh_run_state(run, task)
     _publish_run_event(refreshed_run, "workflow_run.updated")
@@ -4574,6 +5107,45 @@ def _execute_running_workflow_run_locked(
     execution_step: dict,
     allow_async_agent_queue: bool,
 ) -> dict:
+    selected_node = _selected_branch_node(workflow, run.get("intent"))
+    selected_node_type = _normalize_workflow_node_type((selected_node or {}).get("type"))
+
+    if selected_node_type == "tool" and selected_node is not None:
+        task_result, failure_run = _execute_tool_node_locked(
+            task=task,
+            run=run,
+            steps=steps,
+            node=selected_node,
+        )
+        if failure_run is not None:
+            return failure_run
+        return _finalize_agent_task_result_locked(
+            task=task,
+            run=run,
+            steps=steps,
+            execution_step=execution_step,
+            task_result=task_result,
+            execution_agent=None,
+        )
+
+    if selected_node_type == "workflow" and selected_node is not None:
+        task_result, failure_run = _execute_workflow_node_locked(
+            task=task,
+            run=run,
+            steps=steps,
+            node=selected_node,
+        )
+        if failure_run is not None:
+            return failure_run
+        return _finalize_agent_task_result_locked(
+            task=task,
+            run=run,
+            steps=steps,
+            execution_step=execution_step,
+            task_result=task_result,
+            execution_agent=None,
+        )
+
     if allow_async_agent_queue:
         queued_run = _queue_agent_execution_locked(
             task=task,

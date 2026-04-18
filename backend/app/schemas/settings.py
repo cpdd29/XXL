@@ -94,6 +94,8 @@ class TelegramChannelIntegrationSettings(APIModel):
     enabled: bool
     api_base_url: str
     http_timeout_seconds: float
+    tenant_id: str | None = None
+    tenant_name: str | None = None
     has_bot_token: bool
     bot_token_masked: str | None = None
     has_webhook_secret: bool
@@ -106,6 +108,8 @@ class WeComChannelIntegrationSettings(APIModel):
     webhook_secret_query_param: str
     bot_webhook_base_url: str
     http_timeout_seconds: float
+    tenant_id: str | None = None
+    tenant_name: str | None = None
     has_bot_webhook_key: bool
     bot_webhook_key_masked: str | None = None
     has_webhook_secret: bool
@@ -118,6 +122,8 @@ class FeishuChannelIntegrationSettings(APIModel):
     webhook_secret_query_param: str
     bot_webhook_base_url: str
     http_timeout_seconds: float
+    tenant_id: str | None = None
+    tenant_name: str | None = None
     has_bot_webhook_key: bool
     bot_webhook_key_masked: str | None = None
     has_webhook_secret: bool
@@ -134,6 +140,8 @@ class DingTalkChannelIntegrationSettings(APIModel):
     http_timeout_seconds: float
     webhook_secret_header: str
     webhook_secret_query_param: str
+    tenant_id: str | None = None
+    tenant_name: str | None = None
     has_client_secret: bool
     client_secret_masked: str | None = None
     has_webhook_secret: bool
@@ -157,6 +165,8 @@ class UpdateTelegramChannelIntegrationSettingsRequest(APIModel):
     enabled: bool | None = None
     api_base_url: str | None = None
     http_timeout_seconds: float | None = None
+    tenant_id: str | None = None
+    tenant_name: str | None = None
     bot_token: str | None = None
     clear_bot_token: bool | None = None
     webhook_secret: str | None = None
@@ -169,6 +179,8 @@ class UpdateWeComChannelIntegrationSettingsRequest(APIModel):
     webhook_secret_query_param: str | None = None
     bot_webhook_base_url: str | None = None
     http_timeout_seconds: float | None = None
+    tenant_id: str | None = None
+    tenant_name: str | None = None
     bot_webhook_key: str | None = None
     clear_bot_webhook_key: bool | None = None
     webhook_secret: str | None = None
@@ -181,6 +193,8 @@ class UpdateFeishuChannelIntegrationSettingsRequest(APIModel):
     webhook_secret_query_param: str | None = None
     bot_webhook_base_url: str | None = None
     http_timeout_seconds: float | None = None
+    tenant_id: str | None = None
+    tenant_name: str | None = None
     bot_webhook_key: str | None = None
     clear_bot_webhook_key: bool | None = None
     webhook_secret: str | None = None
@@ -199,6 +213,8 @@ class UpdateDingTalkChannelIntegrationSettingsRequest(APIModel):
     http_timeout_seconds: float | None = None
     webhook_secret_header: str | None = None
     webhook_secret_query_param: str | None = None
+    tenant_id: str | None = None
+    tenant_name: str | None = None
     webhook_secret: str | None = None
     clear_webhook_secret: bool | None = None
 

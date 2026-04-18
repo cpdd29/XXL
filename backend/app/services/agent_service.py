@@ -1,11 +1,15 @@
+import re
 from datetime import UTC, datetime
 from typing import Any
+from uuid import uuid4
 
 from fastapi import HTTPException, status
 
 from app.services.agent_config_service import agent_config_service, build_agent_config_summary
+from app.services.brain_skill_service import brain_skill_service
 from app.services.external_agent_registry_service import external_agent_registry_service
 from app.services.persistence_service import persistence_service
+from app.services.settings_service import get_agent_api_runtime_settings
 from app.services.store import store
 
 DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 15
@@ -25,6 +29,19 @@ ALLOWED_AGENT_STATUSES = {
     "offline",
     "maintenance",
     "error",
+}
+DEFAULT_AGENT_TYPE = "default"
+MODEL_BINDING_RUNTIME_KEY = "agent_binding"
+SKILL_BINDING_RUNTIME_KEY = "brain_skill_binding"
+PROVIDER_LABELS = {
+    "openai": "OpenAI",
+    "codex": "Codex",
+    "claude": "Claude",
+    "kimi": "Kimi",
+    "minimax": "MiniMax",
+    "gemini": "Gemini",
+    "deepseek": "DeepSeek",
+    "openapi": "OpenAPI Compatible",
 }
 
 
@@ -109,6 +126,68 @@ def _normalize_seconds(value: object, *, default: int, minimum: int, maximum: in
     return normalized
 
 
+def _normalize_text(value: object, *, lowercase: bool = False) -> str:
+    normalized = str(value or "").strip()
+    return normalized.lower() if lowercase else normalized
+
+
+def _normalize_identifier_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    items: list[str] = []
+    seen: set[str] = set()
+    for raw_item in value:
+        normalized = _normalize_text(raw_item)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        items.append(normalized)
+    return items
+
+
+def _enabled_provider_models() -> dict[str, dict[str, str]]:
+    runtime_settings = get_agent_api_runtime_settings()
+    providers = runtime_settings.get("providers")
+    if not isinstance(providers, dict):
+        return {}
+
+    result: dict[str, dict[str, str]] = {}
+    for provider_key, provider in providers.items():
+        if not isinstance(provider, dict):
+            continue
+        normalized_key = _normalize_text(provider_key, lowercase=True)
+        if not normalized_key or not bool(provider.get("enabled")):
+            continue
+        model = _normalize_text(provider.get("model"))
+        if not model:
+            continue
+        result[normalized_key] = {
+            "provider_key": normalized_key,
+            "provider_label": PROVIDER_LABELS.get(normalized_key, normalized_key.title()),
+            "model": model,
+        }
+    return result
+
+
+def _guess_provider_key_from_model(model: object) -> str | None:
+    normalized = _normalize_text(model, lowercase=True)
+    if not normalized:
+        return None
+    if "claude" in normalized:
+        return "claude"
+    if "kimi" in normalized or "moonshot" in normalized:
+        return "kimi"
+    if "deepseek" in normalized:
+        return "deepseek"
+    if "gemini" in normalized:
+        return "gemini"
+    if "codex" in normalized:
+        return "codex"
+    if normalized.startswith("gpt"):
+        return "openai"
+    return None
+
+
 def _runtime_snapshot(agent: dict) -> dict:
     snapshot = agent.get("config_snapshot")
     if not isinstance(snapshot, dict):
@@ -117,6 +196,254 @@ def _runtime_snapshot(agent: dict) -> dict:
     if not isinstance(runtime, dict):
         return {}
     return store.clone(runtime)
+
+
+def _runtime_model_binding(snapshot: dict | None) -> dict[str, str | None] | None:
+    if not isinstance(snapshot, dict):
+        return None
+    runtime = snapshot.get("runtime")
+    if not isinstance(runtime, dict):
+        return None
+    binding = runtime.get(MODEL_BINDING_RUNTIME_KEY)
+    if not isinstance(binding, dict):
+        return None
+
+    provider_key = _normalize_text(
+        binding.get("provider_key", binding.get("providerKey")),
+        lowercase=True,
+    ) or None
+    model = _normalize_text(binding.get("model")) or None
+    source = _normalize_text(binding.get("source")) or "manual"
+    if not provider_key and model:
+        provider_key = _guess_provider_key_from_model(model)
+    if not provider_key and not model:
+        return None
+    return {
+        "provider_key": provider_key,
+        "provider_label": PROVIDER_LABELS.get(provider_key, provider_key.title()) if provider_key else None,
+        "model": model,
+        "source": source,
+    }
+
+
+def _runtime_skill_binding(snapshot: dict | None) -> dict[str, Any] | None:
+    if not isinstance(snapshot, dict):
+        return None
+    runtime = snapshot.get("runtime")
+    if isinstance(runtime, dict):
+        binding = runtime.get(SKILL_BINDING_RUNTIME_KEY)
+        if isinstance(binding, dict):
+            return {
+                "skill_ids": _normalize_identifier_list(binding.get("skill_ids") or binding.get("skillIds")),
+                "source": _normalize_text(binding.get("source")) or "manual",
+            }
+        if isinstance(binding, list):
+            return {
+                "skill_ids": _normalize_identifier_list(binding),
+                "source": "manual",
+            }
+
+    agent_doc = snapshot.get("agent")
+    if not isinstance(agent_doc, dict):
+        return None
+    skill_ids = _normalize_identifier_list(agent_doc.get("skill_ids") or agent_doc.get("skillIds"))
+    if not skill_ids and "skill_ids" not in agent_doc and "skillIds" not in agent_doc:
+        return None
+    return {"skill_ids": skill_ids, "source": "config"}
+
+
+def _resolve_agent_model_binding(agent_payload: dict) -> dict[str, str | None] | None:
+    snapshot = agent_payload.get("config_snapshot")
+    runtime_binding = _runtime_model_binding(snapshot)
+    if runtime_binding is not None:
+        return runtime_binding
+
+    if not isinstance(snapshot, dict):
+        return None
+
+    agent_doc = snapshot.get("agent")
+    if not isinstance(agent_doc, dict):
+        return None
+
+    provider_key = _normalize_text(agent_doc.get("provider"), lowercase=True) or None
+    model = _normalize_text(agent_doc.get("model")) or None
+    if not provider_key and model:
+        provider_key = _guess_provider_key_from_model(model)
+    if not provider_key and not model:
+        return None
+    return {
+        "provider_key": provider_key,
+        "provider_label": PROVIDER_LABELS.get(provider_key, provider_key.title()) if provider_key else None,
+        "model": model,
+        "source": "config",
+    }
+
+
+def _resolve_agent_skill_binding(agent_payload: dict) -> list[str]:
+    snapshot = agent_payload.get("config_snapshot")
+    binding = _runtime_skill_binding(snapshot)
+    if binding is None:
+        return []
+    return _normalize_identifier_list(binding.get("skill_ids"))
+
+
+def _build_manual_config_snapshot(agent: dict) -> dict[str, Any]:
+    return {
+        "agent_id": str(agent.get("id") or "").strip(),
+        "status": "manual",
+        "directory": None,
+        "version": None,
+        "loaded_at": _now().isoformat(),
+        "files_loaded": [],
+        "warnings": [],
+        "agent": {
+            "agent_id": str(agent.get("id") or "").strip(),
+            "name": str(agent.get("name") or "").strip(),
+            "type": str(agent.get("type") or DEFAULT_AGENT_TYPE).strip().lower() or DEFAULT_AGENT_TYPE,
+        },
+        "soul": None,
+        "tools": None,
+        "memory_rules": None,
+        "examples": [],
+        "runtime": {},
+    }
+
+
+def _apply_model_binding_to_snapshot(
+    snapshot: dict | None,
+    *,
+    agent: dict,
+    provider_key: str | None,
+    model: str | None,
+    source: str = "manual",
+) -> dict[str, Any]:
+    next_snapshot = store.clone(snapshot) if isinstance(snapshot, dict) else _build_manual_config_snapshot(agent)
+    agent_doc = next_snapshot.get("agent")
+    if not isinstance(agent_doc, dict):
+        agent_doc = {}
+    agent_doc["agent_id"] = str(agent.get("id") or "").strip()
+    agent_doc["name"] = str(agent.get("name") or "").strip()
+    agent_doc["type"] = str(agent.get("type") or DEFAULT_AGENT_TYPE).strip().lower() or DEFAULT_AGENT_TYPE
+    if provider_key:
+        agent_doc["provider"] = provider_key
+    if model:
+        agent_doc["model"] = model
+    next_snapshot["agent"] = agent_doc
+
+    runtime = next_snapshot.get("runtime")
+    if not isinstance(runtime, dict):
+        runtime = {}
+    runtime[MODEL_BINDING_RUNTIME_KEY] = {
+        "provider_key": provider_key,
+        "model": model,
+        "source": source,
+    }
+    next_snapshot["runtime"] = runtime
+    next_snapshot["loaded_at"] = _now().isoformat()
+    return next_snapshot
+
+
+def _apply_skill_binding_to_snapshot(
+    snapshot: dict | None,
+    *,
+    agent: dict,
+    skill_ids: list[str],
+    source: str = "manual",
+) -> dict[str, Any]:
+    next_snapshot = store.clone(snapshot) if isinstance(snapshot, dict) else _build_manual_config_snapshot(agent)
+    normalized_skill_ids = _normalize_identifier_list(skill_ids)
+    agent_doc = next_snapshot.get("agent")
+    if not isinstance(agent_doc, dict):
+        agent_doc = {}
+    agent_doc["agent_id"] = str(agent.get("id") or "").strip()
+    agent_doc["name"] = str(agent.get("name") or "").strip()
+    agent_doc["type"] = str(agent.get("type") or DEFAULT_AGENT_TYPE).strip().lower() or DEFAULT_AGENT_TYPE
+    agent_doc["skill_ids"] = normalized_skill_ids
+    next_snapshot["agent"] = agent_doc
+
+    runtime = next_snapshot.get("runtime")
+    if not isinstance(runtime, dict):
+        runtime = {}
+    runtime[SKILL_BINDING_RUNTIME_KEY] = {
+        "skill_ids": normalized_skill_ids,
+        "source": source,
+    }
+    next_snapshot["runtime"] = runtime
+    next_snapshot["loaded_at"] = _now().isoformat()
+    return next_snapshot
+
+
+def _normalize_agent_config_payload(payload: dict[str, Any], *, current_agent: dict | None = None) -> dict[str, Any]:
+    current = current_agent or {}
+    name = _normalize_text(payload.get("name", current.get("name")))
+    if not name:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Agent 名称不能为空")
+
+    description = _normalize_text(payload.get("description", current.get("description")))
+    agent_type = _normalize_text(payload.get("type", current.get("type") or DEFAULT_AGENT_TYPE), lowercase=True)
+    if not agent_type:
+        agent_type = DEFAULT_AGENT_TYPE
+
+    enabled_value = payload.get("enabled", current.get("enabled", True))
+    enabled = bool(enabled_value)
+
+    provider_key = _normalize_text(
+        payload.get("provider_key", payload.get("providerKey")),
+        lowercase=True,
+    )
+    if not provider_key:
+        provider_key = (
+            _normalize_text(current.get("provider"), lowercase=True)
+            or (_resolve_agent_model_binding(current) or {}).get("provider_key")
+            or ""
+        )
+    enabled_models = _enabled_provider_models()
+    if provider_key not in enabled_models:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="请选择项目内已启用的模型")
+
+    requested_model = _normalize_text(payload.get("model"))
+    model = requested_model or enabled_models[provider_key]["model"]
+    if not model:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="所选模型不可用")
+
+    requested_skill_ids = payload.get("skill_ids", payload.get("skillIds"))
+    if requested_skill_ids is None:
+        skill_ids = _resolve_agent_skill_binding(current)
+    else:
+        skill_ids = _normalize_identifier_list(requested_skill_ids)
+
+    if skill_ids:
+        resolved_skills = brain_skill_service.resolve_skill_summaries(skill_ids)
+        resolved_skill_ids = {str(item.get("id") or "") for item in resolved_skills}
+        missing_skill_ids = [skill_id for skill_id in skill_ids if skill_id not in resolved_skill_ids]
+        if missing_skill_ids:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"以下 Skill 不存在：{', '.join(missing_skill_ids)}",
+            )
+
+    return {
+        "name": name,
+        "description": description,
+        "type": agent_type,
+        "enabled": enabled,
+        "provider_key": provider_key,
+        "provider_label": enabled_models[provider_key]["provider_label"],
+        "model": model,
+        "skill_ids": skill_ids,
+    }
+
+
+def _generate_agent_id(name: str, agent_type: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", name.strip().lower()).strip("-")
+    type_prefix = re.sub(r"[^a-z0-9]+", "-", agent_type.strip().lower()).strip("-") or "agent"
+    if not slug:
+        slug = f"{type_prefix}-agent"
+
+    existing_ids = {str(item.get("id") or "").strip() for item in _load_agents()}
+    if slug not in existing_ids:
+        return slug
+    return f"{slug}-{uuid4().hex[:6]}"
 
 
 def _set_runtime_snapshot(agent: dict, runtime: dict) -> None:
@@ -225,6 +552,9 @@ def _decorate_agent(agent_payload: dict, *, include_snapshot: bool = True) -> di
     elif not isinstance(payload.get("config_summary"), dict):
         payload["config_summary"] = build_agent_config_summary(snapshot)
     payload.update(_build_runtime_view(payload))
+    payload["model_binding"] = _resolve_agent_model_binding(payload)
+    payload["bound_skill_ids"] = _resolve_agent_skill_binding(payload)
+    payload["bound_skills"] = brain_skill_service.resolve_skill_summaries(payload["bound_skill_ids"])
     if not include_snapshot:
         payload.pop("config_snapshot", None)
     return payload
@@ -319,10 +649,28 @@ def _persist_agent(agent: dict | None) -> None:
 
 def reload_agent(agent_id: str) -> dict:
     agent = _find_agent_mutable(agent_id)
+    existing_snapshot = agent.get("config_snapshot")
+    existing_binding = _runtime_model_binding(existing_snapshot if isinstance(existing_snapshot, dict) else None)
+    existing_skill_binding = _runtime_skill_binding(existing_snapshot if isinstance(existing_snapshot, dict) else None)
     runtime_snapshot = _runtime_snapshot(agent)
     config_snapshot = agent_config_service.load_agent_config(agent)
     if runtime_snapshot:
         config_snapshot["runtime"] = runtime_snapshot
+    if existing_binding is not None:
+        config_snapshot = _apply_model_binding_to_snapshot(
+            config_snapshot,
+            agent=agent,
+            provider_key=existing_binding.get("provider_key"),
+            model=existing_binding.get("model"),
+            source=str(existing_binding.get("source") or "manual"),
+        )
+    if existing_skill_binding is not None:
+        config_snapshot = _apply_skill_binding_to_snapshot(
+            config_snapshot,
+            agent=agent,
+            skill_ids=_normalize_identifier_list(existing_skill_binding.get("skill_ids")),
+            source=str(existing_skill_binding.get("source") or "manual"),
+        )
     agent["config_snapshot"] = config_snapshot
     agent["config_summary"] = build_agent_config_summary(config_snapshot)
     agent["status"] = "idle"
@@ -331,6 +679,108 @@ def reload_agent(agent_id: str) -> dict:
     return {
         "ok": True,
         "message": f"Agent {agent['name']} reloaded",
+        "agent": _decorate_agent(agent),
+    }
+
+
+def refresh_agent_config_snapshot(agent_id: str) -> dict:
+    agent = _find_agent_mutable(agent_id)
+    existing_snapshot = agent.get("config_snapshot")
+    existing_binding = _runtime_model_binding(existing_snapshot if isinstance(existing_snapshot, dict) else None)
+    existing_skill_binding = _runtime_skill_binding(existing_snapshot if isinstance(existing_snapshot, dict) else None)
+    runtime_snapshot = _runtime_snapshot(agent)
+    config_snapshot = agent_config_service.load_agent_config(agent)
+    if runtime_snapshot:
+        config_snapshot["runtime"] = runtime_snapshot
+    if existing_binding is not None:
+        config_snapshot = _apply_model_binding_to_snapshot(
+            config_snapshot,
+            agent=agent,
+            provider_key=existing_binding.get("provider_key"),
+            model=existing_binding.get("model"),
+            source=str(existing_binding.get("source") or "manual"),
+        )
+    if existing_skill_binding is not None:
+        config_snapshot = _apply_skill_binding_to_snapshot(
+            config_snapshot,
+            agent=agent,
+            skill_ids=_normalize_identifier_list(existing_skill_binding.get("skill_ids")),
+            source=str(existing_skill_binding.get("source") or "manual"),
+        )
+    agent["config_snapshot"] = config_snapshot
+    agent["config_summary"] = build_agent_config_summary(config_snapshot)
+    _persist_agent(agent)
+    return _decorate_agent(agent)
+
+
+def create_agent(payload: dict[str, Any]) -> dict[str, Any]:
+    normalized = _normalize_agent_config_payload(payload)
+    agent_id = _generate_agent_id(normalized["name"], normalized["type"])
+    agent = {
+        "id": agent_id,
+        "name": normalized["name"],
+        "description": normalized["description"],
+        "type": normalized["type"],
+        "status": "idle",
+        "enabled": normalized["enabled"],
+        "tasks_completed": 0,
+        "tasks_total": 0,
+        "avg_response_time": "--",
+        "tokens_used": 0,
+        "tokens_limit": 0,
+        "success_rate": 0.0,
+        "last_active": "未运行",
+    }
+    agent["config_snapshot"] = _apply_model_binding_to_snapshot(
+        None,
+        agent=agent,
+        provider_key=normalized["provider_key"],
+        model=normalized["model"],
+    )
+    agent["config_snapshot"] = _apply_skill_binding_to_snapshot(
+        agent["config_snapshot"],
+        agent=agent,
+        skill_ids=normalized["skill_ids"],
+    )
+    agent["config_summary"] = build_agent_config_summary(agent["config_snapshot"])
+    cached_agent = _sync_cached_agent(agent)
+    _persist_agent(cached_agent)
+    return {
+        "ok": True,
+        "message": f"Agent {normalized['name']} created",
+        "agent": _decorate_agent(cached_agent),
+    }
+
+
+def update_agent_config(agent_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    agent = _find_agent_mutable(agent_id)
+    normalized = _normalize_agent_config_payload(payload, current_agent=agent)
+    agent["name"] = normalized["name"]
+    agent["description"] = normalized["description"]
+    agent["type"] = normalized["type"]
+    agent["enabled"] = normalized["enabled"]
+
+    current_snapshot = agent.get("config_snapshot")
+    if not isinstance(current_snapshot, dict):
+        current_snapshot = agent_config_service.load_agent_config(agent)
+
+    updated_snapshot = _apply_model_binding_to_snapshot(
+        current_snapshot,
+        agent=agent,
+        provider_key=normalized["provider_key"],
+        model=normalized["model"],
+    )
+    updated_snapshot = _apply_skill_binding_to_snapshot(
+        updated_snapshot,
+        agent=agent,
+        skill_ids=normalized["skill_ids"],
+    )
+    agent["config_snapshot"] = updated_snapshot
+    agent["config_summary"] = build_agent_config_summary(updated_snapshot)
+    _persist_agent(agent)
+    return {
+        "ok": True,
+        "message": f"Agent {agent['name']} config updated",
         "agent": _decorate_agent(agent),
     }
 

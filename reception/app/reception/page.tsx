@@ -100,28 +100,16 @@ export default function ReceptionPage() {
 
   return (
     <div className="space-y-6 p-6">
-      <div className="flex items-center justify-between">
-        <div>
-          <h1 className="text-2xl font-bold text-foreground">待办中心</h1>
-          <p className="text-sm text-muted-foreground">
-            聚焦需要继续对话推进的澄清任务，按渠道和会话快速回到处理链路。
-          </p>
-        </div>
-        <Badge variant="secondary" className="bg-primary/10 text-primary">
-          待回复 {replyQueue.length}
-        </Badge>
-      </div>
-
       <div className="grid gap-3 md:grid-cols-3">
         <Card className="bg-card">
           <CardContent className="p-4">
-            <div className="text-xs text-muted-foreground">筛选后会话</div>
+            <div className="text-xs text-muted-foreground">筛选后事项</div>
             <div className="mt-2 text-2xl font-semibold text-foreground">{filteredQueue.length}</div>
           </CardContent>
         </Card>
         <Card className="bg-card">
           <CardContent className="p-4">
-            <div className="text-xs text-muted-foreground">运行中澄清</div>
+            <div className="text-xs text-muted-foreground">等待继续回复</div>
             <div className="mt-2 text-2xl font-semibold text-foreground">{runningCount}</div>
           </CardContent>
         </Card>
@@ -149,9 +137,9 @@ export default function ReceptionPage() {
                 <EmptyMedia variant="icon">
                   <Headphones className="size-5" />
                 </EmptyMedia>
-                <EmptyTitle>当前没有待回复会话</EmptyTitle>
+                <EmptyTitle>当前没有待人工处理事项</EmptyTitle>
                 <EmptyDescription>
-                  当项目经理要求先澄清再执行时，对应会话会出现在这里。
+                  当主脑需要人工确认、补充说明或继续回复时，对应事项会出现在这里。
                 </EmptyDescription>
               </EmptyHeader>
               <EmptyContent>
@@ -168,7 +156,7 @@ export default function ReceptionPage() {
         <div className="grid gap-4 xl:grid-cols-[380px_minmax(0,1fr)]">
           <Card className="bg-card">
             <CardHeader className="pb-3">
-              <CardTitle className="text-base">待回复会话</CardTitle>
+              <CardTitle className="text-base">待处理事项</CardTitle>
             </CardHeader>
             <CardContent className="space-y-4 p-4">
               <div className="space-y-3">
@@ -237,12 +225,12 @@ export default function ReceptionPage() {
                             <div className="mt-2 flex flex-wrap gap-2">
                               {item.userLabel ? (
                                 <Badge variant="secondary" className="text-xs">
-                                  user: {item.userLabel}
+                                  用户: {item.userLabel}
                                 </Badge>
                               ) : null}
                               {item.sessionId ? (
                                 <Badge variant="secondary" className="text-xs">
-                                  session: {item.sessionId}
+                                  会话: {item.sessionId}
                                 </Badge>
                               ) : null}
                               {item.stateLabel ? (
@@ -258,7 +246,7 @@ export default function ReceptionPage() {
                   ))}
                   {groupedQueue.length === 0 ? (
                     <div className="rounded-xl border border-dashed border-border p-4 text-sm text-muted-foreground">
-                      当前筛选条件下没有匹配的待回复会话。
+                      当前筛选条件下没有匹配的待处理事项。
                     </div>
                   ) : null}
                 </div>
@@ -269,7 +257,7 @@ export default function ReceptionPage() {
           <div className="space-y-4">
             <Card className="bg-card">
               <CardHeader className="pb-3">
-                <CardTitle className="text-base">接待摘要</CardTitle>
+                <CardTitle className="text-base">待处理摘要</CardTitle>
               </CardHeader>
               <CardContent className="space-y-4">
                 <div className="flex items-center justify-between gap-3">
@@ -290,13 +278,13 @@ export default function ReceptionPage() {
                     <div className="mt-1 font-medium text-foreground">{selectedQueueItem?.sessionId ?? "--"}</div>
                   </div>
                   <div className="rounded-xl bg-secondary/30 p-3">
-                    <div className="text-xs text-muted-foreground">下一归属</div>
+                    <div className="text-xs text-muted-foreground">下一处理方</div>
                     <div className="mt-1 font-medium text-foreground">{selectedQueueItem?.nextOwner ?? "--"}</div>
                   </div>
                 </div>
                 <div className="grid gap-3 md:grid-cols-3">
                   <div className="rounded-xl bg-secondary/30 p-3">
-                    <div className="text-xs text-muted-foreground">接待态</div>
+                    <div className="text-xs text-muted-foreground">接待方式</div>
                     <div className="mt-2">
                       <Badge variant="secondary" className="bg-primary/10 text-primary">
                         {task?.managerPacket?.receptionMode ?? selectedQueueItem?.receptionMode ?? "--"}
@@ -304,7 +292,7 @@ export default function ReceptionPage() {
                     </div>
                   </div>
                   <div className="rounded-xl bg-secondary/30 p-3">
-                    <div className="text-xs text-muted-foreground">执行态</div>
+                    <div className="text-xs text-muted-foreground">执行方式</div>
                     <div className="mt-2">
                       <Badge variant="secondary" className="bg-success/15 text-success">
                         {task?.managerPacket?.workflowMode ?? selectedQueueItem?.workflowMode ?? "--"}
@@ -312,7 +300,7 @@ export default function ReceptionPage() {
                     </div>
                   </div>
                   <div className="rounded-xl bg-secondary/30 p-3">
-                    <div className="text-xs text-muted-foreground">确认态</div>
+                    <div className="text-xs text-muted-foreground">回复要求</div>
                     <div className="mt-2">
                       <Badge variant="secondary" className="bg-warning/15 text-warning-foreground">
                         {task?.managerPacket?.responseContract ??
@@ -325,7 +313,7 @@ export default function ReceptionPage() {
                   </div>
                 </div>
                 <div className="rounded-xl bg-secondary/30 p-3">
-                  <div className="text-xs text-muted-foreground">项目经理状态</div>
+                  <div className="text-xs text-muted-foreground">主脑会话状态</div>
                   <div className="mt-2 flex items-center gap-2">
                     <Badge variant="secondary" className="bg-primary/10 text-primary">
                       {task?.managerPacket?.stateLabel ?? selectedQueueItem?.stateLabel ?? "--"}
@@ -360,41 +348,41 @@ export default function ReceptionPage() {
 
             <Card className="bg-card">
               <CardHeader className="pb-3">
-                <CardTitle className="text-base">主脑分发</CardTitle>
+                <CardTitle className="text-base">主脑分发策略</CardTitle>
               </CardHeader>
               <CardContent className="space-y-3">
                 <div className="flex items-center justify-between rounded-xl bg-secondary/30 p-3">
-                  <span className="text-sm text-muted-foreground">接待态</span>
+                  <span className="text-sm text-muted-foreground">接待方式</span>
                   <Badge variant="secondary" className="bg-primary/10 text-primary">
                     {task?.managerPacket?.receptionMode ?? "--"}
                   </Badge>
                 </div>
                 <div className="flex items-center justify-between rounded-xl bg-secondary/30 p-3">
-                  <span className="text-sm text-muted-foreground">执行态</span>
+                  <span className="text-sm text-muted-foreground">执行方式</span>
                   <Badge variant="secondary" className="bg-success/10 text-success">
                     {task?.managerPacket?.workflowMode ?? "--"}
                   </Badge>
                 </div>
                 <div className="flex items-center justify-between rounded-xl bg-secondary/30 p-3">
-                  <span className="text-sm text-muted-foreground">确认态</span>
+                  <span className="text-sm text-muted-foreground">回复要求</span>
                   <Badge variant="secondary" className="bg-warning/20 text-warning-foreground">
                     {task?.managerPacket?.responseContract ?? task?.routeDecision?.confirmationStatus ?? "--"}
                   </Badge>
                 </div>
                 <div className="flex items-center justify-between rounded-xl bg-secondary/30 p-3">
-                  <span className="text-sm text-muted-foreground">经理动作</span>
+                  <span className="text-sm text-muted-foreground">主脑动作</span>
                   <span className="text-sm font-medium text-foreground">
                     {task?.managerPacket?.managerAction ?? "--"}
                   </span>
                 </div>
                 <div className="flex items-center justify-between rounded-xl bg-secondary/30 p-3">
-                  <span className="text-sm text-muted-foreground">交付模式</span>
+                  <span className="text-sm text-muted-foreground">输出方式</span>
                   <span className="text-sm font-medium text-foreground">
                     {task?.managerPacket?.deliveryMode ?? "--"}
                   </span>
                 </div>
                 <div className="flex items-center justify-between rounded-xl bg-secondary/30 p-3">
-                  <span className="text-sm text-muted-foreground">任务形态</span>
+                  <span className="text-sm text-muted-foreground">任务类型</span>
                   <span className="text-sm font-medium text-foreground">
                     {task?.managerPacket?.taskShape ?? "--"}
                   </span>
@@ -412,7 +400,7 @@ export default function ReceptionPage() {
 
             <Card className="bg-card">
               <CardHeader className="pb-3">
-                <CardTitle className="text-base">路由落点</CardTitle>
+                <CardTitle className="text-base">当前路由落点</CardTitle>
               </CardHeader>
               <CardContent className="space-y-3">
                 <div className="flex items-center justify-between rounded-xl bg-secondary/30 p-3">
@@ -428,7 +416,7 @@ export default function ReceptionPage() {
                   </span>
                 </div>
                 <div className="flex items-center justify-between rounded-xl bg-secondary/30 p-3">
-                  <span className="text-sm text-muted-foreground">执行代理</span>
+                  <span className="text-sm text-muted-foreground">执行角色</span>
                   <span className="text-sm font-medium text-foreground">
                     {task?.routeDecision?.executionAgent ?? "--"}
                   </span>

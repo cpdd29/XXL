@@ -1,0 +1,23 @@
+{
+  "name": "skyscraper-base-palette",
+  "notes": [
+    "Base placeholder palette derived from the bright/night reference pair.",
+    "Keep structure colors stable across day and night variants.",
+    "Swap reflection and emissive layers before recoloring the shell."
+  ],
+  "colors": {
+    "shell_dark": "#1D2434",
+    "shell_mid": "#39445C",
+    "shell_light": "#73829A",
+    "glass_day": "#84D7FF",
+    "glass_night": "#244D73",
+    "interior_warm": "#F7C26B",
+    "interior_cool": "#8DDFFF",
+    "accent_warning": "#FF6A4A",
+    "accent_safe": "#79F2A0",
+    "street_dark": "#20242D",
+    "street_light": "#4C5566",
+    "sky_day_top": "#79CFFF",
+    "sky_night_top": "#091A31"
+  }
+}

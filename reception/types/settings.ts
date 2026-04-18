@@ -55,6 +55,8 @@ export interface TelegramChannelIntegrationSettings {
   enabled: boolean
   apiBaseUrl: string
   httpTimeoutSeconds: number
+  tenantId: string | null
+  tenantName: string | null
   hasBotToken: boolean
   botTokenMasked: string | null
   hasWebhookSecret: boolean
@@ -67,6 +69,8 @@ export interface WeComChannelIntegrationSettings {
   webhookSecretQueryParam: string
   botWebhookBaseUrl: string
   httpTimeoutSeconds: number
+  tenantId: string | null
+  tenantName: string | null
   hasBotWebhookKey: boolean
   botWebhookKeyMasked: string | null
   hasWebhookSecret: boolean
@@ -79,6 +83,8 @@ export interface FeishuChannelIntegrationSettings {
   webhookSecretQueryParam: string
   botWebhookBaseUrl: string
   httpTimeoutSeconds: number
+  tenantId: string | null
+  tenantName: string | null
   hasBotWebhookKey: boolean
   botWebhookKeyMasked: string | null
   hasWebhookSecret: boolean
@@ -89,6 +95,8 @@ export interface DingTalkChannelIntegrationSettings {
   enabled: boolean
   apiBaseUrl: string
   httpTimeoutSeconds: number
+  tenantId: string | null
+  tenantName: string | null
   appId: string
   agentId: string
   clientId: string
@@ -118,6 +126,8 @@ export interface UpdateTelegramChannelIntegrationSettingsRequest {
   enabled?: boolean
   apiBaseUrl?: string
   httpTimeoutSeconds?: number
+  tenantId?: string
+  tenantName?: string
   botToken?: string
   clearBotToken?: boolean
   webhookSecret?: string
@@ -130,6 +140,8 @@ export interface UpdateWeComChannelIntegrationSettingsRequest {
   webhookSecretQueryParam?: string
   botWebhookBaseUrl?: string
   httpTimeoutSeconds?: number
+  tenantId?: string
+  tenantName?: string
   botWebhookKey?: string
   clearBotWebhookKey?: boolean
   webhookSecret?: string
@@ -142,6 +154,8 @@ export interface UpdateFeishuChannelIntegrationSettingsRequest {
   webhookSecretQueryParam?: string
   botWebhookBaseUrl?: string
   httpTimeoutSeconds?: number
+  tenantId?: string
+  tenantName?: string
   botWebhookKey?: string
   clearBotWebhookKey?: boolean
   webhookSecret?: string
@@ -152,6 +166,8 @@ export interface UpdateDingTalkChannelIntegrationSettingsRequest {
   enabled?: boolean
   apiBaseUrl?: string
   httpTimeoutSeconds?: number
+  tenantId?: string
+  tenantName?: string
   appId?: string
   agentId?: string
   clientId?: string

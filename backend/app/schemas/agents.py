@@ -5,6 +5,23 @@ from pydantic import Field
 from app.schemas.base import APIModel
 
 
+class AgentModelBinding(APIModel):
+    provider_key: str | None = None
+    provider_label: str | None = None
+    model: str | None = None
+    source: str | None = None
+
+
+class AgentBoundSkill(APIModel):
+    id: str
+    name: str
+    file_name: str
+    format: str
+    description: str | None = None
+    tags: list[str] = Field(default_factory=list)
+    capabilities: list[str] = Field(default_factory=list)
+
+
 class Agent(APIModel):
     id: str
     name: str
@@ -29,6 +46,9 @@ class Agent(APIModel):
     runtime_metrics: dict[str, Any] = Field(default_factory=dict)
     config_summary: dict[str, Any] | None = None
     config_snapshot: dict[str, Any] | None = None
+    model_binding: AgentModelBinding | None = None
+    bound_skill_ids: list[str] = Field(default_factory=list)
+    bound_skills: list[AgentBoundSkill] = Field(default_factory=list)
 
 
 class AgentListResponse(APIModel):
@@ -50,3 +70,47 @@ class AgentActionResponse(APIModel):
     ok: bool
     message: str
     agent: Agent
+
+
+class AgentConfigRequest(APIModel):
+    name: str
+    description: str = ""
+    type: str = "default"
+    enabled: bool = True
+    provider_key: str | None = None
+    model: str | None = None
+    skill_ids: list[str] = Field(default_factory=list)
+
+
+class BrainSkillItem(APIModel):
+    id: str
+    name: str
+    file_name: str
+    format: str
+    description: str | None = None
+    enabled: bool = True
+    tags: list[str] = Field(default_factory=list)
+    capabilities: list[str] = Field(default_factory=list)
+    uploaded_at: str | None = None
+
+
+class BrainSkillListResponse(APIModel):
+    items: list[BrainSkillItem]
+    total: int
+
+
+class BrainSkillUploadRequest(APIModel):
+    file_name: str
+    content: str
+
+
+class BrainSkillActionResponse(APIModel):
+    ok: bool
+    message: str
+    skill: BrainSkillItem
+
+
+class BrainSkillDeleteResponse(APIModel):
+    ok: bool
+    message: str
+    skill_id: str

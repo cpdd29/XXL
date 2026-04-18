@@ -1,12 +1,21 @@
 "use client"
 
-import { startTransition, useDeferredValue, useState } from "react"
-import { useRouter } from "next/navigation"
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
+import { startTransition, useDeferredValue, useEffect, useMemo, useState } from "react"
+import { useRouter, useSearchParams } from "next/navigation"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
+import {
+  Empty,
+  EmptyContent,
+  EmptyDescription,
+  EmptyHeader,
+  EmptyMedia,
+  EmptyTitle,
+} from "@/components/ui/empty"
 import { Input } from "@/components/ui/input"
-import { Avatar, AvatarFallback } from "@/components/ui/avatar"
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
+import { Skeleton } from "@/components/ui/skeleton"
 import {
   Table,
   TableBody,
@@ -15,96 +24,196 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table"
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu"
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select"
-import { useAuth } from "@/hooks/use-auth"
-import { cn } from "@/lib/utils"
-import { downloadUsers, useBlockUser, useUpdateUserRole, useUsers } from "@/hooks/use-users"
+import { downloadUsers, useUserTenants, useUsers } from "@/hooks/use-users"
 import { toast } from "@/hooks/use-toast"
-import type { User, UserRole, UserStatus } from "@/types"
-import { Search, Plus, MoreVertical, Filter, Download } from "lucide-react"
+import { cn } from "@/lib/utils"
+import type { UserPortrait } from "@/types"
+import { Building2, Download, Languages, MessageSquareText, Search, Users } from "lucide-react"
 
-const roleConfig: Record<UserRole, { label: string; color: string }> = {
-  admin: { label: "管理员", color: "bg-destructive/20 text-destructive" },
-  operator: { label: "运维员", color: "bg-primary/20 text-primary" },
-  viewer: { label: "查看者", color: "bg-muted-foreground/20 text-muted-foreground" },
-  external: { label: "外部画像", color: "bg-secondary text-secondary-foreground" },
+const TENANT_STORAGE_KEY = "user-portraits:selected-tenant"
+
+const platformLabelMap: Record<string, string> = {
+  telegram: "Telegram",
+  wecom: "WeCom",
+  feishu: "Feishu",
+  dingtalk: "DingTalk",
+  console: "Console",
 }
 
-const statusConfig: Record<UserStatus, { label: string; color: string }> = {
-  active: { label: "活跃", color: "bg-success/20 text-success" },
-  inactive: { label: "不活跃", color: "bg-warning/20 text-warning-foreground" },
-  suspended: { label: "已停用", color: "bg-destructive/20 text-destructive" },
+function platformLabel(platform: string) {
+  return platformLabelMap[platform] ?? platform
+}
+
+function languageLabel(language: "zh" | "en") {
+  return language === "zh" ? "中文" : "English"
+}
+
+function summarizeNotes(notes: string, maxLength = 28) {
+  const normalized = notes.trim()
+  if (!normalized) {
+    return "暂无备注"
+  }
+  return normalized.length > maxLength ? `${normalized.slice(0, maxLength)}...` : normalized
+}
+
+function LoadingTable() {
+  return (
+    <div className="space-y-3">
+      {Array.from({ length: 5 }).map((_, index) => (
+        <div
+          key={`user-portrait-loading-${index}`}
+          className="grid gap-3 rounded-xl border border-border px-4 py-3 md:grid-cols-[1.2fr_1fr_1fr_1fr_120px_140px_120px_1fr]"
+        >
+          {Array.from({ length: 8 }).map((__, cellIndex) => (
+            <Skeleton key={`user-portrait-loading-cell-${index}-${cellIndex}`} className="h-5 w-full" />
+          ))}
+        </div>
+      ))}
+    </div>
+  )
+}
+
+function PortraitChannels({ portrait }: { portrait: UserPortrait }) {
+  if (portrait.sourceChannels.length === 0) {
+    return <span className="text-xs text-muted-foreground">暂无渠道</span>
+  }
+
+  return (
+    <div className="flex flex-wrap gap-1.5">
+      {portrait.sourceChannels.slice(0, 2).map((channel) => (
+        <Badge key={`${portrait.id}-${channel}`} variant="outline" className="border-border">
+          {platformLabel(channel)}
+        </Badge>
+      ))}
+      {portrait.sourceChannels.length > 2 ? (
+        <Badge variant="secondary">+{portrait.sourceChannels.length - 2}</Badge>
+      ) : null}
+    </div>
+  )
+}
+
+function PortraitAccounts({ portrait }: { portrait: UserPortrait }) {
+  if (portrait.platformAccounts.length === 0) {
+    return <span className="text-xs text-muted-foreground">暂无账号</span>
+  }
+
+  return (
+    <div className="space-y-1">
+      {portrait.platformAccounts.slice(0, 2).map((account) => (
+        <div key={`${portrait.id}-${account.platform}-${account.accountId}`} className="text-xs text-foreground">
+          {platformLabel(account.platform)} / {account.accountId}
+        </div>
+      ))}
+      {portrait.platformAccounts.length > 2 ? (
+        <div className="text-xs text-muted-foreground">+{portrait.platformAccounts.length - 2} 个平台账号</div>
+      ) : null}
+    </div>
+  )
+}
+
+function PortraitTags({ portrait }: { portrait: UserPortrait }) {
+  if (portrait.tags.length === 0) {
+    return <span className="text-xs text-muted-foreground">暂无标签</span>
+  }
+
+  return (
+    <div className="flex flex-wrap gap-1.5">
+      {portrait.tags.slice(0, 2).map((tag) => (
+        <Badge key={`${portrait.id}-${tag}`} variant="secondary" className="bg-primary/10 text-primary">
+          {tag}
+        </Badge>
+      ))}
+      {portrait.tags.length > 2 ? <Badge variant="secondary">+{portrait.tags.length - 2}</Badge> : null}
+    </div>
+  )
 }
 
 export default function UsersPage() {
-  const { hasPermission } = useAuth()
   const router = useRouter()
+  const searchParams = useSearchParams()
   const [searchQuery, setSearchQuery] = useState("")
-  const [showFilters, setShowFilters] = useState(false)
-  const [roleFilter, setRoleFilter] = useState("all")
-  const [statusFilter, setStatusFilter] = useState("all")
+  const [selectedTenant, setSelectedTenant] = useState("")
+  const [hasTenantHydrated, setHasTenantHydrated] = useState(false)
   const [isExporting, setIsExporting] = useState(false)
   const deferredSearchQuery = useDeferredValue(searchQuery.trim())
-  const { data: allUsersData } = useUsers()
-  const { data, isLoading, error, isFetching } = useUsers({
-    search: deferredSearchQuery || undefined,
-    role: roleFilter,
-    status: statusFilter,
+  const { data: tenantOptionsData, isLoading: tenantOptionsLoading, error: tenantOptionsError } = useUserTenants()
+  const canViewAllTenants = tenantOptionsData?.canViewAllTenants ?? false
+  const defaultTenantId = tenantOptionsData?.defaultTenantId ?? ""
+  const {
+    data: tenantPortraitsData,
+    isLoading: tenantPortraitsLoading,
+    error: tenantPortraitsError,
+  } = useUsers({
+    tenantId: selectedTenant || undefined,
+    enabled: Boolean(selectedTenant),
   })
-  const updateRoleMutation = useUpdateUserRole()
-  const blockUserMutation = useBlockUser()
-  const users = data?.items ?? []
-  const allUserCount = allUsersData?.total ?? users.length
-  const activeAdvancedFilterCount = [
-    roleFilter !== "all",
-    statusFilter !== "all",
-  ].filter(Boolean).length
+  const { data, isLoading, error, isFetching } = useUsers({
+    tenantId: selectedTenant || undefined,
+    search: deferredSearchQuery || undefined,
+    enabled: Boolean(selectedTenant),
+  })
+
+  useEffect(() => {
+    const tenantFromQuery = searchParams.get("tenant")
+    if (tenantFromQuery) {
+      setSelectedTenant(tenantFromQuery)
+      setHasTenantHydrated(true)
+      return
+    }
+
+    const storedTenant = window.localStorage.getItem(TENANT_STORAGE_KEY)
+    if (storedTenant) {
+      setSelectedTenant(storedTenant)
+    }
+    setHasTenantHydrated(true)
+  }, [searchParams])
+
+  useEffect(() => {
+    if (!hasTenantHydrated || selectedTenant || !defaultTenantId) {
+      return
+    }
+    setSelectedTenant(defaultTenantId)
+  }, [defaultTenantId, hasTenantHydrated, selectedTenant])
+
+  useEffect(() => {
+    if (!hasTenantHydrated || !tenantOptionsData || !selectedTenant) {
+      return
+    }
+
+    const availableTenantIds = new Set(tenantOptionsData.items.map((tenant) => tenant.id))
+    if (selectedTenant === "all" && canViewAllTenants) {
+      return
+    }
+
+    if (!availableTenantIds.has(selectedTenant)) {
+      setSelectedTenant(defaultTenantId || "")
+    }
+  }, [canViewAllTenants, defaultTenantId, hasTenantHydrated, selectedTenant, tenantOptionsData])
+
+  useEffect(() => {
+    if (!hasTenantHydrated) {
+      return
+    }
+    if (!selectedTenant) {
+      window.localStorage.removeItem(TENANT_STORAGE_KEY)
+      return
+    }
+    window.localStorage.setItem(TENANT_STORAGE_KEY, selectedTenant)
+  }, [hasTenantHydrated, selectedTenant])
+
+  const tenantOptions = tenantOptionsData?.items ?? []
+  const tenantPortraits = tenantPortraitsData?.items ?? []
+  const portraits = data?.items ?? []
+  const selectedTenantMeta = selectedTenant === "all"
+    ? {
+        id: "all",
+        name: "全部租户",
+        status: "active",
+        profileCount: tenantPortraits.length,
+        description: "跨租户查看所有人员画像。",
+      }
+    : tenantOptions.find((tenant) => tenant.id === selectedTenant) ?? null
   const isSyncingSearch = deferredSearchQuery !== searchQuery.trim()
-  const canExportUsers = hasPermission("users:read")
-  const canEditRoles = hasPermission("users:role:write")
-  const canBlockUsers = hasPermission("users:block")
-
-  const handleRoleUpdate = async (user: User, role: UserRole) => {
-    try {
-      const result = await updateRoleMutation.mutateAsync({ userId: user.id, role })
-      toast({
-        title: "角色已更新",
-        description: `${user.name} 当前角色：${result.user.role ?? role}`,
-      })
-    } catch (mutationError) {
-      toast({
-        title: "更新角色失败",
-        description: mutationError instanceof Error ? mutationError.message : "未知错误",
-      })
-    }
-  }
-
-  const handleBlockUser = async (user: User) => {
-    try {
-      const result = await blockUserMutation.mutateAsync(user.id)
-      toast({
-        title: "账户状态已更新",
-        description: `${user.name} 当前状态：${result.user.status}`,
-      })
-    } catch (mutationError) {
-      toast({
-        title: "停用账户失败",
-        description: mutationError instanceof Error ? mutationError.message : "未知错误",
-      })
-    }
-  }
 
   const handleSearchChange = (value: string) => {
     startTransition(() => {
@@ -112,20 +221,34 @@ export default function UsersPage() {
     })
   }
 
-  const resetAdvancedFilters = () => {
+  const handleTenantChange = (value: string) => {
     startTransition(() => {
-      setRoleFilter("all")
-      setStatusFilter("all")
+      setSelectedTenant(value)
     })
   }
 
-  const handleExportUsers = async () => {
+  const openPortrait = (portrait: UserPortrait) => {
+    router.push(`/users/${portrait.id}?tenant=${encodeURIComponent(portrait.tenantId)}`)
+  }
+
+  const summaryText = useMemo(() => {
+    if (!selectedTenantMeta) {
+      return "请先选择租户，再查看对应的人员画像。"
+    }
+
+      return `${selectedTenantMeta.name} 共 ${tenantPortraits.length} 份画像${isFetching ? "，正在同步..." : ""}`
+    }, [isFetching, selectedTenantMeta, tenantPortraits.length])
+
+  const handleExport = async () => {
+    if (!selectedTenant) {
+      return
+    }
+
     try {
       setIsExporting(true)
       const { blob, filename } = await downloadUsers({
+        tenantId: selectedTenant === "all" ? undefined : selectedTenant,
         search: deferredSearchQuery || undefined,
-        role: roleFilter,
-        status: statusFilter,
       })
 
       const objectUrl = window.URL.createObjectURL(blob)
@@ -138,12 +261,12 @@ export default function UsersPage() {
       window.URL.revokeObjectURL(objectUrl)
 
       toast({
-        title: "用户列表导出成功",
-        description: `已按当前筛选条件导出 ${users.length} 位用户。`,
+        title: "画像导出成功",
+        description: `已导出 ${selectedTenantMeta?.name ?? selectedTenant} 的当前筛选结果。`,
       })
     } catch (exportError) {
       toast({
-        title: "用户列表导出失败",
+        title: "画像导出失败",
         description: exportError instanceof Error ? exportError.message : "未知错误",
       })
     } finally {
@@ -153,254 +276,177 @@ export default function UsersPage() {
 
   return (
     <div className="flex h-full flex-col p-6">
-      <div className="mb-6 flex items-center justify-between">
-        <div>
-          <h1 className="text-2xl font-bold text-foreground">用户管理</h1>
-          <p className="text-sm text-muted-foreground">
-            管理系统用户和权限
-          </p>
-        </div>
-        <div className="flex items-center gap-2">
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={handleExportUsers}
-            disabled={!canExportUsers || isExporting || isLoading || isFetching || isSyncingSearch}
-          >
-            <Download className="mr-2 size-4" />
-            {isExporting ? "导出中..." : "导出"}
-          </Button>
-          <Button
-            size="sm"
-            onClick={() =>
-              toast({
-                title: "添加用户入口已保留",
-                description: "后续会接入用户创建表单。",
-              })
-            }
-          >
-            <Plus className="mr-2 size-4" />
-            添加用户
-          </Button>
-        </div>
+      <div className="mb-6 space-y-2">
+        <h1 className="text-2xl font-bold text-foreground">人员画像</h1>
+        <p className="text-sm text-muted-foreground">按真实租户上下文查看人员来源、平台映射、语言偏好和互动画像。</p>
       </div>
 
       <Card className="flex-1 bg-card">
         <CardHeader className="pb-3">
-          <div className="space-y-4">
-            <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
-              <div>
-                <CardTitle className="text-base">用户列表</CardTitle>
-                <p className="mt-1 text-sm text-muted-foreground">
-                  {deferredSearchQuery || activeAdvancedFilterCount > 0
-                    ? `当前匹配 ${users.length} / ${allUserCount} 位用户`
-                    : `当前共 ${allUserCount} 位用户`}
-                  {isFetching ? "，正在同步筛选结果..." : ""}
-                </p>
-              </div>
-              <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
-                <div className="relative">
-                  <Search className="absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
-                  <Input
-                    placeholder="搜索用户 / 渠道 / 平台账号..."
-                    value={searchQuery}
-                    onChange={(e) => handleSearchChange(e.target.value)}
-                    className="w-full bg-secondary pl-10 sm:w-64"
-                  />
-                </div>
-                <Button
-                  variant={showFilters || activeAdvancedFilterCount > 0 ? "secondary" : "outline"}
-                  size="sm"
-                  onClick={() => setShowFilters((current) => !current)}
-                >
-                  <Filter className="mr-2 size-4" />
-                  筛选
-                  {activeAdvancedFilterCount > 0 ? ` (${activeAdvancedFilterCount})` : ""}
-                </Button>
-              </div>
+          <div className="flex flex-col gap-4 xl:flex-row xl:items-center xl:justify-between">
+            <div>
+              <CardTitle className="text-base">画像列表</CardTitle>
+              <p className="mt-1 text-sm text-muted-foreground">{summaryText}</p>
             </div>
-            {showFilters ? (
-              <div className="grid gap-3 rounded-xl border border-border bg-secondary/20 p-4 md:grid-cols-[minmax(0,1fr)_180px_180px_auto]">
-                <div className="md:col-span-4">
-                  <div className="text-sm font-medium text-foreground">高级筛选</div>
-                  <div className="mt-1 text-sm text-muted-foreground">
-                    支持和搜索条件叠加，用于快速定位角色或状态范围内的用户。
-                  </div>
-                </div>
-                <div>
-                  <div className="mb-2 text-sm font-medium text-foreground">角色</div>
-                  <Select
-                    value={roleFilter}
-                    onValueChange={(value) =>
-                      startTransition(() => {
-                        setRoleFilter(value)
-                      })
-                    }
-                  >
-                    <SelectTrigger className="w-full bg-background">
-                      <SelectValue placeholder="全部角色" />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="all">全部角色</SelectItem>
-                      <SelectItem value="admin">管理员</SelectItem>
-                      <SelectItem value="operator">运维员</SelectItem>
-                      <SelectItem value="viewer">查看者</SelectItem>
-                      <SelectItem value="external">外部画像</SelectItem>
-                    </SelectContent>
-                  </Select>
-                </div>
-                <div>
-                  <div className="mb-2 text-sm font-medium text-foreground">状态</div>
-                  <Select
-                    value={statusFilter}
-                    onValueChange={(value) =>
-                      startTransition(() => {
-                        setStatusFilter(value)
-                      })
-                    }
-                  >
-                    <SelectTrigger className="w-full bg-background">
-                      <SelectValue placeholder="全部状态" />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="all">全部状态</SelectItem>
-                      <SelectItem value="active">活跃</SelectItem>
-                      <SelectItem value="inactive">不活跃</SelectItem>
-                      <SelectItem value="suspended">已停用</SelectItem>
-                    </SelectContent>
-                  </Select>
-                </div>
-                <div className="flex items-end">
-                  <Button
-                    variant="outline"
-                    className="w-full"
-                    onClick={resetAdvancedFilters}
-                    disabled={activeAdvancedFilterCount === 0}
-                  >
-                    清空筛选
-                  </Button>
-                </div>
+            <div className="flex flex-col gap-2 md:flex-row md:items-center">
+              <Select value={selectedTenant} onValueChange={handleTenantChange}>
+                <SelectTrigger className="w-full bg-secondary md:w-64">
+                  <SelectValue placeholder="选择租户" />
+                </SelectTrigger>
+                <SelectContent>
+                  {canViewAllTenants ? <SelectItem value="all">全部租户</SelectItem> : null}
+                  {tenantOptions.map((tenant) => (
+                    <SelectItem key={tenant.id} value={tenant.id}>
+                      {tenant.name}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <div className="relative">
+                <Search className="absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
+                <Input
+                  placeholder="搜索姓名 / 渠道 / 平台账号 / 标签"
+                  value={searchQuery}
+                  onChange={(event) => handleSearchChange(event.target.value)}
+                  className="w-full bg-secondary pl-10 md:w-72"
+                  disabled={!selectedTenant}
+                />
               </div>
-            ) : null}
+              <Button
+                variant="outline"
+                onClick={() => void handleExport()}
+                disabled={!selectedTenant || selectedTenant === "all" || isExporting || tenantPortraits.length === 0}
+              >
+                <Download className="mr-2 size-4" />
+                {isExporting ? "导出中..." : "导出画像"}
+              </Button>
+            </div>
           </div>
+          {selectedTenantMeta ? (
+            <div className="rounded-xl border border-border bg-secondary/20 px-4 py-3 text-sm text-muted-foreground">
+              <span className="font-medium text-foreground">{selectedTenantMeta.name}</span>
+              <span className="ml-2">{selectedTenantMeta.description}</span>
+            </div>
+          ) : null}
         </CardHeader>
-        <CardContent>
-          {error && (
-            <div className="mb-4 text-sm text-destructive">
-              用户数据加载失败：{error instanceof Error ? error.message : "未知错误"}
-            </div>
-          )}
-
-          <Table>
-            <TableHeader>
-              <TableRow className="border-border hover:bg-transparent">
-                <TableHead className="text-muted-foreground">用户</TableHead>
-                <TableHead className="text-muted-foreground">角色</TableHead>
-                <TableHead className="text-muted-foreground">状态</TableHead>
-                <TableHead className="text-muted-foreground">最后登录</TableHead>
-                <TableHead className="text-muted-foreground">交互次数</TableHead>
-                <TableHead className="text-muted-foreground">创建时间</TableHead>
-                <TableHead className="text-right text-muted-foreground">操作</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {users.map((user) => (
-                <TableRow key={user.id} className="border-border">
-                  <TableCell>
-                    <div className="flex items-center gap-3">
-                      <Avatar className="size-8">
-                        <AvatarFallback className="bg-primary/20 text-primary text-xs">
-                          {user.name.slice(0, 1)}
-                        </AvatarFallback>
-                      </Avatar>
-                      <div>
-                        <div className="font-medium text-foreground">
-                          {user.name}
-                        </div>
-                        <div className="text-xs text-muted-foreground">
-                          {user.email}
-                        </div>
-                      </div>
-                    </div>
-                  </TableCell>
-                  <TableCell>
-                    <Badge
-                      variant="secondary"
-                      className={cn("text-xs", roleConfig[user.role].color)}
+        <CardContent className="h-full">
+          {tenantOptionsError || tenantPortraitsError || error ? (
+            <Empty className="border-border">
+              <EmptyHeader>
+                <EmptyMedia variant="icon">
+                  <Users className="size-5" />
+                </EmptyMedia>
+                <EmptyTitle>人员画像加载失败</EmptyTitle>
+                <EmptyDescription>
+                  {(error instanceof Error ? error.message : null) ??
+                    (tenantPortraitsError instanceof Error ? tenantPortraitsError.message : null) ??
+                    (tenantOptionsError instanceof Error ? tenantOptionsError.message : "请稍后重试。")}
+                </EmptyDescription>
+              </EmptyHeader>
+            </Empty>
+          ) : tenantOptionsLoading || (selectedTenant && (tenantPortraitsLoading || isLoading)) ? (
+            <LoadingTable />
+          ) : !selectedTenant ? (
+            <Empty className="border-border">
+              <EmptyHeader>
+                <EmptyMedia variant="icon">
+                  <Building2 className="size-5" />
+                </EmptyMedia>
+                <EmptyTitle>未选择租户</EmptyTitle>
+                <EmptyDescription>
+                  先选择一个租户，再查看该租户下的人员画像列表与可导出结果。
+                </EmptyDescription>
+              </EmptyHeader>
+            </Empty>
+          ) : tenantPortraits.length === 0 ? (
+            <Empty className="border-border">
+              <EmptyHeader>
+                <EmptyMedia variant="icon">
+                  <Users className="size-5" />
+                </EmptyMedia>
+                <EmptyTitle>当前租户无画像</EmptyTitle>
+                <EmptyDescription>
+                  该租户下还没有可展示的人员画像，后续接入新渠道或补齐画像后会出现在这里。
+                </EmptyDescription>
+              </EmptyHeader>
+              <EmptyContent>
+                <Button variant="outline" onClick={() => setSelectedTenant("")}>
+                  重新选择租户
+                </Button>
+              </EmptyContent>
+            </Empty>
+          ) : portraits.length === 0 ? (
+            <Empty className="border-border">
+              <EmptyHeader>
+                <EmptyMedia variant="icon">
+                  <Search className="size-5" />
+                </EmptyMedia>
+                <EmptyTitle>搜索无结果</EmptyTitle>
+                <EmptyDescription>
+                  当前租户下没有匹配“{deferredSearchQuery}”的人员画像，请调整搜索词后再试。
+                </EmptyDescription>
+              </EmptyHeader>
+            </Empty>
+          ) : (
+            <div className="overflow-hidden rounded-xl border border-border">
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>人员名称</TableHead>
+                    <TableHead>来源渠道</TableHead>
+                    <TableHead>平台账号</TableHead>
+                    <TableHead>标签</TableHead>
+                    <TableHead>语言偏好</TableHead>
+                    <TableHead>最近活跃</TableHead>
+                    <TableHead>累计交互次数</TableHead>
+                    <TableHead>备注</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {portraits.map((portrait) => (
+                    <TableRow
+                      key={portrait.id}
+                      className={cn("cursor-pointer", isSyncingSearch ? "opacity-70" : "")}
+                      onClick={() => openPortrait(portrait)}
                     >
-                      {roleConfig[user.role].label}
-                    </Badge>
-                  </TableCell>
-                  <TableCell>
-                    <Badge
-                      variant="secondary"
-                      className={cn("text-xs", statusConfig[user.status].color)}
-                    >
-                      {statusConfig[user.status].label}
-                    </Badge>
-                  </TableCell>
-                  <TableCell className="text-muted-foreground">
-                    {user.lastLogin}
-                  </TableCell>
-                  <TableCell className="text-muted-foreground">
-                    {user.totalInteractions.toLocaleString()}
-                  </TableCell>
-                  <TableCell className="text-muted-foreground">
-                    {user.createdAt}
-                  </TableCell>
-                  <TableCell className="text-right">
-                    <DropdownMenu>
-                      <DropdownMenuTrigger asChild>
-                        <Button variant="ghost" size="icon" className="size-8">
-                          <MoreVertical className="size-4" />
-                        </Button>
-                      </DropdownMenuTrigger>
-                      <DropdownMenuContent align="end">
-                        <DropdownMenuItem
-                          onSelect={() => router.push(`/users/${encodeURIComponent(user.id)}`)}
-                        >
-                          查看详情
-                        </DropdownMenuItem>
-                        {canEditRoles && user.role !== "admin" && (
-                          <DropdownMenuItem onSelect={() => void handleRoleUpdate(user, "admin")}>
-                            设为管理员
-                          </DropdownMenuItem>
-                        )}
-                        {canEditRoles && user.role !== "operator" && (
-                          <DropdownMenuItem onSelect={() => void handleRoleUpdate(user, "operator")}>
-                            设为运维员
-                          </DropdownMenuItem>
-                        )}
-                        {canEditRoles && user.role !== "viewer" && (
-                          <DropdownMenuItem onSelect={() => void handleRoleUpdate(user, "viewer")}>
-                            设为查看者
-                          </DropdownMenuItem>
-                        )}
-                        {canBlockUsers ? (
-                          <DropdownMenuItem
-                            className="text-destructive"
-                            onSelect={() => void handleBlockUser(user)}
-                          >
-                            停用账户
-                          </DropdownMenuItem>
-                        ) : null}
-                      </DropdownMenuContent>
-                    </DropdownMenu>
-                  </TableCell>
-                </TableRow>
-              ))}
-            </TableBody>
-          </Table>
-          {isLoading && (
-            <div className="flex h-40 items-center justify-center text-muted-foreground">
-              正在加载用户数据...
+                      <TableCell>
+                        <div className="space-y-1">
+                          <div className="font-medium text-foreground">{portrait.name}</div>
+                          <div className="text-xs text-muted-foreground">{portrait.interactionSummary || portrait.tenantName}</div>
+                        </div>
+                      </TableCell>
+                      <TableCell>
+                        <PortraitChannels portrait={portrait} />
+                      </TableCell>
+                      <TableCell>
+                        <PortraitAccounts portrait={portrait} />
+                      </TableCell>
+                      <TableCell>
+                        <PortraitTags portrait={portrait} />
+                      </TableCell>
+                      <TableCell>
+                        <div className="flex items-center gap-2 text-sm text-foreground">
+                          <Languages className="size-4 text-primary" />
+                          {languageLabel(portrait.preferredLanguage)}
+                        </div>
+                      </TableCell>
+                      <TableCell className="text-sm text-foreground">{portrait.lastActiveAt}</TableCell>
+                      <TableCell>
+                        <div className="flex items-center gap-2 text-sm font-medium text-foreground">
+                          <MessageSquareText className="size-4 text-primary" />
+                          {portrait.totalInteractions.toLocaleString()}
+                        </div>
+                      </TableCell>
+                      <TableCell className="max-w-64 text-sm text-muted-foreground">{summarizeNotes(portrait.notes)}</TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
             </div>
           )}
-          {!isLoading && users.length === 0 && (
-            <div className="flex h-40 items-center justify-center text-muted-foreground">
-              没有找到匹配的用户
-            </div>
-          )}
+          <div className="mt-4 text-xs text-muted-foreground">
+            {selectedTenant ? `当前展示 ${portraits.length} / ${tenantPortraits.length} 份画像` : "租户上下文未选择"}
+          </div>
         </CardContent>
       </Card>
     </div>

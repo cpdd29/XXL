@@ -1,4 +1,5 @@
 import type { RuntimeSnapshot } from '@/types/runtime'
+import type { AgentType } from '@/types/agent'
 
 export interface DashboardStat {
   key: string
@@ -21,7 +22,7 @@ export type LogType = 'info' | 'success' | 'warning' | 'error'
 export interface DashboardAgentStatus {
   id: string
   name: string
-  type: 'search' | 'write' | 'security' | 'intent' | 'default' | 'output'
+  type: AgentType
   status: 'idle' | 'running' | 'waiting' | 'error'
   tasksCompleted: number
   avgResponseTime: string

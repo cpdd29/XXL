@@ -3,6 +3,8 @@
 import { useEffect, useState } from "react"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
+import { Input } from "@/components/ui/input"
+import { Label } from "@/components/ui/label"
 import { Switch } from "@/components/ui/switch"
 import { useAuth } from "@/hooks/use-auth"
 import { useGeneralSettings, useUpdateGeneralSettings } from "@/hooks/use-settings"
@@ -140,6 +142,30 @@ export default function GeneralSettingsPage() {
             >
               {isSaving ? "保存中..." : "保存设置"}
             </Button>
+          </div>
+        </CardContent>
+      </Card>
+
+      <Card className="bg-card">
+        <CardHeader>
+          <CardTitle className="text-base">联调地址</CardTitle>
+        </CardHeader>
+        <CardContent className="grid gap-4 md:grid-cols-2">
+          <div className="space-y-2">
+            <Label htmlFor="general-api-base-url">后端 API</Label>
+            <Input
+              id="general-api-base-url"
+              readOnly
+              value={process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://127.0.0.1:8080"}
+            />
+          </div>
+          <div className="space-y-2">
+            <Label htmlFor="general-ws-base-url">实时 WebSocket</Label>
+            <Input
+              id="general-ws-base-url"
+              readOnly
+              value={process.env.NEXT_PUBLIC_WS_BASE_URL ?? "ws://127.0.0.1:8080"}
+            />
           </div>
         </CardContent>
       </Card>

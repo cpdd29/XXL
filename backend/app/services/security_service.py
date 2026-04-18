@@ -1289,6 +1289,12 @@ def update_security_rule(
 
 
 def get_security_guardian() -> dict:
+    try:
+        return get_agent("security-guardian")
+    except HTTPException as exc:
+        if exc.status_code != status.HTTP_404_NOT_FOUND:
+            raise
+
     agents_payload = list_agents()
     for agent in agents_payload.get("items", []):
         if str(agent.get("type") or "").strip().lower() == "security":

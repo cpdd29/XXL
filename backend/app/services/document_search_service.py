@@ -7,9 +7,12 @@ import math
 from pathlib import Path
 import re
 
+from app.config import get_settings
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 DOCS_ROOT = PROJECT_ROOT / "docs"
+WIKI_ROOT = DOCS_ROOT / "wiki"
 MAX_CHUNK_CHARS = 720
 SVG_LAYER_PREFIXES = ("①", "②", "③", "④", "⑤")
 SECURITY_SECTION_ALIASES = {
@@ -116,6 +119,7 @@ class ProjectDocumentSearchService:
         chunks.extend(self._load_named_chunks("开发指南补充.md", kind="markdown"))
         chunks.extend(self._load_named_chunks("security_gateway_pipeline.svg", kind="svg"))
         chunks.extend(self._load_named_chunks("memory_distillation_lifecycle.svg", kind="svg"))
+        chunks.extend(self._load_wiki_chunks())
         return chunks
 
     def _load_named_chunks(self, filename: str, *, kind: str) -> list[DocumentChunk]:
@@ -126,20 +130,46 @@ class ProjectDocumentSearchService:
             if not candidate.exists():
                 continue
             if kind == "markdown":
-                return self._load_markdown_chunks(candidate)
+                return self._load_markdown_chunks(candidate, source_name=filename)
             return self._load_svg_chunks(candidate)
         return []
 
-    def _load_markdown_chunks(self, path: Path) -> list[DocumentChunk]:
+    def _load_wiki_chunks(self) -> list[DocumentChunk]:
+        if not bool(get_settings().enable_wiki_knowledge):
+            return []
+        if not WIKI_ROOT.exists():
+            return []
+
+        chunks: list[DocumentChunk] = []
+        for index, path in enumerate(sorted(WIKI_ROOT.rglob("*.md"))):
+            if not path.is_file():
+                continue
+            chunks.extend(
+                self._load_markdown_chunks(
+                    path,
+                    source_name=path.relative_to(DOCS_ROOT).as_posix(),
+                    order_base=80000 + index * 1000,
+                )
+            )
+        return chunks
+
+    def _load_markdown_chunks(
+        self,
+        path: Path,
+        *,
+        source_name: str | None = None,
+        order_base: int | None = None,
+    ) -> list[DocumentChunk]:
         if not path.exists():
             return []
 
+        resolved_source_name = source_name or path.name
         lines = path.read_text(encoding="utf-8").splitlines()
         chunks: list[DocumentChunk] = []
         heading_stack: list[str] = []
         buffer: list[str] = []
         found_heading = False
-        order_base = len(path.name) * 1000
+        resolved_order_base = order_base if order_base is not None else len(resolved_source_name) * 1000
 
         def flush_buffer() -> None:
             nonlocal buffer
@@ -151,16 +181,16 @@ class ProjectDocumentSearchService:
             if not body:
                 return
 
-            section = self._section_name_for_markdown_chunk(path.name, heading_stack, body)
+            section = self._section_name_for_markdown_chunk(resolved_source_name, heading_stack, body)
             for index, part in enumerate(self._split_body(body), start=1):
                 chunks.append(
                     DocumentChunk(
-                        source_name=path.name,
+                        source_name=resolved_source_name,
                         section=section if index == 1 else f"{section}（续 {index}）",
                         content=part,
-                        order=order_base + len(chunks),
+                        order=resolved_order_base + len(chunks),
                         kind="markdown",
-                        searchable_text=self._normalize_text(f"{path.name} {section} {part}"),
+                        searchable_text=self._normalize_text(f"{resolved_source_name} {section} {part}"),
                     )
                 )
 
@@ -187,12 +217,12 @@ class ProjectDocumentSearchService:
 
         return [
             DocumentChunk(
-                source_name=path.name,
+                source_name=resolved_source_name,
                 section=self._default_section_name(body),
                 content=part,
-                order=order_base + index,
+                order=resolved_order_base + index,
                 kind="markdown",
-                searchable_text=self._normalize_text(f"{path.name} {part}"),
+                searchable_text=self._normalize_text(f"{resolved_source_name} {part}"),
             )
             for index, part in enumerate(self._split_body(body))
         ]

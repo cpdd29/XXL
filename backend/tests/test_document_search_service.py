@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from app.config import get_settings
 from app.services.document_search_service import document_search_service
 
 
@@ -48,3 +49,30 @@ def test_search_memory_distillation_query_prefers_memory_svg_stages_with_stable_
         assert set(item.keys()) == {"source_name", "section", "content", "excerpt"}
         assert item["excerpt"] == "Memory distillation lifecycle"
         assert item["excerpt"] in item["content"]
+
+
+def test_search_indexes_wiki_markdown_pages_recursively() -> None:
+    results = document_search_service.search(
+        "请说明 XXL 知识库接入路径和本地 wiki 检索入口",
+        intent="help",
+        limit=3,
+    )
+
+    assert results
+    top = results[0]
+    assert top["source_name"] == "wiki/project/knowledge-entrypoints.md"
+    assert "知识库接入路径" in top["section"]
+    assert "document_search_service.py" in top["content"]
+
+
+def test_search_can_disable_wiki_knowledge_via_settings(monkeypatch) -> None:
+    monkeypatch.setattr(get_settings(), "enable_wiki_knowledge", False)
+
+    results = document_search_service.search(
+        "请说明 XXL 知识库接入路径和本地 wiki 检索入口",
+        intent="help",
+        limit=5,
+    )
+
+    assert results
+    assert all(not item["source_name"].startswith("wiki/") for item in results)

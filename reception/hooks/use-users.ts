@@ -7,48 +7,53 @@ import { API_BASE_URL } from '@/lib/api/config'
 import { ApiError } from '@/lib/api/errors'
 import { queryKeys } from '@/lib/api/query-keys'
 import type {
+  CreateUserTenantRequest,
+  UpdateUserProfileRequest,
   UserActionResponse,
   UserActivityResponse,
-  UserListResponse,
+  UserPortraitListResponse,
   UserProfile,
-  UpdateUserProfileRequest,
-  UserRole,
+  UserTenantActionResponse,
+  UserTenantOptionsResponse,
 } from '@/types'
 
 interface UseUsersParams {
+  tenantId?: string
   search?: string
-  role?: string
-  status?: string
+  enabled?: boolean
+  management?: boolean
 }
 
-function buildUsersSearchParams(params: UseUsersParams = {}) {
+function buildProfilesSearchParams(params: UseUsersParams = {}) {
   const searchParams = new URLSearchParams()
+
+  if (params.tenantId) {
+    searchParams.set('tenantId', params.tenantId)
+  }
 
   if (params.search) {
     searchParams.set('search', params.search)
   }
-  if (params.role && params.role !== 'all') {
-    searchParams.set('role', params.role)
-  }
-  if (params.status && params.status !== 'all') {
-    searchParams.set('status', params.status)
+
+  if (params.management) {
+    searchParams.set('management', 'true')
   }
 
   return searchParams
 }
 
-function buildUsersPath(params: UseUsersParams = {}) {
-  const queryString = buildUsersSearchParams(params).toString()
-  return queryString ? `/api/users?${queryString}` : '/api/users'
+function buildProfilesPath(params: UseUsersParams = {}) {
+  const queryString = buildProfilesSearchParams(params).toString()
+  return queryString ? `/api/profiles?${queryString}` : '/api/profiles'
 }
 
-function buildUsersExportPath(params: UseUsersParams = {}) {
-  const queryString = buildUsersSearchParams(params).toString()
-  return queryString ? `/api/users/export?${queryString}` : '/api/users/export'
+function buildProfilesExportPath(params: UseUsersParams = {}) {
+  const queryString = buildProfilesSearchParams(params).toString()
+  return queryString ? `/api/profiles/export?${queryString}` : '/api/profiles/export'
 }
 
 function resolveDownloadFilename(contentDisposition: string | null) {
-  if (!contentDisposition) return 'workbot-users.csv'
+  if (!contentDisposition) return 'workbot-profiles.csv'
 
   const utf8Match = contentDisposition.match(/filename\*=UTF-8''([^;]+)/i)
   if (utf8Match?.[1]) {
@@ -56,12 +61,12 @@ function resolveDownloadFilename(contentDisposition: string | null) {
   }
 
   const filenameMatch = contentDisposition.match(/filename="?([^";]+)"?/i)
-  return filenameMatch?.[1] || 'workbot-users.csv'
+  return filenameMatch?.[1] || 'workbot-profiles.csv'
 }
 
 export async function downloadUsers(params: UseUsersParams = {}) {
   const headers = await getAuthenticatedHeaders({ Accept: 'text/csv' })
-  const response = await fetch(`${API_BASE_URL}${buildUsersExportPath(params)}`, {
+  const response = await fetch(`${API_BASE_URL}${buildProfilesExportPath(params)}`, {
     method: 'GET',
     headers,
     cache: 'no-store',
@@ -78,93 +83,113 @@ export async function downloadUsers(params: UseUsersParams = {}) {
   }
 }
 
+export function useProfileTenants(enabled = true) {
+  return useQuery<UserTenantOptionsResponse>({
+    queryKey: queryKeys.users.tenants,
+    queryFn: () => apiRequest<UserTenantOptionsResponse>('/api/profiles/tenants'),
+    enabled,
+  })
+}
+
+export const useUserTenants = useProfileTenants
+
+export function useManagedUserTenants(enabled = true) {
+  return useQuery<UserTenantOptionsResponse>({
+    queryKey: [...queryKeys.users.tenants, 'management'] as const,
+    queryFn: () => apiRequest<UserTenantOptionsResponse>('/api/profiles/tenants?management=true'),
+    enabled,
+  })
+}
+
+export function useCreateUserTenant() {
+  const queryClient = useQueryClient()
+
+  return useMutation<UserTenantActionResponse, Error, CreateUserTenantRequest>({
+    mutationFn: (payload) =>
+      apiRequest<UserTenantActionResponse, CreateUserTenantRequest>('/api/profiles/tenants', {
+        method: 'POST',
+        body: payload,
+      }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.users.tenants })
+      queryClient.invalidateQueries({ queryKey: queryKeys.users.list })
+    },
+  })
+}
+
+export function useDeleteUserTenant() {
+  const queryClient = useQueryClient()
+
+  return useMutation<UserTenantActionResponse, Error, { tenantId: string }>({
+    mutationFn: ({ tenantId }) =>
+      apiRequest<UserTenantActionResponse>(`/api/profiles/tenants/${encodeURIComponent(tenantId)}`, {
+        method: 'DELETE',
+      }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.users.tenants })
+      queryClient.invalidateQueries({ queryKey: queryKeys.users.list })
+    },
+  })
+}
+
 export function useUsers(params?: UseUsersParams) {
-  return useQuery({
+  return useQuery<UserPortraitListResponse>({
     queryKey: [
       ...queryKeys.users.list,
+      params?.tenantId ?? '',
       params?.search ?? '',
-      params?.role ?? 'all',
-      params?.status ?? 'all',
+      params?.enabled ?? true,
+      params?.management ?? false,
     ] as const,
-    queryFn: () => apiRequest<UserListResponse>(buildUsersPath(params)),
+    queryFn: () => apiRequest<UserPortraitListResponse>(buildProfilesPath(params)),
+    enabled: params?.enabled ?? true,
   })
 }
 
 export function useUserProfile(userId: string) {
-  return useQuery({
+  return useQuery<UserProfile>({
     queryKey: queryKeys.users.profile(userId),
-    queryFn: () => apiRequest<UserProfile>(`/api/users/${encodeURIComponent(userId)}/profile`),
+    queryFn: () => apiRequest<UserProfile>(`/api/profiles/${encodeURIComponent(userId)}`),
     enabled: Boolean(userId),
   })
 }
 
 export function useUserActivity(userId: string) {
-  return useQuery({
+  return useQuery<UserActivityResponse>({
     queryKey: queryKeys.users.activity(userId),
-    queryFn: () => apiRequest<UserActivityResponse>(`/api/users/${encodeURIComponent(userId)}/activity`),
+    queryFn: () => apiRequest<UserActivityResponse>(`/api/profiles/${encodeURIComponent(userId)}/activity`),
     enabled: Boolean(userId),
-  })
-}
-
-export function useUpdateUserRole() {
-  const queryClient = useQueryClient()
-
-  return useMutation({
-    mutationFn: ({ userId, role }: { userId: string; role: UserRole }) =>
-      apiRequest<UserActionResponse>(`/api/users/${encodeURIComponent(userId)}/role`, {
-        method: 'PUT',
-        body: { role },
-      }),
-    onSuccess: (_, variables) => {
-      queryClient.invalidateQueries({ queryKey: queryKeys.users.list })
-      queryClient.invalidateQueries({ queryKey: queryKeys.users.profile(variables.userId) })
-      queryClient.invalidateQueries({ queryKey: queryKeys.users.activity(variables.userId) })
-    },
   })
 }
 
 export function useUpdateUserProfile() {
   const queryClient = useQueryClient()
 
-  return useMutation({
+  return useMutation<
+    UserActionResponse,
+    Error,
+    {
+      userId: string
+      payload: UpdateUserProfileRequest
+    }
+  >({
     mutationFn: ({
       userId,
       payload,
-    }: {
-      userId: string
-      payload: UpdateUserProfileRequest
     }) =>
       apiRequest<UserActionResponse, UpdateUserProfileRequest>(
-        `/api/users/${encodeURIComponent(userId)}/profile`,
+        `/api/profiles/${encodeURIComponent(userId)}`,
         {
           method: 'PUT',
           body: payload,
         },
       ),
     onSuccess: (response, variables) => {
-      queryClient.setQueryData(
-        queryKeys.users.profile(variables.userId),
-        response.user as UserProfile,
-      )
+      queryClient.setQueryData(queryKeys.users.profile(variables.userId), response.profile)
       queryClient.invalidateQueries({ queryKey: queryKeys.users.list })
       queryClient.invalidateQueries({ queryKey: queryKeys.users.profile(variables.userId) })
       queryClient.invalidateQueries({ queryKey: queryKeys.users.activity(variables.userId) })
-    },
-  })
-}
-
-export function useBlockUser() {
-  const queryClient = useQueryClient()
-
-  return useMutation({
-    mutationFn: (userId: string) =>
-      apiRequest<UserActionResponse>(`/api/users/${encodeURIComponent(userId)}/block`, {
-        method: 'POST',
-      }),
-    onSuccess: (_, userId) => {
-      queryClient.invalidateQueries({ queryKey: queryKeys.users.list })
-      queryClient.invalidateQueries({ queryKey: queryKeys.users.profile(userId) })
-      queryClient.invalidateQueries({ queryKey: queryKeys.users.activity(userId) })
+      queryClient.invalidateQueries({ queryKey: queryKeys.users.tenants })
     },
   })
 }

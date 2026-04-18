@@ -163,6 +163,10 @@ def _ensure_runtime_profile(profile: dict[str, Any]) -> dict[str, Any]:
     return store.user_profiles[user_id]
 
 
+def _delete_runtime_profile(user_id: str) -> None:
+    store.user_profiles.pop(user_id, None)
+
+
 def _raise_auth_storage_unavailable(*, reason: str) -> None:
     logger.warning("Auth database lookup unavailable: %s", reason)
     raise HTTPException(
@@ -258,19 +262,6 @@ def _demo_admin_user_payload() -> dict[str, Any]:
     }
 
 
-def _demo_admin_profile_payload(user: dict[str, Any]) -> dict[str, Any]:
-    settings = get_settings()
-    return {
-        **store.clone(user),
-        "tags": ["系统管理员", "控制面入口"],
-        "notes": "系统自动维护的默认管理员账号。",
-        "preferred_language": "zh",
-        "source_channels": ["console"],
-        "platform_accounts": [{"platform": "console", "account_id": str(user["id"])}],
-        **build_password_record(settings.demo_admin_password),
-    }
-
-
 def _is_default_demo_admin_user(user: dict[str, Any] | None) -> bool:
     if user is None:
         return True
@@ -283,27 +274,20 @@ def _is_default_demo_admin_user(user: dict[str, Any] | None) -> bool:
     )
 
 
-def _ensure_demo_admin_account() -> tuple[dict[str, Any], dict[str, Any]]:
+def _ensure_demo_admin_account() -> tuple[dict[str, Any], dict[str, Any] | None]:
     settings = get_settings()
-    user, profile = _get_user_and_profile_by_email(_normalize_email(settings.demo_admin_email))
+    user, _profile = _get_user_and_profile_by_email(_normalize_email(settings.demo_admin_email))
     if user is None:
         user = _demo_admin_user_payload()
 
-    profile_needs_seed = profile is None or not (
-        profile.get("auth_password_hash") or profile.get("auth_password") or profile.get("password")
-    )
-    if profile is None:
-        profile = _demo_admin_profile_payload(user)
-    elif profile_needs_seed:
-        profile = {
-            **store.clone(profile),
-            **build_password_record(settings.demo_admin_password),
-        }
-
     mutable_user = _ensure_runtime_user(user)
-    mutable_profile = _ensure_runtime_profile(profile)
-    persistence_service.persist_user_state(user=mutable_user, profile=mutable_profile)
-    return mutable_user, mutable_profile
+    user_id = str(mutable_user["id"])
+    _delete_runtime_profile(user_id)
+    delete_profiles = getattr(persistence_service, "delete_user_profiles", None)
+    if callable(delete_profiles):
+        delete_profiles(user_ids=[user_id])
+    _persist_login_state(mutable_user, None)
+    return mutable_user, None
 
 
 def _issue_token_pair(user: dict[str, Any]) -> dict[str, Any]:
@@ -381,6 +365,8 @@ class AuthService:
         fallback_password = None
         user, profile = _get_user_and_profile_by_email(normalized_email)
         is_demo_admin_login = normalized_email == _normalize_email(settings.demo_admin_email)
+        if is_demo_admin_login and _is_default_demo_admin_user(user):
+            profile = None
 
         if (
             settings.auth_demo_fallback_enabled
@@ -429,7 +415,10 @@ class AuthService:
         mutable_user = _ensure_runtime_user({**store.clone(user), "last_login": now_text})
         mutable_profile = None
         if profile is not None:
-            mutable_profile = _ensure_runtime_profile({**store.clone(profile), "last_login": now_text})
+            profile_payload = {**store.clone(profile), "last_login": now_text}
+            mutable_profile = _ensure_runtime_profile(profile_payload)
+        else:
+            _delete_runtime_profile(str(mutable_user["id"]))
 
         _persist_login_state(mutable_user, mutable_profile)
         _record_auth_audit_log(

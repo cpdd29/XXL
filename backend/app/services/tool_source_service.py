@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 from typing import Any
 import logging
+from urllib.parse import urlparse
 
 from fastapi import HTTPException, status
 import yaml
@@ -41,6 +42,11 @@ EXTERNAL_TOOL_SOURCES_JSON_ENV_KEYS = (
 EXTERNAL_TOOL_SOURCES_FILE_ENV = "WORKBOT_EXTERNAL_TOOL_SOURCES_FILE"
 EXTERNAL_AGENT_REACH_PATH_ENV = "WORKBOT_EXTERNAL_AGENT_REACH_PATH"
 ENV_PLACEHOLDER_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
+PROJECT_EXTERNAL_REGISTRY_PATH = PROJECT_ROOT / "deploy" / "external-registry" / DEFAULT_EXTERNAL_REGISTRY_FILENAME
+CONTROL_PLANE_SKILL_SOURCE_ID = "control-plane-skill-registry"
+CONTROL_PLANE_SKILL_SOURCE_NAME = "Control Plane Skill Registry"
+CONTROL_PLANE_MCP_SOURCE_ID = "control-plane-mcp-registry"
+CONTROL_PLANE_MCP_SOURCE_NAME = "Control Plane MCP Registry"
 
 
 def _local_mcp_specs() -> list[dict[str, Any]]:
@@ -361,6 +367,729 @@ class ToolSourceService:
             "total": len(self._sources_cache),
             "governance_summary": self._build_governance_summary(self._sources_cache),
         }
+
+    def register_external_skill_tool(self, payload: dict[str, Any]) -> dict[str, Any]:
+        document, registry_path = self._load_external_registry_document_for_write()
+        source_id = str(payload.get("source_id") or CONTROL_PLANE_SKILL_SOURCE_ID).strip() or CONTROL_PLANE_SKILL_SOURCE_ID
+        source_name = (
+            str(payload.get("source_name") or CONTROL_PLANE_SKILL_SOURCE_NAME).strip()
+            or CONTROL_PLANE_SKILL_SOURCE_NAME
+        )
+        name = str(payload.get("name") or "").strip()
+        if not name:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Skill name is required")
+
+        tool_id = str(payload.get("id") or "").strip() or f"skill-tool-{_slugify(name)}"
+        if self._registry_tool_exists(document, tool_id):
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"Tool '{tool_id}' already exists")
+
+        base_url = self._normalize_registry_base_url(payload.get("base_url"))
+        invoke_path = self._normalize_registry_path(payload.get("invoke_path"), default="/invoke")
+        health_path = self._normalize_registry_path(payload.get("health_path"), default="/health")
+        method = self._normalize_registry_method(payload.get("method"), default="POST")
+        timeout_seconds = self._normalize_timeout_seconds(payload.get("timeout_seconds"), default=8.0)
+        description = str(payload.get("description") or f"{name} external skill").strip() or f"{name} external skill"
+        provider = str(payload.get("provider") or "external-skill-http").strip() or "external-skill-http"
+        version = str(payload.get("version") or "1.0.0").strip() or "1.0.0"
+        skill_family = str(payload.get("skill_family") or name).strip() or name
+        capabilities = _as_tags(payload.get("capabilities"))
+        tags = self._merge_registry_tags(payload.get("tags"), defaults=["skill", "externalized", "runtime"])
+
+        self._ensure_registry_source(
+            document,
+            source_id=source_id,
+            source_name=source_name,
+            kind="external_repo",
+            registry_origin="control_plane",
+            default_notes=[
+                "由控制台新增 Skill 入口登记，供本地环境直连外部 Skill 服务。",
+            ],
+            default_config_summary={
+                "deployment_mode": "control_plane_registry",
+                "notes": "Skills added from the control plane are stored as inline registry tools.",
+            },
+        )
+        self._append_registry_tool(
+            document,
+            {
+                "id": tool_id,
+                "name": name,
+                "type": "skill",
+                "source": source_id,
+                "source_kind": "external_repo",
+                "enabled": _as_bool(payload.get("enabled"), default=True),
+                "description": description,
+                "tags": tags,
+                "capabilities": capabilities,
+                "provider": provider,
+                "bridge_mode": "runtime_bridge",
+                "permissions": _default_permissions(),
+                "config_summary": {
+                    "base_url": base_url,
+                    "invoke_path": invoke_path,
+                    "health_path": health_path,
+                    "http_method": method,
+                    "protocol": str(payload.get("protocol") or "http").strip() or "http",
+                    "timeout_seconds": timeout_seconds,
+                    "version": version,
+                    "skill_family": skill_family,
+                    "registration_kind": "control_plane_skill",
+                },
+            },
+        )
+        self._write_external_registry_document(registry_path, document)
+        self.scan_sources()
+        return self._build_registration_result(
+            source_id=source_id,
+            tool_id=tool_id,
+            message=f"Skill '{name}' registered successfully.",
+        )
+
+    def register_external_mcp_tool(self, payload: dict[str, Any]) -> dict[str, Any]:
+        document, registry_path = self._load_external_registry_document_for_write()
+        default_source_id, default_source_name = self._resolve_default_mcp_source(document)
+        source_id = str(payload.get("source_id") or default_source_id).strip() or default_source_id
+        source_name = str(payload.get("source_name") or default_source_name).strip() or default_source_name
+        name = str(payload.get("name") or "").strip()
+        if not name:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="MCP name is required")
+
+        tool_id = str(payload.get("id") or "").strip() or f"mcp-tool-{_slugify(name)}"
+        if self._registry_tool_exists(document, tool_id):
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"Tool '{tool_id}' already exists")
+
+        requires_permission = _as_bool(payload.get("requires_permission"), default=False)
+        approval_required = _as_bool(payload.get("approval_required"), default=requires_permission)
+        base_url = self._normalize_registry_base_url(payload.get("base_url"))
+        invoke_path = self._normalize_registry_path(payload.get("invoke_path"), default="/invoke")
+        method = self._normalize_registry_method(payload.get("method"), default="POST")
+        timeout_seconds = self._normalize_timeout_seconds(payload.get("timeout_seconds"), default=10.0)
+        description = str(payload.get("description") or f"{name} MCP tool").strip() or f"{name} MCP tool"
+        provider = str(payload.get("provider") or "mcp-http").strip() or "mcp-http"
+        tags = self._merge_registry_tags(payload.get("tags"), defaults=["mcp", "externalized", "runtime"])
+        scopes = _as_tags(payload.get("scopes")) or ["agents:read"]
+        roles = _as_tags(payload.get("roles")) or ["admin", "operator", "power_user", "viewer"]
+
+        self._ensure_registry_source(
+            document,
+            source_id=source_id,
+            source_name=source_name,
+            kind="mcp_registry",
+            registry_origin="control_plane",
+            default_notes=[
+                "由控制台新增 MCP 入口登记，供本地环境直连外部 MCP 服务。",
+            ],
+            default_config_summary={
+                "deployment_mode": "control_plane_registry",
+                "notes": "MCP tools added from the control plane are stored as inline registry tools.",
+            },
+        )
+        self._append_registry_tool(
+            document,
+            {
+                "id": tool_id,
+                "name": name,
+                "type": "mcp",
+                "source": source_id,
+                "source_kind": "mcp_server",
+                "enabled": _as_bool(payload.get("enabled"), default=True),
+                "description": description,
+                "tags": tags,
+                "provider": provider,
+                "bridge_mode": "runtime_bridge",
+                "permissions": {
+                    "requires_permission": requires_permission,
+                    "scopes": scopes,
+                    "roles": roles,
+                    "approval_required": approval_required,
+                },
+                "config_summary": {
+                    "base_url": base_url,
+                    "invoke_path": invoke_path,
+                    "http_method": method,
+                    "timeout_seconds": timeout_seconds,
+                    "registration_kind": "control_plane_mcp",
+                },
+            },
+        )
+        self._write_external_registry_document(registry_path, document)
+        self.scan_sources()
+        return self._build_registration_result(
+            source_id=source_id,
+            tool_id=tool_id,
+            message=f"MCP '{name}' registered successfully.",
+        )
+
+    def update_external_skill_tool(self, tool_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        document, registry_path = self._load_external_registry_document_for_write()
+        existing, _, _, _ = self._find_registry_tool(document, tool_id)
+        if existing is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tool not found")
+        self._assert_control_plane_managed_tool(existing, expected_type="skill")
+
+        source_id = str(payload.get("source_id") or existing.get("source") or CONTROL_PLANE_SKILL_SOURCE_ID).strip()
+        source_name = (
+            str(payload.get("source_name") or self._find_source_name(document, source_id) or CONTROL_PLANE_SKILL_SOURCE_NAME).strip()
+            or CONTROL_PLANE_SKILL_SOURCE_NAME
+        )
+        name = str(payload.get("name") or existing.get("name") or "").strip()
+        if not name:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Skill name is required")
+
+        base_url = self._normalize_registry_base_url(
+            payload.get("base_url")
+            or ((existing.get("config_summary") or {}).get("base_url"))
+            or ((existing.get("config_summary") or {}).get("baseUrl"))
+        )
+        invoke_path = self._normalize_registry_path(
+            payload.get("invoke_path") or ((existing.get("config_summary") or {}).get("invoke_path")) or ((existing.get("config_summary") or {}).get("invokePath")),
+            default="/invoke",
+        )
+        health_path = self._normalize_registry_path(
+            payload.get("health_path") or ((existing.get("config_summary") or {}).get("health_path")) or ((existing.get("config_summary") or {}).get("healthPath")),
+            default="/health",
+        )
+        method = self._normalize_registry_method(
+            payload.get("method") or ((existing.get("config_summary") or {}).get("http_method")) or ((existing.get("config_summary") or {}).get("httpMethod")),
+            default="POST",
+        )
+        timeout_seconds = self._normalize_timeout_seconds(
+            payload.get("timeout_seconds") or ((existing.get("config_summary") or {}).get("timeout_seconds")) or ((existing.get("config_summary") or {}).get("timeoutSeconds")),
+            default=8.0,
+        )
+        description = str(payload.get("description") or existing.get("description") or f"{name} external skill").strip()
+        provider = str(payload.get("provider") or existing.get("provider") or "external-skill-http").strip() or "external-skill-http"
+        version = str(payload.get("version") or ((existing.get("config_summary") or {}).get("version")) or "1.0.0").strip() or "1.0.0"
+        skill_family = str(payload.get("skill_family") or ((existing.get("config_summary") or {}).get("skill_family")) or name).strip() or name
+        protocol = (
+            str(payload.get("protocol") or ((existing.get("config_summary") or {}).get("protocol")) or "http").strip() or "http"
+        )
+        tags = self._merge_registry_tags(payload.get("tags") if "tags" in payload else existing.get("tags"), defaults=["skill", "externalized", "runtime"])
+        capabilities = _as_tags(payload.get("capabilities") if "capabilities" in payload else existing.get("capabilities"))
+        enabled = _as_bool(payload.get("enabled") if "enabled" in payload else existing.get("enabled"), default=True)
+
+        self._ensure_registry_source(
+            document,
+            source_id=source_id,
+            source_name=source_name,
+            kind="external_repo",
+            registry_origin="control_plane",
+            default_notes=[
+                "由控制台新增 Skill 入口登记，供本地环境直连外部 Skill 服务。",
+            ],
+            default_config_summary={
+                "deployment_mode": "control_plane_registry",
+                "notes": "Skills added from the control plane are stored as inline registry tools.",
+            },
+        )
+
+        existing["name"] = name
+        existing["source"] = source_id
+        existing["source_kind"] = "external_repo"
+        existing["enabled"] = enabled
+        existing["description"] = description
+        existing["tags"] = tags
+        existing["capabilities"] = capabilities
+        existing["provider"] = provider
+        existing["bridge_mode"] = "runtime_bridge"
+        existing["permissions"] = _default_permissions()
+        existing["config_summary"] = {
+            **deepcopy(existing.get("config_summary") or {}),
+            "base_url": base_url,
+            "invoke_path": invoke_path,
+            "health_path": health_path,
+            "http_method": method,
+            "protocol": protocol,
+            "timeout_seconds": timeout_seconds,
+            "version": version,
+            "skill_family": skill_family,
+            "registration_kind": "control_plane_skill",
+        }
+
+        self._write_external_registry_document(registry_path, document)
+        self.scan_sources()
+        return self._build_registration_result(
+            source_id=source_id,
+            tool_id=tool_id,
+            message=f"Skill '{name}' updated successfully.",
+        )
+
+    def update_external_mcp_tool(self, tool_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        document, registry_path = self._load_external_registry_document_for_write()
+        existing, _, _, _ = self._find_registry_tool(document, tool_id)
+        if existing is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tool not found")
+        self._assert_control_plane_managed_tool(existing, expected_type="mcp")
+
+        source_id = str(payload.get("source_id") or existing.get("source") or CONTROL_PLANE_MCP_SOURCE_ID).strip()
+        source_name = (
+            str(payload.get("source_name") or self._find_source_name(document, source_id) or CONTROL_PLANE_MCP_SOURCE_NAME).strip()
+            or CONTROL_PLANE_MCP_SOURCE_NAME
+        )
+        name = str(payload.get("name") or existing.get("name") or "").strip()
+        if not name:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="MCP name is required")
+
+        requires_permission = _as_bool(
+            payload.get("requires_permission")
+            if "requires_permission" in payload
+            else ((existing.get("permissions") or {}).get("requires_permission")),
+            default=False,
+        )
+        approval_required = _as_bool(
+            payload.get("approval_required")
+            if "approval_required" in payload
+            else ((existing.get("permissions") or {}).get("approval_required")),
+            default=requires_permission,
+        )
+        base_url = self._normalize_registry_base_url(
+            payload.get("base_url")
+            or ((existing.get("config_summary") or {}).get("base_url"))
+            or ((existing.get("config_summary") or {}).get("baseUrl"))
+        )
+        invoke_path = self._normalize_registry_path(
+            payload.get("invoke_path") or ((existing.get("config_summary") or {}).get("invoke_path")) or ((existing.get("config_summary") or {}).get("invokePath")),
+            default="/invoke",
+        )
+        method = self._normalize_registry_method(
+            payload.get("method") or ((existing.get("config_summary") or {}).get("http_method")) or ((existing.get("config_summary") or {}).get("httpMethod")),
+            default="POST",
+        )
+        timeout_seconds = self._normalize_timeout_seconds(
+            payload.get("timeout_seconds") or ((existing.get("config_summary") or {}).get("timeout_seconds")) or ((existing.get("config_summary") or {}).get("timeoutSeconds")),
+            default=10.0,
+        )
+        description = str(payload.get("description") or existing.get("description") or f"{name} MCP tool").strip()
+        provider = str(payload.get("provider") or existing.get("provider") or "mcp-http").strip() or "mcp-http"
+        tags = self._merge_registry_tags(payload.get("tags") if "tags" in payload else existing.get("tags"), defaults=["mcp", "externalized", "runtime"])
+        scopes = _as_tags(payload.get("scopes") if "scopes" in payload else ((existing.get("permissions") or {}).get("scopes"))) or ["agents:read"]
+        roles = _as_tags(payload.get("roles") if "roles" in payload else ((existing.get("permissions") or {}).get("roles"))) or ["admin", "operator", "power_user", "viewer"]
+        enabled = _as_bool(payload.get("enabled") if "enabled" in payload else existing.get("enabled"), default=True)
+
+        self._ensure_registry_source(
+            document,
+            source_id=source_id,
+            source_name=source_name,
+            kind="mcp_registry",
+            registry_origin="control_plane",
+            default_notes=[
+                "由控制台新增 MCP 入口登记，供本地环境直连外部 MCP 服务。",
+            ],
+            default_config_summary={
+                "deployment_mode": "control_plane_registry",
+                "notes": "MCP tools added from the control plane are stored as inline registry tools.",
+            },
+        )
+
+        existing["name"] = name
+        existing["source"] = source_id
+        existing["source_kind"] = "mcp_server"
+        existing["enabled"] = enabled
+        existing["description"] = description
+        existing["tags"] = tags
+        existing["provider"] = provider
+        existing["bridge_mode"] = "runtime_bridge"
+        existing["permissions"] = {
+            "requires_permission": requires_permission,
+            "scopes": scopes,
+            "roles": roles,
+            "approval_required": approval_required,
+        }
+        existing["config_summary"] = {
+            **deepcopy(existing.get("config_summary") or {}),
+            "base_url": base_url,
+            "invoke_path": invoke_path,
+            "http_method": method,
+            "timeout_seconds": timeout_seconds,
+            "registration_kind": "control_plane_mcp",
+        }
+
+        self._write_external_registry_document(registry_path, document)
+        self.scan_sources()
+        return self._build_registration_result(
+            source_id=source_id,
+            tool_id=tool_id,
+            message=f"MCP '{name}' updated successfully.",
+        )
+
+    def delete_external_registry_tool(self, tool_id: str) -> dict[str, Any]:
+        document, registry_path = self._load_external_registry_document_for_write()
+        existing, container, index, _ = self._find_registry_tool(document, tool_id)
+        if existing is None or container is None or index is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tool not found")
+        self._assert_control_plane_managed_tool(existing)
+
+        source_id = str(existing.get("source") or "").strip()
+        deleted_name = str(existing.get("name") or tool_id).strip() or tool_id
+        container.pop(index)
+        self._cleanup_managed_empty_source(document, source_id)
+        self._write_external_registry_document(registry_path, document)
+        self.scan_sources()
+        return {
+            "ok": True,
+            "message": f"Tool '{deleted_name}' deleted successfully.",
+            "source_id": source_id,
+            "tool_id": tool_id,
+        }
+
+    def _build_registration_result(self, *, source_id: str, tool_id: str, message: str) -> dict[str, Any]:
+        source = self.get_source(source_id, refresh=False)
+        tool = next(
+            (deepcopy(item) for item in self._tools_cache if str(item.get("id") or "").strip() == tool_id),
+            None,
+        )
+        if tool is None:
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Registered tool not found")
+        return {
+            "ok": True,
+            "message": message,
+            "source_id": source_id,
+            "tool_id": tool_id,
+            "source": source,
+            "tool": tool,
+        }
+
+    def _assert_control_plane_managed_tool(
+        self,
+        tool: dict[str, Any],
+        *,
+        expected_type: str | None = None,
+    ) -> None:
+        if expected_type is not None and str(tool.get("type") or "").strip() != expected_type:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Tool type mismatch")
+        registration_kind = str(((tool.get("config_summary") or {}).get("registration_kind")) or "").strip()
+        if registration_kind not in {"control_plane_skill", "control_plane_mcp"}:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Tool is not managed by control plane",
+            )
+
+    def _find_registry_tool(
+        self,
+        document: dict[str, Any],
+        tool_id: str,
+    ) -> tuple[dict[str, Any] | None, list[dict[str, Any]] | None, int | None, dict[str, Any] | None]:
+        normalized_tool_id = str(tool_id or "").strip()
+        raw_tools = document.get("tools")
+        if isinstance(raw_tools, list):
+            for index, item in enumerate(raw_tools):
+                if not isinstance(item, dict):
+                    continue
+                if str(item.get("id") or "").strip() == normalized_tool_id:
+                    return item, raw_tools, index, None
+
+        raw_sources = document.get("sources")
+        if isinstance(raw_sources, list):
+            for source in raw_sources:
+                if not isinstance(source, dict):
+                    continue
+                source_tools = source.get("tools")
+                if not isinstance(source_tools, list):
+                    continue
+                for index, item in enumerate(source_tools):
+                    if not isinstance(item, dict):
+                        continue
+                    if str(item.get("id") or "").strip() == normalized_tool_id:
+                        return item, source_tools, index, source
+
+        return None, None, None, None
+
+    def _find_source_name(self, document: dict[str, Any], source_id: str) -> str | None:
+        raw_sources = document.get("sources")
+        if not isinstance(raw_sources, list):
+            return None
+        for source in raw_sources:
+            if not isinstance(source, dict):
+                continue
+            if str(source.get("id") or "").strip() != source_id:
+                continue
+            return str(source.get("name") or "").strip() or None
+        return None
+
+    def _cleanup_managed_empty_source(self, document: dict[str, Any], source_id: str) -> None:
+        if not source_id:
+            return
+        raw_sources = document.get("sources")
+        if not isinstance(raw_sources, list):
+            return
+
+        still_referenced = False
+        raw_tools = document.get("tools")
+        if isinstance(raw_tools, list):
+            still_referenced = any(
+                isinstance(item, dict) and str(item.get("source") or "").strip() == source_id
+                for item in raw_tools
+            )
+
+        if still_referenced:
+            return
+
+        for index, source in enumerate(raw_sources):
+            if not isinstance(source, dict):
+                continue
+            if str(source.get("id") or "").strip() != source_id:
+                continue
+            registry = source.get("registry") if isinstance(source.get("registry"), dict) else {}
+            managed_by = str(registry.get("managed_by") or "").strip()
+            if source_id == CONTROL_PLANE_SKILL_SOURCE_ID or source_id == CONTROL_PLANE_MCP_SOURCE_ID or managed_by == "control_plane":
+                raw_sources.pop(index)
+            return
+
+    def _resolve_default_mcp_source(self, document: dict[str, Any]) -> tuple[str, str]:
+        sources = document.get("sources")
+        if isinstance(sources, list):
+            for item in sources:
+                if not isinstance(item, dict):
+                    continue
+                if str(item.get("kind") or "").strip().lower() != "mcp_registry":
+                    continue
+                source_id = str(item.get("id") or "").strip()
+                source_name = str(item.get("name") or "").strip()
+                if source_id:
+                    return source_id, source_name or CONTROL_PLANE_MCP_SOURCE_NAME
+        return CONTROL_PLANE_MCP_SOURCE_ID, CONTROL_PLANE_MCP_SOURCE_NAME
+
+    def _registry_tool_exists(self, document: dict[str, Any], tool_id: str) -> bool:
+        raw_tools = document.get("tools")
+        if isinstance(raw_tools, list) and any(
+            str(item.get("id") or "").strip() == tool_id for item in raw_tools if isinstance(item, dict)
+        ):
+            return True
+
+        raw_sources = document.get("sources")
+        if not isinstance(raw_sources, list):
+            return False
+        for source in raw_sources:
+            if not isinstance(source, dict):
+                continue
+            source_tools = source.get("tools")
+            if not isinstance(source_tools, list):
+                continue
+            if any(str(item.get("id") or "").strip() == tool_id for item in source_tools if isinstance(item, dict)):
+                return True
+        return False
+
+    def _append_registry_tool(self, document: dict[str, Any], tool: dict[str, Any]) -> None:
+        raw_tools = document.get("tools")
+        if not isinstance(raw_tools, list):
+            raw_tools = []
+            document["tools"] = raw_tools
+        raw_tools.append(deepcopy(tool))
+        document["version"] = _utc_now_iso().split("T", 1)[0]
+        document.setdefault("mode", "external_only")
+
+    def _ensure_registry_source(
+        self,
+        document: dict[str, Any],
+        *,
+        source_id: str,
+        source_name: str,
+        kind: str,
+        registry_origin: str,
+        default_notes: list[str],
+        default_config_summary: dict[str, Any],
+    ) -> None:
+        raw_sources = document.get("sources")
+        if not isinstance(raw_sources, list):
+            raw_sources = []
+            document["sources"] = raw_sources
+
+        for item in raw_sources:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("id") or "").strip() != source_id:
+                continue
+            item["name"] = source_name
+            item["kind"] = kind
+            item["enabled"] = True
+            registry = item.get("registry")
+            if not isinstance(registry, dict):
+                registry = {}
+                item["registry"] = registry
+            registry.setdefault("origin", registry_origin)
+            registry["bridge_enabled"] = True
+            registry["managed_by"] = "control_plane"
+            config_summary = item.get("config_summary")
+            if not isinstance(config_summary, dict):
+                config_summary = {}
+                item["config_summary"] = config_summary
+            for key, value in default_config_summary.items():
+                config_summary.setdefault(key, deepcopy(value))
+            notes = item.get("notes")
+            if not isinstance(notes, list):
+                notes = []
+                item["notes"] = notes
+            for note in default_notes:
+                if note not in notes:
+                    notes.append(note)
+            return
+
+        raw_sources.append(
+            {
+                "id": source_id,
+                "name": source_name,
+                "kind": kind,
+                "enabled": True,
+                "registry": {
+                    "origin": registry_origin,
+                    "bridge_enabled": True,
+                    "managed_by": "control_plane",
+                },
+                "config_summary": deepcopy(default_config_summary),
+                "notes": list(default_notes),
+            }
+        )
+
+    def _load_external_registry_document_for_write(self) -> tuple[dict[str, Any], Path]:
+        document = self._read_external_registry_document()
+        registry_path = self._resolve_external_registry_write_path()
+        return document, registry_path
+
+    def _read_external_registry_document(self) -> dict[str, Any]:
+        registry_file = str(os.getenv(EXTERNAL_TOOL_SOURCES_FILE_ENV, "")).strip()
+        file_candidates: list[Path] = []
+        if registry_file:
+            registry_path = Path(registry_file)
+            if not registry_path.is_absolute():
+                registry_path = PROJECT_ROOT / registry_path
+            file_candidates.append(registry_path)
+        file_candidates.extend(DEFAULT_EXTERNAL_REGISTRY_FALLBACK_PATHS)
+
+        checked_paths: set[Path] = set()
+        for registry_path in [*file_candidates, PROJECT_EXTERNAL_REGISTRY_PATH]:
+            if registry_path in checked_paths:
+                continue
+            checked_paths.add(registry_path)
+            try:
+                raw = registry_path.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            payload = _safe_parse_json(raw, env_key=f"{EXTERNAL_TOOL_SOURCES_FILE_ENV}={registry_path}")
+            if payload is None:
+                continue
+            return self._normalize_external_registry_document(payload)
+
+        for env_key in EXTERNAL_TOOL_SOURCES_JSON_ENV_KEYS:
+            raw = str(os.getenv(env_key, "")).strip()
+            if not raw:
+                continue
+            payload = _safe_parse_json(raw, env_key=env_key)
+            if payload is None:
+                continue
+            return self._normalize_external_registry_document(payload)
+
+        return self._normalize_external_registry_document({})
+
+    def _resolve_external_registry_write_path(self) -> Path:
+        registry_file = str(os.getenv(EXTERNAL_TOOL_SOURCES_FILE_ENV, "")).strip()
+        candidates: list[Path] = []
+        if registry_file:
+            registry_path = Path(registry_file)
+            if not registry_path.is_absolute():
+                registry_path = PROJECT_ROOT / registry_path
+            candidates.append(registry_path)
+        candidates.extend(DEFAULT_EXTERNAL_REGISTRY_FALLBACK_PATHS)
+        candidates.append(PROJECT_EXTERNAL_REGISTRY_PATH)
+
+        checked_paths: set[Path] = set()
+        for candidate in candidates:
+            if candidate in checked_paths:
+                continue
+            checked_paths.add(candidate)
+            try:
+                candidate.parent.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                continue
+            os.environ[EXTERNAL_TOOL_SOURCES_FILE_ENV] = str(candidate)
+            return candidate
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Unable to access external registry file",
+        )
+
+    def _write_external_registry_document(self, path: Path, document: dict[str, Any]) -> None:
+        document["version"] = _utc_now_iso().split("T", 1)[0]
+        document.setdefault("mode", "external_only")
+        try:
+            path.write_text(
+                json.dumps(document, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Failed to write external registry file: {exc}",
+            ) from exc
+
+    def _normalize_external_registry_document(self, payload: Any) -> dict[str, Any]:
+        if isinstance(payload, list):
+            return {
+                "version": _utc_now_iso().split("T", 1)[0],
+                "mode": "external_only",
+                "sources": [deepcopy(item) for item in payload if isinstance(item, dict)],
+                "tools": [],
+            }
+
+        if not isinstance(payload, dict):
+            payload = {}
+
+        normalized = deepcopy(payload)
+        raw_sources = normalized.get("sources")
+        normalized["sources"] = [deepcopy(item) for item in raw_sources if isinstance(item, dict)] if isinstance(raw_sources, list) else []
+        raw_tools = normalized.get("tools")
+        normalized["tools"] = [deepcopy(item) for item in raw_tools if isinstance(item, dict)] if isinstance(raw_tools, list) else []
+        normalized.setdefault("version", _utc_now_iso().split("T", 1)[0])
+        normalized.setdefault("mode", "external_only")
+        return normalized
+
+    def _merge_registry_tags(self, value: Any, *, defaults: list[str]) -> list[str]:
+        merged: list[str] = []
+        seen: set[str] = set()
+        for item in [*defaults, *_as_tags(value)]:
+            normalized = str(item or "").strip()
+            if not normalized:
+                continue
+            key = normalized.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(normalized)
+        return merged
+
+    def _normalize_registry_base_url(self, value: Any) -> str:
+        base_url = str(value or "").strip()
+        parsed = urlparse(base_url)
+        if not base_url or parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="base_url must be a valid http(s) URL",
+            )
+        return base_url.rstrip("/")
+
+    def _normalize_registry_path(self, value: Any, *, default: str) -> str:
+        normalized = str(value or default).strip() or default
+        if not normalized.startswith("/"):
+            normalized = f"/{normalized}"
+        return normalized
+
+    def _normalize_registry_method(self, value: Any, *, default: str) -> str:
+        normalized = str(value or default).strip().upper() or default
+        if normalized not in {"GET", "POST", "PUT", "PATCH", "DELETE"}:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unsupported HTTP method")
+        return normalized
+
+    def _normalize_timeout_seconds(self, value: Any, *, default: float) -> float:
+        try:
+            resolved = float(value if value not in {None, ""} else default)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="timeout_seconds must be numeric") from exc
+        if resolved <= 0:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="timeout_seconds must be greater than 0",
+            )
+        return resolved
 
     def _resolve_source_scan_mode(self) -> tuple[str, bool, bool, bool]:
         mode = str(os.getenv(TOOL_SOURCES_MODE_ENV, "hybrid") or "hybrid").strip().lower()
@@ -708,6 +1437,11 @@ class ToolSourceService:
         bridge_mode = str(item.get("bridge_mode") or "runtime_bridge").strip() or "runtime_bridge"
         tool_type = str(item.get("type") or default_type).strip() or default_type
         enabled = _as_bool(item.get("enabled"), default=True)
+        effective_registration_kind = str(
+            item.get("registration_kind")
+            or config_summary_payload.get("registration_kind")
+            or registration_kind
+        ).strip() or registration_kind
         permissions_payload = item.get("permissions")
         if isinstance(permissions_payload, dict):
             requires_permission = _as_bool(permissions_payload.get("requires_permission"), default=False)
@@ -734,7 +1468,7 @@ class ToolSourceService:
             "invoke_path": invoke_path,
             "httpMethod": method,
             "http_method": method,
-            "registration_kind": registration_kind,
+            "registration_kind": effective_registration_kind,
         }
         return {
             "id": resolved_tool_id,
@@ -745,6 +1479,7 @@ class ToolSourceService:
             "source_kind": source_kind,
             "enabled": enabled,
             "description": str(item.get("description") or f"External MCP tool: {resolved_name}"),
+            "capabilities": _as_tags(item.get("capabilities")),
             "tags": _as_tags(item.get("tags")) or ["mcp", "external", "runtime"],
             "provider": provider,
             "bridge_mode": bridge_mode,
@@ -772,6 +1507,12 @@ class ToolSourceService:
         skill_items = skill_registry_service.list_abilities(ability_type="skill", enabled=True)
         tools: list[dict[str, Any]] = []
         for ability in skill_items:
+            metadata = ability.get("metadata") if isinstance(ability.get("metadata"), dict) else {}
+            if (
+                str(ability.get("source") or "").strip().lower() == "local_brain_skill_library"
+                or str(metadata.get("registration_scope") or "").strip().lower() == "brain_skill_library"
+            ):
+                continue
             tools.append(
                 {
                     "id": str(ability.get("id") or ability.get("name") or ""),

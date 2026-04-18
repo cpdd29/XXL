@@ -254,6 +254,20 @@ LOCAL_ONLY_REASON_DESCRIPTIONS = {
 logger = logging.getLogger(__name__)
 
 
+def _normalize_identifier_list(values: list[str] | tuple[str, ...] | set[str] | None) -> list[str]:
+    if not values:
+        return []
+    items: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        normalized = str(value or "").strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        items.append(normalized)
+    return items
+
+
 class MemoryService:
     def __init__(
         self,
@@ -2659,6 +2673,109 @@ class MemoryService:
             "archived_count": archived_count,
             "deleted_count": 0,
             "corrected_count": 0,
+        }
+
+    def delete_scope_data(
+        self,
+        *,
+        tenant_id: str | None = None,
+        user_ids: list[str] | tuple[str, ...] | set[str] | None = None,
+    ) -> dict[str, int]:
+        normalized_tenant_id = str(tenant_id or "").strip()
+        normalized_user_ids = _normalize_identifier_list(user_ids)
+        normalized_user_id_set = set(normalized_user_ids)
+
+        deleted_short_term = 0
+        deleted_mid_term_runtime = 0
+        deleted_long_term_runtime = 0
+        deleted_session_state_cache = 0
+        deleted_redis_keys = 0
+
+        for user_id in normalized_user_ids:
+            short_bucket = self._short_term.pop(user_id, None)
+            if short_bucket is not None:
+                deleted_short_term += len(short_bucket)
+
+            mid_bucket = self._mid_term.pop(user_id, None)
+            if mid_bucket is not None:
+                deleted_mid_term_runtime += len(mid_bucket)
+
+            long_bucket = self._long_term.pop(user_id, None)
+            if long_bucket is not None:
+                deleted_long_term_runtime += len(long_bucket)
+
+        for cache_key in list(self._session_state_cache):
+            if cache_key[0] not in normalized_user_id_set:
+                continue
+            self._session_state_cache.pop(cache_key, None)
+            deleted_session_state_cache += 1
+
+        client = self._get_redis_client()
+        if client is not None and normalized_user_ids:
+            try:
+                redis_keys = [self._short_term_key(user_id) for user_id in normalized_user_ids]
+                deleted_redis_keys = int(client.delete(*redis_keys) or 0) if redis_keys else 0
+            except Exception as exc:
+                logger.warning("Redis scoped short-term memory delete failed: %s", exc)
+
+        deleted_conversation_messages = 0
+        delete_messages = getattr(self._raw_message_store, "delete_conversation_messages", None)
+        if delete_messages is not None and normalized_user_ids:
+            try:
+                deleted_conversation_messages = int(
+                    delete_messages(user_ids=normalized_user_ids) or 0
+                )
+            except Exception as exc:
+                logger.warning("Raw conversation log delete failed: %s", exc)
+
+        deleted_persisted_session_states = 0
+        delete_session_states = getattr(self._raw_message_store, "delete_memory_session_states", None)
+        if delete_session_states is not None and normalized_user_ids:
+            try:
+                deleted_persisted_session_states = int(
+                    delete_session_states(user_ids=normalized_user_ids) or 0
+                )
+            except Exception as exc:
+                logger.warning("Persisted memory session state delete failed: %s", exc)
+
+        deleted_mid_term_store = 0
+        delete_mid_term = getattr(self._mid_term_store, "delete_summaries", None)
+        if delete_mid_term is not None and (normalized_tenant_id or normalized_user_ids):
+            try:
+                deleted_mid_term_store = int(
+                    delete_mid_term(
+                        tenant_id=normalized_tenant_id or None,
+                        user_ids=normalized_user_ids,
+                    )
+                    or 0
+                )
+            except Exception as exc:
+                logger.warning("Mid-term memory store delete failed: %s", exc)
+
+        deleted_long_term_store = 0
+        delete_long_term = getattr(self._long_term_store, "delete_memories", None)
+        if delete_long_term is not None and (normalized_tenant_id or normalized_user_ids):
+            try:
+                deleted_long_term_store = int(
+                    delete_long_term(
+                        tenant_id=normalized_tenant_id or None,
+                        user_ids=normalized_user_ids,
+                    )
+                    or 0
+                )
+            except Exception as exc:
+                logger.warning("Long-term memory store delete failed: %s", exc)
+
+        return {
+            "short_term_deleted": deleted_short_term,
+            "mid_term_runtime_deleted": deleted_mid_term_runtime,
+            "mid_term_store_deleted": deleted_mid_term_store,
+            "long_term_runtime_deleted": deleted_long_term_runtime,
+            "long_term_store_deleted": deleted_long_term_store,
+            "conversation_messages_deleted": deleted_conversation_messages,
+            "session_state_cache_deleted": deleted_session_state_cache,
+            "session_state_store_deleted": deleted_persisted_session_states,
+            "redis_short_term_keys_deleted": deleted_redis_keys,
         }
 
     def clear(self) -> None:

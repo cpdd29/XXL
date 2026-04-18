@@ -1,5 +1,7 @@
 from typing import Any
 
+from pydantic import Field
+
 from app.schemas.base import APIModel
 
 
@@ -58,3 +60,58 @@ class ToolSourceDetailResponse(ToolSourceItem):
     tools: list[ToolSourceToolItem]
     tool_total: int
     scanned_at: str
+
+
+class ToolSourceSkillRegistrationRequest(APIModel):
+    id: str | None = None
+    name: str
+    description: str | None = None
+    skill_family: str | None = None
+    version: str = "1.0.0"
+    base_url: str
+    invoke_path: str = "/invoke"
+    health_path: str | None = "/health"
+    method: str = "POST"
+    protocol: str = "http"
+    provider: str | None = None
+    enabled: bool = True
+    timeout_seconds: float = 8.0
+    tags: list[str] = Field(default_factory=list)
+    capabilities: list[str] = Field(default_factory=list)
+    source_id: str | None = None
+    source_name: str | None = None
+
+
+class ToolSourceMcpRegistrationRequest(APIModel):
+    id: str | None = None
+    name: str
+    description: str | None = None
+    base_url: str
+    invoke_path: str = "/invoke"
+    method: str = "POST"
+    provider: str | None = None
+    enabled: bool = True
+    timeout_seconds: float = 10.0
+    requires_permission: bool = False
+    approval_required: bool | None = None
+    tags: list[str] = Field(default_factory=list)
+    scopes: list[str] = Field(default_factory=lambda: ["agents:read"])
+    roles: list[str] = Field(default_factory=lambda: ["admin", "operator", "power_user", "viewer"])
+    source_id: str | None = None
+    source_name: str | None = None
+
+
+class ToolSourceRegistrationResponse(APIModel):
+    ok: bool
+    message: str
+    source_id: str
+    tool_id: str
+    source: dict[str, Any]
+    tool: dict[str, Any]
+
+
+class ToolSourceDeleteResponse(APIModel):
+    ok: bool
+    message: str
+    source_id: str
+    tool_id: str

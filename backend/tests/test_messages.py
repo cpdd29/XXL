@@ -1,3 +1,4 @@
+from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 import time
 import warnings
@@ -639,6 +640,8 @@ def test_message_ingest_parses_schedule_plan_into_route_decision() -> None:
 def test_message_ingest_updates_cross_platform_profile_mapping(auth_headers) -> None:
     store.user_profiles["crm-user-map-1"] = {
         "id": "crm-user-map-1",
+        "tenant_id": "tenant-alpha",
+        "tenant_name": "Alpha Corp",
         "name": "CRM 用户",
         "email": "crm-user-map-1@example.com",
         "role": "external",
@@ -660,7 +663,12 @@ def test_message_ingest_updates_cross_platform_profile_mapping(auth_headers) -> 
             "platformUserId": "telegram-map-user",
             "chatId": "telegram-map-chat",
             "text": "请帮我写一段发布说明",
-            "metadata": {"profileId": "crm-user-map-1", "displayName": "CRM 用户"},
+            "metadata": {
+                "profileId": "crm-user-map-1",
+                "displayName": "CRM 用户",
+                "tenantId": "tenant-alpha",
+                "tenantName": "Alpha Corp",
+            },
         },
     )
 
@@ -678,6 +686,86 @@ def test_message_ingest_updates_cross_platform_profile_mapping(auth_headers) -> 
     assert synced_user["role"] == "viewer"
     assert synced_user["status"] == "active"
     assert synced_user["total_interactions"] == 8
+
+
+def test_message_ingest_does_not_create_profile_without_tenant_binding() -> None:
+    response = client.post(
+        "/api/messages/ingest",
+        json={
+            "channel": "telegram",
+            "platformUserId": "tenantless-user",
+            "chatId": "tenantless-chat",
+            "text": "帮我总结一下今天的对话",
+        },
+    )
+
+    assert response.status_code == 200
+    assert "telegram:tenantless-user" not in store.user_profiles
+    assert all(user["id"] != "telegram:tenantless-user" for user in store.users)
+
+
+def test_message_ingest_does_not_update_existing_profile_without_tenant_binding() -> None:
+    store.user_profiles["crm-user-unbound-sync"] = {
+        "id": "crm-user-unbound-sync",
+        "tenant_id": "tenant-alpha",
+        "tenant_name": "Alpha Corp",
+        "name": "CRM 未绑定用户",
+        "email": "crm-user-unbound-sync@example.com",
+        "role": "external",
+        "status": "active",
+        "last_login": "2026-04-04T09:00:00+00:00",
+        "total_interactions": 7,
+        "created_at": "2026-04-01",
+        "tags": ["已关联"],
+        "notes": "已有企微接入。",
+        "preferred_language": "en",
+        "source_channels": ["wecom"],
+        "platform_accounts": [{"platform": "wecom", "account_id": "wecom-user-2"}],
+    }
+
+    response = client.post(
+        "/api/messages/ingest",
+        json={
+            "channel": "telegram",
+            "platformUserId": "telegram-unbound-sync-user",
+            "chatId": "telegram-unbound-sync-chat",
+            "text": "请帮我写一段发布说明",
+            "metadata": {
+                "profileId": "crm-user-unbound-sync",
+                "displayName": "CRM 未绑定用户",
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    profile = store.user_profiles["crm-user-unbound-sync"]
+    assert profile["total_interactions"] == 7
+    assert profile["source_channels"] == ["wecom"]
+    assert profile["platform_accounts"] == [{"platform": "wecom", "account_id": "wecom-user-2"}]
+    assert all(user["id"] != "telegram:telegram-unbound-sync-user" for user in store.users)
+
+
+def test_message_ingest_creates_profile_when_channel_has_bound_tenant() -> None:
+    runtime_settings = deepcopy(settings_service.DEFAULT_CHANNEL_INTEGRATION_SETTINGS)
+    runtime_settings["telegram"]["tenant_id"] = "tenant-alpha"
+    runtime_settings["telegram"]["tenant_name"] = "Alpha Corp"
+    store.system_settings["channel_integrations"] = runtime_settings
+
+    response = client.post(
+        "/api/messages/ingest",
+        json={
+            "channel": "telegram",
+            "platformUserId": "bound-user",
+            "chatId": "bound-chat",
+            "text": "请帮我写一封欢迎邮件",
+        },
+    )
+
+    assert response.status_code == 200
+    profile = store.user_profiles["telegram:bound-user"]
+    assert profile["tenant_id"] == "tenant-alpha"
+    assert profile["tenant_name"] == "Alpha Corp"
+    assert profile["source_channels"] == ["telegram"]
 
 
 def test_message_ingest_merges_follow_up_into_active_task_context(auth_headers) -> None:

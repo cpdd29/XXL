@@ -9,7 +9,7 @@ from sqlalchemy import delete
 
 from app.db.models import UserProfileRecord, UserRecord
 from app.main import app
-from app.services import auth_service
+from app.services import auth_service, profile_service
 from app.services.persistence_service import StatePersistenceService
 from app.services.store import InMemoryStore, store
 
@@ -31,6 +31,21 @@ def _sqlite_service(tmp_path: Path, seeded_store: InMemoryStore) -> StatePersist
     )
     assert service.initialize() is True
     return service
+
+
+def _bind_persistence_services(monkeypatch, service: StatePersistenceService) -> None:
+    monkeypatch.setattr(auth_service, "persistence_service", service)
+    monkeypatch.setattr(profile_service, "persistence_service", service)
+
+
+def _demo_admin_actor() -> dict[str, str]:
+    return {
+        "id": "admin-1",
+        "name": "管理员",
+        "email": "admin@workbot.ai",
+        "role": "admin",
+        "status": "active",
+    }
 
 
 def test_login_prefers_database_user_over_demo_fallback(
@@ -62,7 +77,7 @@ def test_login_prefers_database_user_over_demo_fallback(
     }
 
     service = _sqlite_service(tmp_path, seeded_store)
-    monkeypatch.setattr(auth_service, "persistence_service", service)
+    _bind_persistence_services(monkeypatch, service)
 
     try:
         payload = auth_service.login("admin@workbot.ai", "db-only-password")
@@ -81,16 +96,26 @@ def test_login_prefers_database_user_over_demo_fallback(
     assert audit_logs[0]["status"] == "success"
 
 
-def test_login_falls_back_to_seeded_demo_admin_when_database_has_no_match(
+def test_login_falls_back_to_demo_admin_without_creating_visible_profile_or_tenant_data(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
-    service = _sqlite_service(tmp_path, InMemoryStore())
-    monkeypatch.setattr(auth_service, "persistence_service", service)
+    seeded_store = InMemoryStore()
+    seeded_store.users = []
+    seeded_store.user_profiles = {}
+
+    service = _sqlite_service(tmp_path, seeded_store)
+    _bind_persistence_services(monkeypatch, service)
 
     try:
         payload = auth_service.login("admin@workbot.ai", "workbot123")
         persisted_user = service.get_user_by_email("admin@workbot.ai")
+        persisted_profile = service.get_user_profile("admin-1")
+        visible_profiles = profile_service.list_profiles(current_user=_demo_admin_actor())
+        visible_tenants = profile_service.list_profile_tenants(
+            _demo_admin_actor(),
+            management_view=True,
+        )
     finally:
         service.close()
 
@@ -99,6 +124,10 @@ def test_login_falls_back_to_seeded_demo_admin_when_database_has_no_match(
     assert persisted_user is not None
     assert persisted_user["email"] == "admin@workbot.ai"
     assert persisted_user["status"] == "active"
+    assert persisted_profile is None
+    assert "admin-1" not in store.user_profiles
+    assert visible_profiles["total"] == 0
+    assert visible_tenants["total"] == 0
 
 
 def test_login_rejects_invalid_password_for_existing_database_user(
@@ -130,7 +159,7 @@ def test_login_rejects_invalid_password_for_existing_database_user(
     }
 
     service = _sqlite_service(tmp_path, seeded_store)
-    monkeypatch.setattr(auth_service, "persistence_service", service)
+    _bind_persistence_services(monkeypatch, service)
 
     try:
         with pytest.raises(HTTPException) as exc_info:
@@ -165,7 +194,7 @@ def test_login_rejects_demo_password_for_existing_database_user_without_profile(
     seeded_store.user_profiles = {}
 
     service = _sqlite_service(tmp_path, seeded_store)
-    monkeypatch.setattr(auth_service, "persistence_service", service)
+    _bind_persistence_services(monkeypatch, service)
 
     try:
         with pytest.raises(HTTPException) as exc_info:
@@ -182,7 +211,7 @@ def test_login_rejects_demo_password_for_existing_database_user_without_profile(
     assert audit_logs[0]["status"] == "error"
 
 
-def test_login_seeds_missing_password_for_default_demo_admin_user(
+def test_login_keeps_default_demo_admin_user_without_profile_when_database_only_has_user(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -202,18 +231,122 @@ def test_login_seeds_missing_password_for_default_demo_admin_user(
     seeded_store.user_profiles = {}
 
     service = _sqlite_service(tmp_path, seeded_store)
-    monkeypatch.setattr(auth_service, "persistence_service", service)
+    _bind_persistence_services(monkeypatch, service)
 
     try:
         payload = auth_service.login("admin@workbot.ai", "workbot123")
         persisted_profile = service.get_user_profile("admin-1")
+        visible_profiles = profile_service.list_profiles(current_user=_demo_admin_actor())
+        visible_tenants = profile_service.list_profile_tenants(
+            _demo_admin_actor(),
+            management_view=True,
+        )
     finally:
         service.close()
 
     assert payload["user"]["id"] == "admin-1"
-    assert persisted_profile is not None
-    assert persisted_profile["preferred_language"] == "zh"
-    assert persisted_profile.get("auth_password_hash")
+    assert persisted_profile is None
+    assert "admin-1" not in store.user_profiles
+    assert visible_profiles["total"] == 0
+    assert visible_tenants["total"] == 0
+
+
+def test_login_hides_existing_default_demo_admin_profile_from_profile_and_tenant_views(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    seeded_store = InMemoryStore()
+    seeded_store.users = [
+        {
+            "id": "admin-1",
+            "name": "管理员",
+            "email": "admin@workbot.ai",
+            "role": "admin",
+            "status": "active",
+            "last_login": "",
+            "total_interactions": 0,
+            "created_at": "2026-04-01",
+        }
+    ]
+    seeded_store.user_profiles = {
+        "admin-1": {
+            **seeded_store.users[0],
+            "tenant_id": "default",
+            "tenant_name": "默认租户",
+            "tags": ["系统管理员", "控制台入口"],
+            "notes": "旧版 demo admin 画像。",
+            "preferred_language": "zh",
+            "source_channels": ["console"],
+            "platform_accounts": [{"platform": "console", "account_id": "admin-1"}],
+            **auth_service.build_password_record("workbot123"),
+        }
+    }
+
+    service = _sqlite_service(tmp_path, seeded_store)
+    _bind_persistence_services(monkeypatch, service)
+
+    try:
+        payload = auth_service.login("admin@workbot.ai", "workbot123")
+        persisted_profile = service.get_user_profile("admin-1")
+        visible_profiles = profile_service.list_profiles(current_user=_demo_admin_actor())
+        visible_tenants = profile_service.list_profile_tenants(
+            _demo_admin_actor(),
+            management_view=True,
+        )
+    finally:
+        service.close()
+
+    assert payload["user"]["id"] == "admin-1"
+    assert persisted_profile is None
+    assert "admin-1" not in store.user_profiles
+    assert visible_profiles["total"] == 0
+    assert visible_tenants["total"] == 0
+
+
+def test_login_accepts_password_only_demo_admin_profile_without_exposing_visible_data(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    seeded_store = InMemoryStore()
+    seeded_store.users = [
+        {
+            "id": "admin-1",
+            "name": "管理员",
+            "email": "admin@workbot.ai",
+            "role": "admin",
+            "status": "active",
+            "last_login": "",
+            "total_interactions": 0,
+            "created_at": "2026-04-01",
+        }
+    ]
+    seeded_store.user_profiles = {
+        "admin-1": {
+            "id": "admin-1",
+            "user_id": "admin-1",
+            **auth_service.build_password_record("workbot123"),
+        }
+    }
+
+    service = _sqlite_service(tmp_path, seeded_store)
+    _bind_persistence_services(monkeypatch, service)
+
+    try:
+        payload = auth_service.login("admin@workbot.ai", "workbot123")
+        persisted_profile = service.get_user_profile("admin-1")
+        visible_profiles = profile_service.list_profiles(current_user=_demo_admin_actor())
+        visible_tenants = profile_service.list_profile_tenants(
+            _demo_admin_actor(),
+            management_view=True,
+        )
+    finally:
+        service.close()
+
+    assert payload["user"]["id"] == "admin-1"
+    assert persisted_profile is None
+    assert "admin-1" not in store.user_profiles
+    assert visible_profiles["total"] == 0
+    assert visible_tenants["total"] == 0
 
 
 def test_login_rejects_stale_runtime_user_when_database_is_enabled_but_missing(
@@ -221,7 +354,7 @@ def test_login_rejects_stale_runtime_user_when_database_is_enabled_but_missing(
     monkeypatch,
 ) -> None:
     service = _sqlite_service(tmp_path, InMemoryStore())
-    monkeypatch.setattr(auth_service, "persistence_service", service)
+    _bind_persistence_services(monkeypatch, service)
 
     store.users = [
         {
@@ -284,7 +417,7 @@ def test_refresh_and_authenticate_reject_deleted_database_user_even_if_runtime_c
     }
 
     service = _sqlite_service(tmp_path, seeded_store)
-    monkeypatch.setattr(auth_service, "persistence_service", service)
+    _bind_persistence_services(monkeypatch, service)
 
     try:
         login_payload = auth_service.login("admin@workbot.ai", "db-only-password")
@@ -311,7 +444,7 @@ def test_auth_login_route_preserves_response_contract(
     monkeypatch,
 ) -> None:
     service = _sqlite_service(tmp_path, InMemoryStore())
-    monkeypatch.setattr(auth_service, "persistence_service", service)
+    _bind_persistence_services(monkeypatch, service)
 
     try:
         response = client.post(
@@ -335,7 +468,7 @@ def test_auth_refresh_route_returns_new_token_pair(
     monkeypatch,
 ) -> None:
     service = _sqlite_service(tmp_path, InMemoryStore())
-    monkeypatch.setattr(auth_service, "persistence_service", service)
+    _bind_persistence_services(monkeypatch, service)
 
     try:
         login_response = client.post(
@@ -377,7 +510,7 @@ def test_login_fails_closed_when_database_user_lookup_is_unavailable(
     monkeypatch,
 ) -> None:
     service = _sqlite_service(tmp_path, InMemoryStore())
-    monkeypatch.setattr(auth_service, "persistence_service", service)
+    _bind_persistence_services(monkeypatch, service)
     monkeypatch.setattr(service, "get_user_by_email", lambda email: None)
     monkeypatch.setattr(service, "list_users", lambda *, search=None: None)
 
@@ -419,7 +552,7 @@ def test_refresh_fails_closed_when_database_user_lookup_is_unavailable(
     monkeypatch,
 ) -> None:
     service = _sqlite_service(tmp_path, InMemoryStore())
-    monkeypatch.setattr(auth_service, "persistence_service", service)
+    _bind_persistence_services(monkeypatch, service)
     monkeypatch.setattr(service, "get_user", lambda user_id: None)
     monkeypatch.setattr(service, "list_users", lambda *, search=None: None)
 
@@ -461,7 +594,7 @@ def test_authenticate_access_token_fails_closed_when_database_user_lookup_is_una
     monkeypatch,
 ) -> None:
     service = _sqlite_service(tmp_path, InMemoryStore())
-    monkeypatch.setattr(auth_service, "persistence_service", service)
+    _bind_persistence_services(monkeypatch, service)
     monkeypatch.setattr(service, "get_user", lambda user_id: None)
     monkeypatch.setattr(service, "list_users", lambda *, search=None: None)
 

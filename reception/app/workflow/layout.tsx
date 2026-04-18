@@ -13,7 +13,7 @@ export default function WorkflowLayout({
         <AppSidebar />
         <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
           <AppHeader />
-          <main className="min-h-0 flex-1 overflow-auto">{children}</main>
+          <main className="min-h-0 flex-1 overflow-hidden">{children}</main>
         </div>
       </div>
     </AuthGuard>

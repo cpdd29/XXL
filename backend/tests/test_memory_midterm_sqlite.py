@@ -122,3 +122,45 @@ def test_memory_service_mid_term_summary_is_encrypted_at_rest_in_sqlite(tmp_path
     assert isinstance(row[1], str) and row[1].startswith("enc:v1:")
     assert isinstance(row[2], str) and row[2].startswith("enc:v1:")
     assert isinstance(row[3], str) and row[3].startswith("enc:v1:")
+
+
+def test_sqlite_mid_term_memory_store_deletes_by_tenant_or_user(tmp_path: Path) -> None:
+    sqlite_path = tmp_path / "mid-term-delete.sqlite3"
+    store = SQLiteMidTermMemoryStore(sqlite_path=str(sqlite_path))
+
+    for summary_id, user_id, tenant_id in (
+        ("mid-delete-1", "tenant-user-delete", "tenant-delete"),
+        ("mid-keep-1", "tenant-user-keep", "tenant-keep"),
+    ):
+        assert (
+            store.save_summary(
+                {
+                    "id": summary_id,
+                    "user_id": user_id,
+                    "session_id": f"session-{summary_id}",
+                    "trigger": "session_end",
+                    "source_count": 2,
+                    "summary": f"{summary_id} summary",
+                    "entities": [],
+                    "events": [],
+                    "keywords": [],
+                    "preferences": [],
+                    "decisions": [],
+                    "task_results": [],
+                    "tenant_id": tenant_id,
+                    "project_id": "default",
+                    "environment": "test",
+                    "created_at": "2026-04-18T10:00:00+00:00",
+                }
+            )
+            is True
+        )
+
+    assert store.delete_summaries(tenant_id="tenant-delete") == 1
+
+    deleted_items = store.list_summaries("tenant-user-delete")
+    kept_items = store.list_summaries("tenant-user-keep")
+
+    assert deleted_items == []
+    assert kept_items is not None
+    assert [item["id"] for item in kept_items] == ["mid-keep-1"]

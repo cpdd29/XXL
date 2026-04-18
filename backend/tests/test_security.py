@@ -5,6 +5,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.main import app
+from app.services.mandatory_agent_registry_service import ensure_mandatory_agents_registered
 from app.services import security_service
 from app.services.persistence_service import StatePersistenceService
 from app.services.security_gateway_service import security_gateway_service
@@ -160,12 +161,14 @@ def test_security_report_route_aggregates_recent_logs_and_rules(auth_headers) ->
 
 
 def test_security_guardian_route_returns_local_security_agent(auth_headers) -> None:
+    ensure_mandatory_agents_registered()
     response = client.get("/api/security/guardian", headers=auth_headers)
 
     assert response.status_code == 200
     body = response.json()
-    assert body["type"] == "security"
-    assert body["name"] == "安全检测 Agent"
+    assert body["id"] == "security-guardian"
+    assert body["type"] == "security_guardian"
+    assert body["name"] == "Security Guardian"
     assert body["configSummary"]["status"] in {"loaded", "partial", "missing"}
 
 

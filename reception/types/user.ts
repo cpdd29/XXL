@@ -1,46 +1,79 @@
-export type UserRole = 'admin' | 'operator' | 'viewer' | 'external'
-export type UserStatus = 'active' | 'inactive' | 'suspended'
+export type UserPreferredLanguage = 'zh' | 'en'
+export type UserTenantStatus = 'active' | 'inactive' | 'archived' | string
+export type UserActivityType = string
+
+export interface UserTenantOption {
+  id: string
+  name: string
+  status: UserTenantStatus
+  profileCount: number
+  description: string
+}
 
 export interface UserPlatformAccount {
   platform: string
   accountId: string
 }
 
-export interface User {
+export interface UserPortrait {
   id: string
+  tenantId: string
+  tenantName: string
+  tenantStatus: UserTenantStatus
   name: string
-  email: string
-  role: UserRole
-  status: UserStatus
-  lastLogin: string
-  totalInteractions: number
-  createdAt: string
-}
-
-export interface UserProfile extends User {
-  tags: string[]
   sourceChannels: string[]
   platformAccounts: UserPlatformAccount[]
-  preferredLanguage: 'zh' | 'en'
+  tags: string[]
+  preferredLanguage: UserPreferredLanguage
+  lastActiveAt: string
+  totalInteractions: number
   notes: string
-  identityMappingStatus?: string
-  identityMappingSource?: string
-  identityMappingConfidence?: number
-  lastIdentitySyncAt?: string | null
+  interactionSummary: string
+  lastLogin?: string
+  email?: string
+  createdAt?: string
+}
+
+export interface UserProfile extends UserPortrait {
+  identityMappingStatus: string
+  identityMappingSource: string
+  identityMappingConfidence: number
+  lastIdentitySyncAt: string | null
 }
 
 export interface UserActivityItem {
   id: string
   timestamp: string
-  type: 'info' | 'success' | 'warning' | 'error'
+  type: UserActivityType
   title: string
   description: string
   source: string
 }
 
-export interface UserListResponse {
-  items: User[]
+export interface UserPortraitListResponse {
+  items: UserPortrait[]
   total: number
+  appliedTenantId?: string | null
+  canViewAllTenants: boolean
+}
+
+export interface UserTenantOptionsResponse {
+  items: UserTenantOption[]
+  total: number
+  canViewAllTenants: boolean
+  defaultTenantId?: string | null
+}
+
+export interface CreateUserTenantRequest {
+  name: string
+  description: string
+}
+
+export interface UserTenantActionResponse {
+  ok: boolean
+  message: string
+  tenant?: UserTenantOption | null
+  deletedTenantId?: string | null
 }
 
 export interface UserActivityResponse {
@@ -51,11 +84,11 @@ export interface UserActivityResponse {
 export interface UserActionResponse {
   ok: boolean
   message: string
-  user: User | UserProfile
+  profile: UserProfile
 }
 
 export interface UpdateUserProfileRequest {
   tags: string[]
   notes: string
-  preferredLanguage: 'zh' | 'en'
+  preferredLanguage: UserPreferredLanguage
 }

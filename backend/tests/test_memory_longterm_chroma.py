@@ -28,11 +28,21 @@ class FakeChromaCollection:
             }
 
     def get(self, where, include):
-        user_id = where["user_id"]
-        ids = [memory_id for memory_id, row in self.records.items() if row["metadata"]["user_id"] == user_id]
+        ids = [
+            memory_id
+            for memory_id, row in self.records.items()
+            if all(str(row["metadata"].get(key) or "") == str(value) for key, value in (where or {}).items())
+        ]
         documents = [self.records[memory_id]["document"] for memory_id in ids]
         metadatas = [self.records[memory_id]["metadata"] for memory_id in ids]
         return {"ids": ids, "documents": documents, "metadatas": metadatas, "include": include}
+
+    def delete(self, ids=None, where=None) -> None:
+        target_ids = [str(memory_id) for memory_id in (ids or []) if str(memory_id)]
+        if not target_ids and where:
+            target_ids = list(self.get(where=where, include=[]).get("ids") or [])
+        for memory_id in target_ids:
+            self.records.pop(memory_id, None)
 
     @staticmethod
     def _distance(left: list[float], right: list[float]) -> float:
@@ -231,6 +241,55 @@ def test_memory_service_uses_chroma_long_term_store_for_layers_and_retrieval(tmp
         item["source_mid_term_id"] == distill_result["mid_term"]["id"]
         for item in retrieve_result["items"]
     )
+
+
+def test_chroma_long_term_memory_store_deletes_by_tenant_or_user() -> None:
+    fake_client = FakeChromaClient()
+    store = ChromaLongTermMemoryStore(
+        chroma_url="http://fake:8000",
+        collection_name="delete_collection",
+        client_factory_override=lambda: fake_client,
+    )
+
+    assert (
+        store.save_memory(
+            {
+                "id": "lng-delete-1",
+                "user_id": "tenant-user-delete",
+                "source_mid_term_id": "mid-delete-1",
+                "memory_text": "待删除长期记忆",
+                "summary": "待删除",
+                "keywords": ["删除"],
+                "tenant_id": "tenant-delete",
+                "created_at": "2026-04-18T10:00:00+00:00",
+            }
+        )
+        is True
+    )
+    assert (
+        store.save_memory(
+            {
+                "id": "lng-keep-1",
+                "user_id": "tenant-user-keep",
+                "source_mid_term_id": "mid-keep-1",
+                "memory_text": "保留长期记忆",
+                "summary": "保留",
+                "keywords": ["保留"],
+                "tenant_id": "tenant-keep",
+                "created_at": "2026-04-18T10:01:00+00:00",
+            }
+        )
+        is True
+    )
+
+    assert store.delete_memories(tenant_id="tenant-delete") == 1
+
+    deleted_items = store.list_memories("tenant-user-delete")
+    kept_items = store.list_memories("tenant-user-keep")
+
+    assert deleted_items == []
+    assert kept_items is not None
+    assert [item["id"] for item in kept_items] == ["lng-keep-1"]
 
 
 def test_memory_service_chroma_retrieve_supports_dynamic_window_and_hybrid_scores(tmp_path) -> None:

@@ -1,0 +1,27 @@
+policy:
+  execution_scope: "local_governed_memory"
+  direct_external_execution: false
+  hidden_tool_access: false
+  publish_or_execute: false
+tools:
+  - name: "memory_source_reader"
+    scope: "local"
+    mode: "read_only"
+    purpose: "读取已脱敏的会话片段、任务结果和审批结果摘要。"
+  - name: "tenant_scope_resolver"
+    scope: "local"
+    mode: "read_only"
+    purpose: "判断当前写入应落在 tenant 还是 global 作用域。"
+  - name: "retention_policy_checker"
+    scope: "local"
+    mode: "read_only"
+    purpose: "校验留存层级、允许来源和敏感内容排除规则。"
+  - name: "distilled_memory_writer"
+    scope: "local"
+    mode: "append_only"
+    purpose: "仅通过 distillation 路径追加结构化记忆记录。"
+  - name: "memory_audit_append"
+    scope: "local"
+    mode: "append_only"
+    purpose: "记录蒸馏决策、过滤原因和留存审计。"
+mcp: []

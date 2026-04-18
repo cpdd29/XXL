@@ -1,26 +1,41 @@
 "use client"
 
 import { cn } from "@/lib/utils"
-import { Bot, Search, FileText, Shield, Zap, MessageSquare } from "lucide-react"
-
-type AgentStatus = "idle" | "running" | "waiting" | "busy" | "degraded" | "offline" | "maintenance" | "error"
+import { isAgentType, type AgentStatus, type AgentType } from "@/types/agent"
+import {
+  Bot,
+  Database,
+  FileText,
+  GitBranch,
+  MessageCircle,
+  MessageSquare,
+  Search,
+  Shield,
+  Zap,
+  type LucideIcon,
+} from "lucide-react"
 
 interface AgentAvatarProps {
   name: string
-  type?: "search" | "write" | "security" | "intent" | "default" | "output"
+  type?: AgentType
   status?: AgentStatus
   size?: "sm" | "md" | "lg"
   showStatus?: boolean
 }
 
 const agentIcons = {
+  conversation: MessageCircle,
+  task_dispatcher: GitBranch,
+  workflow_planner: GitBranch,
+  memory: Database,
   search: Search,
   write: FileText,
   security: Shield,
+  security_guardian: Shield,
   intent: Zap,
   default: Bot,
   output: MessageSquare,
-}
+} satisfies Record<AgentType, LucideIcon>
 
 const statusColors = {
   idle: "bg-muted-foreground",
@@ -52,7 +67,7 @@ export function AgentAvatar({
   size = "md",
   showStatus = true,
 }: AgentAvatarProps) {
-  const Icon = agentIcons[type]
+  const Icon = agentIcons[type && isAgentType(type) ? type : "default"]
 
   return (
     <div className="relative inline-flex">

@@ -1,0 +1,23 @@
+policy:
+  execution_scope: "local_control_plane"
+  direct_external_execution: false
+  hidden_tool_access: false
+  publish_or_execute: false
+tools:
+  - name: "conversation_handoff_reader"
+    scope: "local"
+    mode: "read_only"
+    purpose: "读取对话 Agent 生成的 handoff 摘要。"
+  - name: "security_review_reader"
+    scope: "local"
+    mode: "read_only"
+    purpose: "读取安全审查结论和风险标签。"
+  - name: "route_plan_builder"
+    scope: "local"
+    mode: "read_only"
+    purpose: "生成外接触手执行方向与分发说明。"
+  - name: "dispatch_audit_append"
+    scope: "local"
+    mode: "append_only"
+    purpose: "记录需求分析与任务分发决策。"
+mcp: []

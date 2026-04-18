@@ -13,6 +13,20 @@ from app.services.encryption_service import encryption_service
 logger = logging.getLogger(__name__)
 
 
+def _normalize_identifier_list(values: list[str] | tuple[str, ...] | set[str] | None) -> list[str]:
+    if not values:
+        return []
+    items: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        normalized = str(value or "").strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        items.append(normalized)
+    return items
+
+
 class SQLiteMidTermMemoryStore:
     def __init__(self, sqlite_path: str | None = None) -> None:
         self.sqlite_path = sqlite_path or get_settings().memory_sqlite_path
@@ -344,6 +358,45 @@ class SQLiteMidTermMemoryStore:
                 connection.commit()
             except Exception as exc:
                 logger.warning("SQLite mid-term memory clear failed: %s", exc)
+            finally:
+                connection.close()
+
+    def delete_summaries(
+        self,
+        *,
+        tenant_id: str | None = None,
+        user_ids: list[str] | tuple[str, ...] | set[str] | None = None,
+    ) -> int:
+        normalized_tenant_id = str(tenant_id or "").strip()
+        normalized_user_ids = _normalize_identifier_list(user_ids)
+        if not normalized_tenant_id and not normalized_user_ids:
+            return 0
+
+        connection = self._connect()
+        if connection is None:
+            return 0
+
+        clauses: list[str] = []
+        parameters: list[str] = []
+        if normalized_tenant_id:
+            clauses.append("tenant_id = ?")
+            parameters.append(normalized_tenant_id)
+        if normalized_user_ids:
+            placeholders = ",".join("?" for _ in normalized_user_ids)
+            clauses.append(f"user_id IN ({placeholders})")
+            parameters.extend(normalized_user_ids)
+
+        with self._lock:
+            try:
+                cursor = connection.execute(
+                    f"DELETE FROM mid_term_summaries WHERE {' OR '.join(clauses)}",
+                    tuple(parameters),
+                )
+                connection.commit()
+                return int(cursor.rowcount or 0)
+            except Exception as exc:
+                logger.warning("SQLite mid-term memory delete failed: %s", exc)
+                return 0
             finally:
                 connection.close()
 

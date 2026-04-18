@@ -57,6 +57,12 @@ class AgentConfigService:
     def __init__(self, *, config_root: str | Path | None = None) -> None:
         self._config_root_override = Path(config_root) if config_root is not None else None
 
+    def resolve_agent_directory_path(self, agent: dict[str, Any]) -> Path | None:
+        return self._resolve_agent_directory(agent)
+
+    def resolve_config_root_path(self) -> Path:
+        return self._resolve_config_root()
+
     def load_agent_config(self, agent: dict[str, Any]) -> dict[str, Any]:
         normalized_agent = deepcopy(agent)
         agent_id = str(normalized_agent.get("id") or "").strip()

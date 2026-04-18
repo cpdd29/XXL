@@ -1,0 +1,27 @@
+policy:
+  execution_scope: "local_control_plane"
+  direct_external_execution: false
+  hidden_tool_access: false
+  publish_or_execute: false
+tools:
+  - name: "enabled_skill_registry_reader"
+    scope: "local"
+    mode: "read_only"
+    purpose: "读取当前租户已启用的 skill 能力目录。"
+  - name: "tool_catalog_reader"
+    scope: "local"
+    mode: "read_only"
+    purpose: "读取工具目录及权限元数据。"
+  - name: "tenant_connector_inventory_reader"
+    scope: "local"
+    mode: "read_only"
+    purpose: "读取当前租户可见连接器和健康状态摘要。"
+  - name: "approval_policy_reader"
+    scope: "local"
+    mode: "read_only"
+    purpose: "读取审批规则、权限门槛和回滚要求。"
+  - name: "workflow_proposal_stager"
+    scope: "local"
+    mode: "append_only"
+    purpose: "把提案暂存为草稿，不直接发布到执行层。"
+mcp: []

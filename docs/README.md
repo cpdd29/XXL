@@ -11,6 +11,7 @@
   - `WorkBot_开发全指南.md`
   - `开发指南补充.md`
 - `docs/brain/` 存放主脑运行、上线、兼容、容灾、记忆治理文档。
+- `docs/wiki/` 存放给 LLM 持续维护和引用的稳定知识页。
 - `docs/stages/` 存放当前阶段任务清单与阶段 TODO。
 - `docs/reports/` 存放验收与阶段结果报告。
 - `docs/archive/completed-stages/` 存放已完成阶段文档与归档 TODO。
@@ -43,6 +44,7 @@
 ## 后续整理规则
 
 - 主脑运行文档：优先放入 `docs/brain/`
+- 稳定知识页与高频问答：优先放入 `docs/wiki/`
 - 当前阶段任务：优先放入 `docs/stages/`
 - 已完成阶段性报告：优先放入 `docs/reports/` 或 `docs/archive/completed-stages/`
 - 新增“当前执行任务清单”：统一放入 `docs/`

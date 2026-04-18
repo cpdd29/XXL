@@ -40,7 +40,11 @@ class WorkflowNode(APIModel):
     label: str
     x: float
     y: float
+    description: str | None = None
+    config: dict[str, object] | None = None
     agent_id: str | None = None
+    tool_id: str | None = None
+    workflow_id: str | None = None
 
 
 class WorkflowEdge(APIModel):

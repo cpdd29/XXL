@@ -84,6 +84,20 @@ def _parse_datetime(value: str | None) -> datetime | None:
     return parsed
 
 
+def _normalize_identifier_list(values: list[str] | tuple[str, ...] | set[str] | None) -> list[str]:
+    if not values:
+        return []
+    items: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        normalized = str(value or "").strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        items.append(normalized)
+    return items
+
+
 def _extract_job_protocol_snapshot(payload: dict[str, Any] | None) -> dict[str, Any] | None:
     if not isinstance(payload, dict):
         return None
@@ -2060,6 +2074,39 @@ class StatePersistenceService:
             logger.warning("Failed to load user profile %s from database: %s", user_id, exc)
             return None
 
+    def list_user_profiles(self) -> list[dict[str, Any]] | None:
+        if not self.enabled or self._session_factory is None:
+            return None
+
+        try:
+            with self._session_factory() as session:
+                return [
+                    self._decrypt_user_profile_payload(row.payload)
+                    for row in session.scalars(select(UserProfileRecord)).all()
+                ]
+        except SQLAlchemyError as exc:
+            logger.warning("Failed to load user profiles from database: %s", exc)
+            return None
+
+    def delete_user_profiles(self, *, user_ids: list[str]) -> int:
+        if not self.enabled or self._session_factory is None:
+            return 0
+
+        normalized_user_ids = _normalize_identifier_list(user_ids)
+        if not normalized_user_ids:
+            return 0
+
+        try:
+            with self._session_factory() as session:
+                result = session.execute(
+                    delete(UserProfileRecord).where(UserProfileRecord.user_id.in_(normalized_user_ids))
+                )
+                session.commit()
+                return int(result.rowcount or 0)
+        except SQLAlchemyError as exc:
+            logger.warning("Failed to delete user profiles from database: %s", exc)
+            return 0
+
     def find_user_profile_by_platform_account(
         self,
         *,
@@ -2227,6 +2274,27 @@ class StatePersistenceService:
             logger.warning("Failed to append conversation message to database: %s", exc)
             return False
 
+    def delete_conversation_messages(self, *, user_ids: list[str]) -> int:
+        if not self.enabled or self._session_factory is None:
+            return 0
+
+        normalized_user_ids = _normalize_identifier_list(user_ids)
+        if not normalized_user_ids:
+            return 0
+
+        try:
+            with self._session_factory() as session:
+                result = session.execute(
+                    delete(ConversationMessageRecord).where(
+                        ConversationMessageRecord.user_id.in_(normalized_user_ids)
+                    )
+                )
+                session.commit()
+                return int(result.rowcount or 0)
+        except SQLAlchemyError as exc:
+            logger.warning("Failed to delete conversation messages from database: %s", exc)
+            return 0
+
     def get_memory_session_state(
         self,
         *,
@@ -2276,6 +2344,27 @@ class StatePersistenceService:
         except SQLAlchemyError as exc:
             logger.warning("Failed to persist memory session state: %s", exc)
             return False
+
+    def delete_memory_session_states(self, *, user_ids: list[str]) -> int:
+        if not self.enabled or self._session_factory is None:
+            return 0
+
+        normalized_user_ids = _normalize_identifier_list(user_ids)
+        if not normalized_user_ids:
+            return 0
+
+        try:
+            with self._session_factory() as session:
+                result = session.execute(
+                    delete(MemorySessionStateRecord).where(
+                        MemorySessionStateRecord.user_id.in_(normalized_user_ids)
+                    )
+                )
+                session.commit()
+                return int(result.rowcount or 0)
+        except SQLAlchemyError as exc:
+            logger.warning("Failed to delete memory session states from database: %s", exc)
+            return 0
 
     def list_security_rules(self) -> list[dict[str, Any]] | None:
         if not self.enabled or self._session_factory is None:

@@ -75,7 +75,6 @@ import {
   AlertTriangle,
   CheckCircle2,
   XCircle,
-  Filter,
   Download,
   Plus,
   Settings,
@@ -121,22 +120,12 @@ const incidentReviewActionConfig: Record<SecurityIncidentReviewAction, string> =
   note: "备注",
 }
 
-const pageSizeOptions = ["10", "20", "50"] as const
 const reportWindowOptions = [
   { value: "24", label: "最近 24 小时" },
   { value: "72", label: "最近 72 小时" },
   { value: "168", label: "最近 7 天" },
 ] as const
-const gatewayLayerOptions = [
-  { value: "all", label: "全部层" },
-  { value: "rate_limit", label: "限流" },
-  { value: "auth_scope", label: "认证" },
-  { value: "prompt_injection", label: "注入检测" },
-  { value: "content_policy_rewrite", label: "脱敏改写" },
-  { value: "security_pass", label: "审计放行" },
-  { value: "active_cooldown", label: "处罚冷却" },
-  { value: "active_ban", label: "处罚封禁" },
-] as const
+const pageSizeOptions = ["10", "20", "50"] as const
 type SecurityPolicyNumericKey =
   | "messageRateLimitPerMinute"
   | "messageRateLimitCooldownSeconds"
@@ -152,9 +141,6 @@ export default function SecurityPage() {
   const [activeTab, setActiveTab] = useState("logs")
   const [searchQuery, setSearchQuery] = useState("")
   const [statusFilter, setStatusFilter] = useState<"all" | AuditLog["status"]>("all")
-  const [layerFilter, setLayerFilter] = useState<(typeof gatewayLayerOptions)[number]["value"]>("all")
-  const [userFilter, setUserFilter] = useState("")
-  const [resourceFilter, setResourceFilter] = useState("")
   const [pageSize, setPageSize] = useState<(typeof pageSizeOptions)[number]>("10")
   const [reportWindowHours, setReportWindowHours] = useState<(typeof reportWindowOptions)[number]["value"]>("24")
   const [offset, setOffset] = useState(0)
@@ -188,16 +174,11 @@ export default function SecurityPage() {
   })
 
   const deferredSearchQuery = useDeferredValue(searchQuery.trim())
-  const deferredUserFilter = useDeferredValue(userFilter.trim())
-  const deferredResourceFilter = useDeferredValue(resourceFilter.trim())
   const limit = Number(pageSize)
 
   const { data: logsData, isLoading: logsLoading, error: logsError } = useAuditLogs({
     search: deferredSearchQuery || undefined,
     status: statusFilter === "all" ? undefined : statusFilter,
-    layer: layerFilter === "all" ? undefined : layerFilter,
-    user: deferredUserFilter || undefined,
-    resource: deferredResourceFilter || undefined,
     limit,
     offset,
   })
@@ -240,10 +221,7 @@ export default function SecurityPage() {
   const totalPages = Math.max(1, Math.ceil(totalLogs / appliedLimit))
   const canLoadPrevious = offset > 0
   const canLoadNext = Boolean(logsData?.hasMore)
-  const isSyncingFilters =
-    deferredSearchQuery !== searchQuery.trim() ||
-    deferredUserFilter !== userFilter.trim() ||
-    deferredResourceFilter !== resourceFilter.trim()
+  const isSyncingSearch = deferredSearchQuery !== searchQuery.trim()
   const securityRules = rulesData?.items ?? []
   const summary = rulesData?.summary ?? {
     todayEvents: auditLogs.length,
@@ -315,27 +293,6 @@ export default function SecurityPage() {
     })
   }
 
-  const handleLayerChange = (value: (typeof gatewayLayerOptions)[number]["value"]) => {
-    startTransition(() => {
-      setLayerFilter(value)
-      setOffset(0)
-    })
-  }
-
-  const handleUserFilterChange = (value: string) => {
-    startTransition(() => {
-      setUserFilter(value)
-      setOffset(0)
-    })
-  }
-
-  const handleResourceFilterChange = (value: string) => {
-    startTransition(() => {
-      setResourceFilter(value)
-      setOffset(0)
-    })
-  }
-
   const handlePageSizeChange = (value: (typeof pageSizeOptions)[number]) => {
     startTransition(() => {
       setPageSize(value)
@@ -349,9 +306,6 @@ export default function SecurityPage() {
       const { blob, filename } = await downloadAuditLogs({
         search: deferredSearchQuery || undefined,
         status: statusFilter === "all" ? undefined : statusFilter,
-        layer: layerFilter === "all" ? undefined : layerFilter,
-        user: deferredUserFilter || undefined,
-        resource: deferredResourceFilter || undefined,
       })
 
       const objectUrl = window.URL.createObjectURL(blob)
@@ -439,12 +393,10 @@ export default function SecurityPage() {
 
   const handleReportMetricDrilldown = (filters: {
     status?: "warning" | "error"
-    layer?: (typeof gatewayLayerOptions)[number]["value"]
   }) => {
     startTransition(() => {
       setActiveTab("logs")
       setStatusFilter(filters.status ?? "all")
-      setLayerFilter(filters.layer ?? "all")
       setOffset(0)
     })
   }
@@ -675,7 +627,7 @@ export default function SecurityPage() {
             variant="outline"
             size="sm"
             onClick={handleExportLogs}
-            disabled={!canExportAudit || isExporting || logsLoading || isSyncingFilters}
+            disabled={!canExportAudit || isExporting || logsLoading || isSyncingSearch}
           >
             <Download className="mr-2 size-4" />
             {isExporting ? "导出中..." : "导出日志"}
@@ -746,86 +698,44 @@ export default function SecurityPage() {
       </div>
 
       <Tabs value={activeTab} onValueChange={setActiveTab} className="flex-1">
-        <TabsList className="mb-4 bg-secondary">
-          <TabsTrigger value="logs">审计日志</TabsTrigger>
-          <TabsTrigger value="rules">安全规则</TabsTrigger>
-          <TabsTrigger value="policy">策略配置</TabsTrigger>
-          <TabsTrigger value="penalties">处罚运营</TabsTrigger>
-          <TabsTrigger value="report">安全报告</TabsTrigger>
-        </TabsList>
+        <div className="mb-4 flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+          <TabsList className="bg-secondary">
+            <TabsTrigger value="logs">审计日志</TabsTrigger>
+            <TabsTrigger value="rules">安全规则</TabsTrigger>
+            <TabsTrigger value="policy">策略配置</TabsTrigger>
+            <TabsTrigger value="penalties">处罚运营</TabsTrigger>
+            <TabsTrigger value="report">安全报告</TabsTrigger>
+          </TabsList>
+          {activeTab === "logs" ? (
+            <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-end">
+              <div className="relative">
+                <Search className="absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
+                <Input
+                  placeholder="搜索动作、用户、详情..."
+                  value={searchQuery}
+                  onChange={(e) => handleSearchChange(e.target.value)}
+                  className="w-full bg-secondary pl-10 sm:w-72"
+                />
+              </div>
+              <Select value={statusFilter} onValueChange={handleStatusChange}>
+                <SelectTrigger className="w-full bg-secondary sm:w-[140px]">
+                  <SelectValue placeholder="全部状态" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="all">全部状态</SelectItem>
+                  <SelectItem value="success">成功</SelectItem>
+                  <SelectItem value="warning">告警</SelectItem>
+                  <SelectItem value="error">异常</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+          ) : null}
+        </div>
 
         <TabsContent value="logs" className="mt-0">
           <Card className="bg-card">
             <CardHeader className="pb-3">
-              <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
-                <CardTitle className="text-base">审计日志</CardTitle>
-                <div className="flex flex-col gap-2 xl:items-end">
-                  <div className="flex flex-wrap items-center gap-2">
-                    <div className="relative">
-                      <Search className="absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
-                      <Input
-                        placeholder="搜索动作、用户、详情..."
-                        value={searchQuery}
-                        onChange={(e) => handleSearchChange(e.target.value)}
-                        className="w-72 bg-secondary pl-10"
-                      />
-                    </div>
-                    <div className="flex items-center gap-2 rounded-md border border-border bg-secondary px-3 py-2 text-xs text-muted-foreground">
-                      <Filter className="size-4" />
-                      服务端筛选
-                    </div>
-                    <Select value={statusFilter} onValueChange={handleStatusChange}>
-                      <SelectTrigger className="w-[140px] bg-secondary">
-                        <SelectValue placeholder="全部状态" />
-                      </SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="all">全部状态</SelectItem>
-                        <SelectItem value="success">成功</SelectItem>
-                        <SelectItem value="warning">告警</SelectItem>
-                        <SelectItem value="error">异常</SelectItem>
-                      </SelectContent>
-                    </Select>
-                    <Select value={layerFilter} onValueChange={handleLayerChange}>
-                      <SelectTrigger className="w-[150px] bg-secondary">
-                        <SelectValue placeholder="全部层" />
-                      </SelectTrigger>
-                      <SelectContent>
-                        {gatewayLayerOptions.map((option) => (
-                          <SelectItem key={option.value} value={option.value}>
-                            {option.label}
-                          </SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
-                    <Select value={pageSize} onValueChange={handlePageSizeChange}>
-                      <SelectTrigger className="w-[140px] bg-secondary">
-                        <SelectValue placeholder="每页条数" />
-                      </SelectTrigger>
-                      <SelectContent>
-                        {pageSizeOptions.map((option) => (
-                          <SelectItem key={option} value={option}>
-                            每页 {option} 条
-                          </SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
-                  </div>
-                  <div className="flex flex-wrap items-center gap-2">
-                    <Input
-                      placeholder="按用户筛选"
-                      value={userFilter}
-                      onChange={(e) => handleUserFilterChange(e.target.value)}
-                      className="w-44 bg-secondary"
-                    />
-                    <Input
-                      placeholder="按资源筛选"
-                      value={resourceFilter}
-                      onChange={(e) => handleResourceFilterChange(e.target.value)}
-                      className="w-44 bg-secondary"
-                    />
-                  </div>
-                </div>
-              </div>
+              <CardTitle className="text-base">审计日志</CardTitle>
             </CardHeader>
             <CardContent>
               {logsError && (
@@ -833,12 +743,6 @@ export default function SecurityPage() {
                   审计日志加载失败：{logsError instanceof Error ? logsError.message : "未知错误"}
                 </div>
               )}
-              <div className="mb-4 flex flex-col gap-2 text-xs text-muted-foreground md:flex-row md:items-center md:justify-between">
-                <span>
-                  共 {totalLogs} 条日志，当前第 {currentPage} / {totalPages} 页
-                </span>
-                <span>{isSyncingFilters ? "正在同步筛选条件..." : "筛选结果由后端直接返回"}</span>
-              </div>
               <ScrollArea className="h-[400px]">
                 <div className="space-y-3">
                   {auditLogs.map((log) => (
@@ -892,8 +796,23 @@ export default function SecurityPage() {
                 </div>
               </ScrollArea>
               <div className="mt-4 flex flex-col gap-3 border-t border-border pt-4 md:flex-row md:items-center md:justify-between">
-                <div className="text-xs text-muted-foreground">
-                  当前显示 {auditLogs.length} 条，偏移 {logsData?.offset ?? offset}
+                <div className="flex flex-col gap-3 text-xs text-muted-foreground md:flex-row md:items-center md:gap-4">
+                  <span>
+                    共 {totalLogs} 条日志，当前第 {currentPage} / {totalPages} 页
+                  </span>
+                  <span>{isSyncingSearch ? "正在同步搜索条件..." : `当前显示 ${auditLogs.length} 条`}</span>
+                  <Select value={pageSize} onValueChange={handlePageSizeChange}>
+                    <SelectTrigger className="h-8 w-[140px] bg-secondary text-xs">
+                      <SelectValue placeholder="每页条数" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {pageSizeOptions.map((option) => (
+                        <SelectItem key={option} value={option}>
+                          每页 {option} 条
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
                 </div>
                 <div className="flex items-center gap-2">
                   <Button
@@ -1546,7 +1465,7 @@ export default function SecurityPage() {
                         key={item.key}
                         type="button"
                         className="w-full space-y-1 text-left"
-                        onClick={() => handleReportMetricDrilldown({ layer: item.key as (typeof gatewayLayerOptions)[number]["value"] })}
+                        onClick={() => handleReportMetricDrilldown({})}
                       >
                         <div className="flex items-center justify-between text-sm">
                           <span className="text-foreground">{item.label}</span>

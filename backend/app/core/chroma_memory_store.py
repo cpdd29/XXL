@@ -245,6 +245,26 @@ class LocalPersistentChromaCollection:
             "include": include,
         }
 
+    def delete(self, ids=None, where=None) -> None:
+        normalized_ids = [str(memory_id).strip() for memory_id in (ids or []) if str(memory_id).strip()]
+        if not normalized_ids and where:
+            result = self.get(where=where, include=[])
+            normalized_ids = [
+                str(memory_id).strip()
+                for memory_id in (result.get("ids") or [])
+                if str(memory_id).strip()
+            ]
+        if not normalized_ids:
+            return
+        self._connection.executemany(
+            """
+            DELETE FROM long_term_memory
+            WHERE collection_name = ? AND memory_id = ?
+            """,
+            [(self._collection_name, memory_id) for memory_id in normalized_ids],
+        )
+        self._connection.commit()
+
     @staticmethod
     def _distance(left: list[float], right: list[float]) -> float:
         return sum((lval - rval) ** 2 for lval, rval in zip(left, right))
@@ -588,6 +608,57 @@ class ChromaLongTermMemoryStore:
         except Exception as exc:  # pragma: no cover - depends on runtime environment
             logger.warning("Chroma long-term memory query failed, using in-memory fallback: %s", exc)
             return None
+
+    def delete_memories(
+        self,
+        *,
+        tenant_id: str | None = None,
+        user_ids: list[str] | tuple[str, ...] | set[str] | None = None,
+    ) -> int:
+        collection = self._get_collection()
+        if collection is None:
+            return 0
+
+        normalized_tenant_id = str(tenant_id or "").strip()
+        normalized_user_ids = [
+            str(user_id).strip()
+            for user_id in (user_ids or [])
+            if str(user_id).strip()
+        ]
+        if not normalized_tenant_id and not normalized_user_ids:
+            return 0
+
+        delete_records = getattr(collection, "delete", None)
+        if delete_records is None:
+            return 0
+
+        candidate_ids: set[str] = set()
+        try:
+            if normalized_tenant_id:
+                tenant_result = collection.get(where={"tenant_id": normalized_tenant_id}, include=["metadatas"])
+                candidate_ids.update(
+                    str(memory_id).strip()
+                    for memory_id in (tenant_result.get("ids") or [])
+                    if str(memory_id).strip()
+                )
+
+            for user_id in normalized_user_ids:
+                user_result = collection.get(where={"user_id": user_id}, include=["metadatas"])
+                candidate_ids.update(
+                    str(memory_id).strip()
+                    for memory_id in (user_result.get("ids") or [])
+                    if str(memory_id).strip()
+                )
+
+            if not candidate_ids:
+                return 0
+
+            delete_records(ids=sorted(candidate_ids))
+            self._warned_unavailable = False
+            return len(candidate_ids)
+        except Exception as exc:  # pragma: no cover - depends on runtime environment
+            logger.warning("Chroma long-term memory delete failed, using in-memory fallback: %s", exc)
+            return 0
 
     def clear(self) -> None:
         client = self._get_client()

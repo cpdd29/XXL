@@ -739,6 +739,8 @@ def test_channel_integrations_route_returns_defaults(auth_headers) -> None:
         "httpTimeoutSeconds": settings_service.DEFAULT_CHANNEL_INTEGRATION_SETTINGS["telegram"][
             "http_timeout_seconds"
         ],
+        "tenantId": settings_service.DEFAULT_CHANNEL_INTEGRATION_SETTINGS["telegram"]["tenant_id"],
+        "tenantName": settings_service.DEFAULT_CHANNEL_INTEGRATION_SETTINGS["telegram"]["tenant_name"],
         "hasBotToken": bool(settings_service.DEFAULT_CHANNEL_INTEGRATION_SETTINGS["telegram"]["bot_token"]),
         "botTokenMasked": settings_service._mask_secret_value(
             settings_service.DEFAULT_CHANNEL_INTEGRATION_SETTINGS["telegram"]["bot_token"]
@@ -751,7 +753,11 @@ def test_channel_integrations_route_returns_defaults(auth_headers) -> None:
         ),
     }
     assert payload["settings"]["wecom"]["enabled"] is True
+    assert payload["settings"]["wecom"]["tenantId"] is None
+    assert payload["settings"]["wecom"]["tenantName"] is None
     assert payload["settings"]["dingtalk"]["enabled"] is True
+    assert payload["settings"]["dingtalk"]["tenantId"] is None
+    assert payload["settings"]["dingtalk"]["tenantName"] is None
     assert payload["settings"]["dingtalk"]["appId"] == settings_service.DEFAULT_CHANNEL_INTEGRATION_SETTINGS["dingtalk"]["app_id"]
     assert payload["settings"]["dingtalk"]["agentId"] == settings_service.DEFAULT_CHANNEL_INTEGRATION_SETTINGS["dingtalk"]["agent_id"]
     assert payload["settings"]["dingtalk"]["clientId"] == settings_service.DEFAULT_CHANNEL_INTEGRATION_SETTINGS["dingtalk"]["client_id"]
@@ -783,11 +789,15 @@ def test_update_channel_integrations_persists_encrypted_secrets_and_returns_mask
                     "enabled": True,
                     "apiBaseUrl": "https://telegram.example.com",
                     "httpTimeoutSeconds": 22.5,
+                    "tenantId": "tenant-alpha",
+                    "tenantName": "Alpha Corp",
                     "botToken": "tg-secret-1234567890",
                     "webhookSecret": "tg-webhook-secret-1234",
                 },
                 "wecom": {
                     "enabled": False,
+                    "tenantId": "tenant-beta",
+                    "tenantName": "Beta Inc",
                     "webhookSecretHeader": "X-WeCom-Secret",
                     "webhookSecretQueryParam": "access_token",
                     "botWebhookBaseUrl": "https://qyapi.example.com/webhook/send",
@@ -797,6 +807,8 @@ def test_update_channel_integrations_persists_encrypted_secrets_and_returns_mask
                 },
                 "dingtalk": {
                     "enabled": True,
+                    "tenantId": "tenant-gamma",
+                    "tenantName": "Gamma Labs",
                     "appId": "123456",
                     "agentId": "100001",
                     "clientId": "ding-client-id",
@@ -819,12 +831,16 @@ def test_update_channel_integrations_persists_encrypted_secrets_and_returns_mask
     telegram_settings = update_response.json()["settings"]["telegram"]
     assert telegram_settings["enabled"] is True
     assert telegram_settings["apiBaseUrl"] == "https://telegram.example.com"
+    assert telegram_settings["tenantId"] == "tenant-alpha"
+    assert telegram_settings["tenantName"] == "Alpha Corp"
     assert telegram_settings["hasBotToken"] is True
     assert telegram_settings["botTokenMasked"].startswith("tg-s")
     assert telegram_settings["hasWebhookSecret"] is True
 
     wecom_settings = update_response.json()["settings"]["wecom"]
     assert wecom_settings["enabled"] is False
+    assert wecom_settings["tenantId"] == "tenant-beta"
+    assert wecom_settings["tenantName"] == "Beta Inc"
     assert wecom_settings["webhookSecretHeader"] == "X-WeCom-Secret"
     assert wecom_settings["botWebhookBaseUrl"] == "https://qyapi.example.com/webhook/send"
     assert wecom_settings["hasBotWebhookKey"] is True
@@ -832,6 +848,8 @@ def test_update_channel_integrations_persists_encrypted_secrets_and_returns_mask
 
     dingtalk_settings = update_response.json()["settings"]["dingtalk"]
     assert dingtalk_settings["enabled"] is True
+    assert dingtalk_settings["tenantId"] == "tenant-gamma"
+    assert dingtalk_settings["tenantName"] == "Gamma Labs"
     assert dingtalk_settings["appId"] == "123456"
     assert dingtalk_settings["agentId"] == "100001"
     assert dingtalk_settings["clientId"] == "ding-client-id"
@@ -844,10 +862,16 @@ def test_update_channel_integrations_persists_encrypted_secrets_and_returns_mask
     persisted_payload = persisted_setting["payload"]
     assert persisted_payload["telegram"]["bot_token"].startswith(ENCRYPTED_TEXT_PREFIX)
     assert persisted_payload["telegram"]["webhook_secret"].startswith(ENCRYPTED_TEXT_PREFIX)
+    assert persisted_payload["telegram"]["tenant_id"] == "tenant-alpha"
+    assert persisted_payload["telegram"]["tenant_name"] == "Alpha Corp"
     assert persisted_payload["wecom"]["bot_webhook_key"].startswith(ENCRYPTED_TEXT_PREFIX)
     assert persisted_payload["wecom"]["webhook_secret"].startswith(ENCRYPTED_TEXT_PREFIX)
+    assert persisted_payload["wecom"]["tenant_id"] == "tenant-beta"
+    assert persisted_payload["wecom"]["tenant_name"] == "Beta Inc"
     assert persisted_payload["dingtalk"]["client_secret"].startswith(ENCRYPTED_TEXT_PREFIX)
     assert persisted_payload["dingtalk"]["webhook_secret"].startswith(ENCRYPTED_TEXT_PREFIX)
+    assert persisted_payload["dingtalk"]["tenant_id"] == "tenant-gamma"
+    assert persisted_payload["dingtalk"]["tenant_name"] == "Gamma Labs"
 
 
 def test_update_channel_integrations_partial_update_keeps_existing_secret(
@@ -881,6 +905,8 @@ def test_update_channel_integrations_partial_update_keeps_existing_secret(
             json={
                 "telegram": {
                     "httpTimeoutSeconds": 33,
+                    "tenantId": "",
+                    "tenantName": "",
                 }
             },
         )
@@ -890,11 +916,15 @@ def test_update_channel_integrations_partial_update_keeps_existing_secret(
 
     assert update_response.status_code == 200
     assert update_response.json()["settings"]["telegram"]["httpTimeoutSeconds"] == 33.0
+    assert update_response.json()["settings"]["telegram"]["tenantId"] is None
+    assert update_response.json()["settings"]["telegram"]["tenantName"] is None
     assert update_response.json()["settings"]["telegram"]["hasBotToken"] is True
     assert update_response.json()["settings"]["telegram"]["hasWebhookSecret"] is True
     assert persisted_setting is not None
     assert persisted_setting["payload"]["telegram"]["bot_token"].startswith(ENCRYPTED_TEXT_PREFIX)
     assert persisted_setting["payload"]["telegram"]["webhook_secret"].startswith(ENCRYPTED_TEXT_PREFIX)
+    assert persisted_setting["payload"]["telegram"]["tenant_id"] is None
+    assert persisted_setting["payload"]["telegram"]["tenant_name"] is None
 
 
 def test_update_channel_integrations_can_clear_existing_secret(

@@ -1,16 +1,31 @@
+policy:
+  execution_scope: "local_control_plane"
+  direct_external_execution: false
+  hidden_tool_access: false
+  publish_or_execute: false
 tools:
-  - name: rate_limit_state_reader
-    scope: local
-    mode: read_write
-  - name: auth_scope_validator
-    scope: local
-    mode: read_only
-  - name: prompt_injection_detector
-    scope: local
-    mode: read_only
-  - name: redaction_rewriter
-    scope: local
-    mode: read_only
-  - name: audit_append
-    scope: local
-    mode: append_only
+  - name: "rate_limit_state_reader"
+    scope: "local"
+    mode: "read_write"
+    purpose: "读取并更新安全限流状态。"
+  - name: "auth_scope_validator"
+    scope: "local"
+    mode: "read_only"
+    purpose: "校验当前请求是否具备所需授权范围。"
+  - name: "prompt_injection_detector"
+    scope: "local"
+    mode: "read_only"
+    purpose: "识别提示词注入、越狱和策略绕过信号。"
+  - name: "redaction_rewriter"
+    scope: "local"
+    mode: "read_only"
+    purpose: "为高风险内容生成脱敏或改写建议。"
+  - name: "risk_escalation_notifier"
+    scope: "local"
+    mode: "append_only"
+    purpose: "记录需要升级审批或人工复核的风险结论。"
+  - name: "audit_append"
+    scope: "local"
+    mode: "append_only"
+    purpose: "追加安全审计注记，不改写既有审计真源。"
+mcp: []

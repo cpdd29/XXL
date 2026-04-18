@@ -80,6 +80,17 @@ class SkillRegistryService:
         ability = self._abilities_by_name.get(name_key)
         return self._clone_ability(ability) if ability is not None else None
 
+    def remove_ability(self, name_or_id: str) -> bool:
+        key = _normalize_text(name_or_id)
+        if not key:
+            return False
+        name_key = self._abilities_by_id.get(key) or key.lower()
+        ability = self._abilities_by_name.pop(name_key, None)
+        if ability is None:
+            return False
+        self._abilities_by_id.pop(str(ability.get("id") or "").strip(), None)
+        return True
+
     def list_abilities(
         self,
         *,

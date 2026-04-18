@@ -10,7 +10,10 @@ from app.api.routes import tools as tools_route
 from app.main import app
 from app.services.mcp_runtime_service import MCPRuntimeService
 from app.services.tool_catalog_service import ToolCatalogService
-from app.services.tool_source_service import ToolSourceService
+from app.services.tool_source_service import (
+    CONTROL_PLANE_SKILL_SOURCE_ID,
+    ToolSourceService,
+)
 
 
 client = TestClient(app)
@@ -476,3 +479,213 @@ def test_tool_source_service_falls_back_to_local_registry_snapshot_when_env_file
     tool_names = {item["name"] for item in tools}
     assert "external_skill_router" in tool_names
     assert "registry_search" in tool_names
+
+
+def test_tool_source_service_registers_skill_and_mcp_into_registry(tmp_path: Path, monkeypatch) -> None:
+    service = _build_source_service(tmp_path)
+    registry_file = tmp_path / "external-tool-sources.json"
+    monkeypatch.setenv("WORKBOT_TOOL_SOURCES_MODE", "external_only")
+    monkeypatch.setenv("WORKBOT_EXTERNAL_TOOL_SOURCES_FILE", str(registry_file))
+    monkeypatch.delenv("WORKBOT_EXTERNAL_TOOL_SOURCES_JSON", raising=False)
+    monkeypatch.delenv("WORKBOT_TOOL_SOURCES_REGISTRY_JSON", raising=False)
+
+    skill_response = service.register_external_skill_tool(
+        {
+            "name": "Contract Review",
+            "description": "审查合同条款",
+            "base_url": "https://skills.example.com",
+            "invoke_path": "/skill/contract-review",
+            "health_path": "/healthz",
+            "capabilities": ["contract_review", "risk_scan"],
+            "tags": ["legal", "review"],
+        }
+    )
+    mcp_response = service.register_external_mcp_tool(
+        {
+            "name": "crm_lookup",
+            "description": "查询 CRM 客户档案",
+            "base_url": "https://mcp.example.com",
+            "invoke_path": "/tools/crm-lookup",
+            "requires_permission": True,
+            "approval_required": True,
+            "tags": ["crm", "lookup"],
+        }
+    )
+
+    persisted = json.loads(registry_file.read_text(encoding="utf-8"))
+    assert skill_response["source_id"] == CONTROL_PLANE_SKILL_SOURCE_ID
+    assert skill_response["tool_id"] == "skill-tool-contract-review"
+    assert mcp_response["tool_id"] == "mcp-tool-crm-lookup"
+    persisted_source_ids = {item["id"] for item in persisted["sources"]}
+    persisted_tools = {item["id"]: item for item in persisted["tools"]}
+    assert CONTROL_PLANE_SKILL_SOURCE_ID in persisted_source_ids
+    assert skill_response["tool_id"] in persisted_tools
+    assert mcp_response["tool_id"] in persisted_tools
+    assert persisted_tools[skill_response["tool_id"]]["source"] == CONTROL_PLANE_SKILL_SOURCE_ID
+    assert persisted_tools[mcp_response["tool_id"]]["source"] == mcp_response["source_id"]
+
+    payload = service.scan_sources()
+    source_ids = {item["id"] for item in payload["items"]}
+    tool_ids = {item["id"] for item in service.list_tools(refresh=False)}
+
+    assert CONTROL_PLANE_SKILL_SOURCE_ID in source_ids
+    assert mcp_response["source_id"] in source_ids
+    assert "skill-tool-contract-review" in tool_ids
+    assert "mcp-tool-crm-lookup" in tool_ids
+
+
+def test_tool_source_register_routes_create_skill_and_mcp(auth_headers, monkeypatch, tmp_path: Path) -> None:
+    service = _build_source_service(tmp_path)
+    registry_file = tmp_path / "external-tool-sources.json"
+    monkeypatch.setattr(tool_sources_route, "tool_source_service", service)
+    monkeypatch.setenv("WORKBOT_TOOL_SOURCES_MODE", "external_only")
+    monkeypatch.setenv("WORKBOT_EXTERNAL_TOOL_SOURCES_FILE", str(registry_file))
+    monkeypatch.delenv("WORKBOT_EXTERNAL_TOOL_SOURCES_JSON", raising=False)
+    monkeypatch.delenv("WORKBOT_TOOL_SOURCES_REGISTRY_JSON", raising=False)
+
+    skill_response = client.post(
+        "/api/tool-sources/register-skill",
+        headers=auth_headers,
+        json={
+            "name": "Invoice Extractor",
+            "description": "解析发票字段",
+            "baseUrl": "https://skills.example.com",
+            "invokePath": "/invoice/extract",
+            "capabilities": ["invoice_extract"],
+        },
+    )
+    assert skill_response.status_code == 200
+    assert skill_response.json()["toolId"] == "skill-tool-invoice-extractor"
+
+    mcp_response = client.post(
+        "/api/tool-sources/register-mcp",
+        headers=auth_headers,
+        json={
+            "name": "order_query_v2",
+            "description": "订单查询",
+            "baseUrl": "https://mcp.example.com",
+            "invokePath": "/tools/order-query",
+            "requiresPermission": True,
+        },
+    )
+    assert mcp_response.status_code == 200
+    assert mcp_response.json()["toolId"] == "mcp-tool-order-query-v2"
+
+    listed = client.get("/api/tool-sources?refresh=true", headers=auth_headers)
+    assert listed.status_code == 200
+    source_ids = {item["id"] for item in listed.json()["items"]}
+    assert CONTROL_PLANE_SKILL_SOURCE_ID in source_ids
+    assert mcp_response.json()["sourceId"] in source_ids
+
+
+def test_tool_source_register_routes_require_scan_permission(auth_headers_factory, monkeypatch, tmp_path: Path) -> None:
+    service = _build_source_service(tmp_path)
+    registry_file = tmp_path / "external-tool-sources.json"
+    monkeypatch.setattr(tool_sources_route, "tool_source_service", service)
+    monkeypatch.setenv("WORKBOT_TOOL_SOURCES_MODE", "external_only")
+    monkeypatch.setenv("WORKBOT_EXTERNAL_TOOL_SOURCES_FILE", str(registry_file))
+
+    response = client.post(
+        "/api/tool-sources/register-skill",
+        headers=auth_headers_factory(role="power_user"),
+        json={
+            "name": "power_user_blocked",
+            "baseUrl": "https://skills.example.com",
+        },
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Permission denied"
+
+
+def test_tool_source_service_updates_and_deletes_control_plane_tool(tmp_path: Path, monkeypatch) -> None:
+    service = _build_source_service(tmp_path)
+    registry_file = tmp_path / "external-tool-sources.json"
+    monkeypatch.setenv("WORKBOT_TOOL_SOURCES_MODE", "external_only")
+    monkeypatch.setenv("WORKBOT_EXTERNAL_TOOL_SOURCES_FILE", str(registry_file))
+    monkeypatch.delenv("WORKBOT_EXTERNAL_TOOL_SOURCES_JSON", raising=False)
+    monkeypatch.delenv("WORKBOT_TOOL_SOURCES_REGISTRY_JSON", raising=False)
+
+    created = service.register_external_skill_tool(
+        {
+            "name": "Legal Review",
+            "base_url": "https://skills.example.com",
+            "invoke_path": "/legal-review",
+        }
+    )
+
+    updated = service.update_external_skill_tool(
+        created["tool_id"],
+        {
+            "name": "Legal Review Pro",
+            "description": "升级后的法务审查",
+            "base_url": "https://skills-v2.example.com",
+            "invoke_path": "/legal-review/v2",
+            "health_path": "/ready",
+            "version": "2.0.0",
+            "capabilities": ["legal_review", "risk_scan"],
+            "tags": ["legal", "premium"],
+            "enabled": False,
+        },
+    )
+
+    updated_tool = next(item for item in service.list_tools(refresh=False) if item["id"] == created["tool_id"])
+    assert updated["tool_id"] == created["tool_id"]
+    assert updated_tool["name"] == "Legal Review Pro"
+    assert updated_tool["enabled"] is False
+    assert updated_tool["config_summary"]["base_url"] == "https://skills-v2.example.com"
+    assert updated_tool["config_summary"]["registration_kind"] == "control_plane_skill"
+
+    deleted = service.delete_external_registry_tool(created["tool_id"])
+    tool_ids = {item["id"] for item in service.list_tools(refresh=False)}
+    source_ids = {item["id"] for item in service.list_sources(refresh=False)["items"]}
+
+    assert deleted["tool_id"] == created["tool_id"]
+    assert created["tool_id"] not in tool_ids
+    assert CONTROL_PLANE_SKILL_SOURCE_ID not in source_ids
+
+
+def test_tool_source_update_and_delete_routes(auth_headers, monkeypatch, tmp_path: Path) -> None:
+    service = _build_source_service(tmp_path)
+    registry_file = tmp_path / "external-tool-sources.json"
+    monkeypatch.setattr(tool_sources_route, "tool_source_service", service)
+    monkeypatch.setenv("WORKBOT_TOOL_SOURCES_MODE", "external_only")
+    monkeypatch.setenv("WORKBOT_EXTERNAL_TOOL_SOURCES_FILE", str(registry_file))
+    monkeypatch.delenv("WORKBOT_EXTERNAL_TOOL_SOURCES_JSON", raising=False)
+    monkeypatch.delenv("WORKBOT_TOOL_SOURCES_REGISTRY_JSON", raising=False)
+
+    created = client.post(
+        "/api/tool-sources/register-mcp",
+        headers=auth_headers,
+        json={
+            "name": "contract_lookup",
+            "baseUrl": "https://mcp.example.com",
+            "invokePath": "/tools/contract-lookup",
+        },
+    )
+    assert created.status_code == 200
+    tool_id = created.json()["toolId"]
+
+    updated = client.put(
+        f"/api/tool-sources/tools/{tool_id}/mcp",
+        headers=auth_headers,
+        json={
+            "name": "contract_lookup_v2",
+            "description": "合同查询升级版",
+            "baseUrl": "https://mcp-v2.example.com",
+            "invokePath": "/tools/contract-lookup-v2",
+            "requiresPermission": True,
+            "approvalRequired": True,
+            "enabled": False,
+        },
+    )
+    assert updated.status_code == 200
+    assert updated.json()["toolId"] == tool_id
+
+    deleted = client.delete(f"/api/tool-sources/tools/{tool_id}", headers=auth_headers)
+    assert deleted.status_code == 200
+    assert deleted.json()["toolId"] == tool_id
+
+    tools_payload = client.get("/api/tools?refresh=true", headers=auth_headers)
+    tool_ids = {item["id"] for item in tools_payload.json()["items"]}
+    assert tool_id not in tool_ids

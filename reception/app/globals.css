@@ -149,3 +149,13 @@
     @apply bg-background text-foreground;
   }
 }
+
+.react-flow__node-output {
+  background: transparent !important;
+  border: 0 !important;
+  box-shadow: none !important;
+  padding: 0 !important;
+  width: auto !important;
+  min-width: 0 !important;
+  border-radius: 0 !important;
+}
