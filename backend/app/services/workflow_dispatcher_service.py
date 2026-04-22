@@ -64,6 +64,27 @@ def _dispatch_context_state(run: dict | None) -> str:
     ).strip().lower()
 
 
+def _is_graph_execution_run(run: dict | None) -> bool:
+    if not isinstance(run, dict):
+        return False
+    dispatch_context = dispatch_context_from_run(run)
+    if not isinstance(dispatch_context, dict):
+        return False
+    execution_engine = alias_text(dispatch_context, "execution_engine", "executionEngine")
+    return str(execution_engine or "").strip().lower() == "graph_v2"
+
+
+def _event_bus_connected(event_bus: object) -> bool:
+    checker = getattr(event_bus, "is_connected", None)
+    if callable(checker):
+        try:
+            return bool(checker())
+        except Exception:
+            return False
+    # Test doubles may not implement connectivity reporting; treat as available.
+    return True
+
+
 class WorkflowDispatcherService:
     def __init__(
         self,
@@ -83,10 +104,11 @@ class WorkflowDispatcherService:
             queue_group=WORKFLOW_DISPATCH_QUEUE,
         )
 
+    def _should_bypass_event_bus(self) -> bool:
+        return self._event_bus is nats_event_bus and not getattr(self._persistence, "enabled", False)
+
     def dispatch_tick(self, run_id: str, *, step_delay: float) -> bool:
-        if not getattr(self._persistence, "enabled", False):
-            return False
-        if not bool(getattr(self._event_bus, "is_connected", lambda: False)()):
+        if self._should_bypass_event_bus() or not _event_bus_connected(self._event_bus):
             return False
         return self._event_bus.publish_json(
             WORKFLOW_DISPATCH_SUBJECT,
@@ -152,9 +174,7 @@ class WorkflowDispatcherService:
         apply_protocol_to_run(run, protocol)
         self._persist_run(run)
         self._enqueue_execution_job(run_id, step_delay=step_delay, queued_at=queued_at, protocol=protocol)
-        if not getattr(self._persistence, "enabled", False):
-            return False
-        if not bool(getattr(self._event_bus, "is_connected", lambda: False)()):
+        if self._should_bypass_event_bus() or not _event_bus_connected(self._event_bus):
             return False
         return self._event_bus.publish_json(WORKFLOW_EXECUTION_SUBJECT, envelope)
 
@@ -182,7 +202,10 @@ class WorkflowDispatcherService:
                 run = self._clear_dispatch_failure(run) or run
             if run is None:
                 return None
-            if _dispatch_context_state(run) in {"agent_queued", "executing"}:
+            dispatch_state = _dispatch_context_state(run)
+            if dispatch_state == "agent_queued" or (
+                dispatch_state == "executing" and not _is_graph_execution_run(run)
+            ):
                 self.release_run_claim(run_id)
                 return self._find_run(run_id)
             if run.get("status") in TERMINAL_RUN_STATUSES:

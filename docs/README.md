@@ -20,6 +20,7 @@
 
 - `docs/brain/BRAIN_COMPAT_BOUNDARY.md`
 - `docs/brain/BRAIN_CORE_STATUS.md`
+- `docs/brain/BRAIN_OPTIMIZED_WORKFLOW_DESIGN.md`
 - `docs/brain/BRAIN_DUAL_REPO_STARTUP.md`
 - `docs/brain/BRAIN_DR_RUNBOOK.md`
 - `docs/brain/BRAIN_PRELAUNCH_TODO.md`
@@ -37,6 +38,7 @@
 - [`CURRENT_EXECUTION_TASKLIST.md`](/Users/xiaoyuge/Documents/XXL/docs/CURRENT_EXECUTION_TASKLIST.md)
 - [`BRAIN_PRELAUNCH_TODO.md`](/Users/xiaoyuge/Documents/XXL/docs/brain/BRAIN_PRELAUNCH_TODO.md)
 - [`BRAIN_DUAL_REPO_STARTUP.md`](/Users/xiaoyuge/Documents/XXL/docs/brain/BRAIN_DUAL_REPO_STARTUP.md)
+- [`BRAIN_OPTIMIZED_WORKFLOW_DESIGN.md`](/Users/xiaoyuge/Documents/XXL/docs/brain/BRAIN_OPTIMIZED_WORKFLOW_DESIGN.md)
 - [`NEXT_STAGE_3_TODO.md`](/Users/xiaoyuge/Documents/XXL/docs/stages/NEXT_STAGE_3_TODO.md)
 - [`final_acceptance_report.md`](/Users/xiaoyuge/Documents/XXL/docs/reports/final_acceptance_report.md)
 - `archive/completed-stages/`

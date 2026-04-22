@@ -294,7 +294,7 @@ export default function DashboardPage() {
           href="/reception"
         />
         <MetricCard
-          title="skill/mcp 接入"
+          title="SKILL/MCP"
           value={externalSummary?.routable ?? 0}
           hint={`可调度 ${externalSummary?.routable ?? 0} / ${externalSummary?.totalFamilies ?? externalItems.length}`}
           toneClass={externalProblemCount > 0 ? "bg-warning/10 text-warning-foreground" : "bg-success/10 text-success"}
@@ -338,9 +338,9 @@ export default function DashboardPage() {
         <CardHeader className="pb-3">
           <div className="flex items-center justify-between gap-3">
             <div>
-              <CardTitle className="text-base font-medium">skill/mcp 接入工作状态</CardTitle>
+              <CardTitle className="text-base font-medium">SKILL/MCP 工作状态</CardTitle>
               <div className="mt-1 text-sm text-muted-foreground">
-                先看外接能力是否可调度，再看谁降级、谁离线、谁熔断
+                先看接入能力是否可调度，再看谁降级、谁离线、谁熔断
               </div>
             </div>
             <Button asChild variant="ghost" size="sm">

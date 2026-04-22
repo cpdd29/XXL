@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
-from threading import Lock, Timer
+from threading import Condition, Lock, Timer
 
 from app.services.persistence_service import persistence_service
 from app.services.store import store
@@ -20,6 +20,9 @@ class WorkflowSchedulerService:
         self._persistence = persistence or persistence_service
         self._timers: dict[str, Timer] = {}
         self._lock = Lock()
+        self._callback_condition = Condition(self._lock)
+        self._active_callbacks = 0
+        self._generation = 0
 
     def schedule(self, run_id: str, *, delay: float, step_delay: float) -> None:
         from app.services.workflow_dispatcher_service import workflow_dispatcher_service
@@ -53,7 +56,10 @@ class WorkflowSchedulerService:
         # In single-process fallback mode this timer guarantees progress if the
         # poller thread is not available; in normal multi-instance mode the
         # timer exits harmlessly when another claimant has already consumed the job.
-        timer = Timer(delay, self._advance_run, args=(run_id, step_delay))
+        with self._lock:
+            generation = self._generation
+
+        timer = Timer(delay, self._advance_run, args=(run_id, step_delay, generation))
         timer.daemon = True
 
         with self._lock:
@@ -113,11 +119,19 @@ class WorkflowSchedulerService:
 
     def reset(self) -> None:
         with self._lock:
+            self._generation += 1
             timer_items = list(self._timers.items())
             self._timers.clear()
 
         for _, timer in timer_items:
             timer.cancel()
+
+        with self._lock:
+            if self._active_callbacks > 0:
+                self._callback_condition.wait_for(
+                    lambda: self._active_callbacks == 0,
+                    timeout=3.0,
+                )
 
         from app.services.workflow_dispatcher_service import workflow_dispatcher_service
 
@@ -137,29 +151,51 @@ class WorkflowSchedulerService:
         for run_id, _ in timer_items:
             workflow_dispatcher_service.release_run_claim(run_id)
 
-    def _advance_run(self, run_id: str, step_delay: float) -> None:
+    def _advance_run(self, run_id: str, step_delay: float, generation: int) -> None:
         with self._lock:
             self._timers.pop(run_id, None)
+            if generation != self._generation:
+                return
+            self._active_callbacks += 1
 
-        from app.services.workflow_dispatcher_service import workflow_dispatcher_service
+        try:
+            from app.services.workflow_dispatcher_service import workflow_dispatcher_service
 
-        if not self._claim_due_dispatch_job(run_id):
-            return
+            if not self._generation_matches(generation):
+                return
 
-        claimed_run = workflow_dispatcher_service.try_acquire_schedule_slot(run_id)
-        if claimed_run is None:
-            return
+            if not self._claim_due_dispatch_job(run_id):
+                return
 
-        if str(claimed_run.get("status") or "") in TERMINAL_RUN_STATUSES:
-            self.cancel(run_id)
-            return
+            if not self._generation_matches(generation):
+                return
 
-        event_bus = getattr(workflow_dispatcher_service, "_event_bus", None)
-        event_bus_connected = bool(getattr(event_bus, "is_connected", lambda: False)())
-        if event_bus_connected and workflow_dispatcher_service.dispatch_tick(run_id, step_delay=step_delay):
-            return
+            claimed_run = workflow_dispatcher_service.try_acquire_schedule_slot(run_id)
+            if claimed_run is None:
+                return
 
-        workflow_dispatcher_service.process_tick(run_id, step_delay=step_delay)
+            if str(claimed_run.get("status") or "") in TERMINAL_RUN_STATUSES:
+                self.cancel(run_id)
+                return
+
+            if not self._generation_matches(generation):
+                workflow_dispatcher_service.release_run_claim(run_id)
+                return
+
+            event_bus = getattr(workflow_dispatcher_service, "_event_bus", None)
+            event_bus_connected = bool(getattr(event_bus, "is_connected", lambda: False)())
+            if event_bus_connected and workflow_dispatcher_service.dispatch_tick(run_id, step_delay=step_delay):
+                return
+
+            workflow_dispatcher_service.process_tick(run_id, step_delay=step_delay)
+        finally:
+            with self._lock:
+                self._active_callbacks = max(self._active_callbacks - 1, 0)
+                self._callback_condition.notify_all()
+
+    def _generation_matches(self, generation: int) -> bool:
+        with self._lock:
+            return generation == self._generation
 
     def _cancel_timer(self, run_id: str) -> None:
         with self._lock:

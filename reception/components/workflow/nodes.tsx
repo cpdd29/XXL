@@ -32,11 +32,19 @@ type WorkflowCanvasNodeData = {
   toolName?: string | null
   workflowId?: string | null
   workflowName?: string | null
+  workflowNodeKind?: "workflow" | "sub_workflow" | "trigger_workflow"
   message?: string | null
   latestError?: string | null
   errorCount?: number
   status?: "idle" | "running" | "waiting" | "completed" | "error"
   tokens?: number
+  relationSummary?: string | null
+  relatedRunId?: string | null
+  relatedRunStatus?: "idle" | "pending" | "running" | "waiting" | "completed" | "error" | null
+  relatedRunAnchor?: string | null
+  parentRunId?: string | null
+  parentWorkflowId?: string | null
+  parentNodeId?: string | null
 }
 
 function getConfigText(config: Record<string, unknown> | null | undefined, ...keys: string[]) {
@@ -66,6 +74,21 @@ function runtimeHint(nodeData: WorkflowCanvasNodeData) {
   return ""
 }
 
+function workflowNodeKindLabel(kind?: WorkflowCanvasNodeData["workflowNodeKind"]) {
+  if (kind === "trigger_workflow") return "触发链路"
+  if (kind === "sub_workflow") return "父子链路"
+  return "工作流链路"
+}
+
+function relatedRunStatusLabel(status?: WorkflowCanvasNodeData["relatedRunStatus"]) {
+  if (status === "pending") return "待启动"
+  if (status === "running") return "运行中"
+  if (status === "waiting") return "等待中"
+  if (status === "completed") return "已完成"
+  if (status === "error") return "异常"
+  return null
+}
+
 function DetailLine({
   text,
   tone = "muted",
@@ -87,10 +110,40 @@ function DetailLine({
   )
 }
 
+function RelationJump({
+  href,
+  label,
+}: {
+  href?: string | null
+  label: string
+}) {
+  if (!href) return null
+  return (
+    <a
+      href={href}
+      className="mt-1 inline-flex text-[11px] text-primary underline-offset-4 hover:underline"
+      onClick={(event) => event.stopPropagation()}
+    >
+      {label}
+    </a>
+  )
+}
+
 // Trigger Node
 export const TriggerNode = memo(function TriggerNode({ data, selected }: NodeProps) {
   const nodeData = data as WorkflowCanvasNodeData
   const status = nodeData.status
+  const relationJumpTarget = nodeData.parentRunId ? `#workflow-run-${nodeData.parentRunId}` : null
+  const parentSummary =
+    nodeData.parentRunId || nodeData.parentWorkflowId
+      ? [
+          "父流程触发",
+          nodeData.parentWorkflowId ? `流程 ${nodeData.parentWorkflowId}` : null,
+          nodeData.parentRunId ? `run ${nodeData.parentRunId}` : null,
+        ]
+          .filter(Boolean)
+          .join(" · ")
+      : null
 
   return (
     <div
@@ -121,6 +174,8 @@ export const TriggerNode = memo(function TriggerNode({ data, selected }: NodePro
               {nodeData.triggerSummary}
             </div>
           ) : null}
+          <DetailLine text={parentSummary} />
+          <RelationJump href={relationJumpTarget} label="定位父流程 run" />
         </div>
       </div>
       <Handle
@@ -557,12 +612,20 @@ export const ToolNode = memo(function ToolNode({ data, selected }: NodeProps) {
 export const WorkflowCallNode = memo(function WorkflowCallNode({ data, selected }: NodeProps) {
   const nodeData = data as WorkflowCanvasNodeData
   const status = nodeData.status
+  const kindLabel = workflowNodeKindLabel(nodeData.workflowNodeKind)
+  const relatedStatusLabel = relatedRunStatusLabel(nodeData.relatedRunStatus)
   const handoffHint = truncateLine(getConfigText(nodeData.config, "handoffNote", "handoff_note"), 52)
   const detailText =
     runtimeHint(nodeData) ||
     handoffHint ||
     truncateLine(nodeData.description, 52) ||
-    (nodeData.workflowName ? "点击节点补充父子流程交接说明" : "点击节点绑定子工作流")
+    (nodeData.workflowNodeKind === "trigger_workflow"
+      ? "点击节点补充触发条件、触发参数与回流说明"
+      : nodeData.workflowName
+        ? "点击节点补充父子流程交接说明"
+        : "点击节点绑定子工作流")
+  const relationJumpLabel =
+    nodeData.workflowNodeKind === "trigger_workflow" ? "定位触发 run" : "定位子流程 run"
 
   return (
     <div
@@ -591,9 +654,26 @@ export const WorkflowCallNode = memo(function WorkflowCallNode({ data, selected 
           <WorkflowIcon className="size-5" />
         </div>
         <div>
-          <div className="text-sm font-medium text-foreground">{nodeData.label || "子工作流节点"}</div>
+          <div className="flex items-center gap-2">
+            <div className="text-sm font-medium text-foreground">
+              {nodeData.label || (nodeData.workflowNodeKind === "trigger_workflow" ? "触发工作流节点" : "子工作流节点")}
+            </div>
+            <span className="rounded-full bg-primary/10 px-2 py-0.5 text-[10px] font-medium text-primary">
+              {kindLabel}
+            </span>
+          </div>
           <div className="text-xs text-muted-foreground">
-            {status === "running" ? "子工作流执行中" : status === "completed" ? "子工作流已完成" : "调用另一个工作流"}
+            {nodeData.workflowNodeKind === "trigger_workflow"
+              ? status === "running"
+                ? "触发工作流执行中"
+                : status === "completed"
+                  ? "触发工作流已完成"
+                  : "触发另一个工作流"
+              : status === "running"
+                ? "子工作流执行中"
+                : status === "completed"
+                  ? "子工作流已完成"
+                  : "调用另一个工作流"}
           </div>
           <div
             className={cn(
@@ -605,10 +685,23 @@ export const WorkflowCallNode = memo(function WorkflowCallNode({ data, selected 
               ? `${nodeData.workflowName}${nodeData.workflowId ? ` · ${nodeData.workflowId}` : ""}`
               : "未绑定子工作流"}
           </div>
+          {nodeData.relationSummary ? (
+            <div className="mt-1 flex max-w-[220px] items-center gap-2 text-[11px] text-muted-foreground">
+              <span className="truncate" title={nodeData.relationSummary}>
+                {nodeData.relationSummary}
+              </span>
+              {relatedStatusLabel ? (
+                <span className="shrink-0 rounded-full bg-secondary px-1.5 py-0.5 text-[10px] text-foreground">
+                  {relatedStatusLabel}
+                </span>
+              ) : null}
+            </div>
+          ) : null}
           <DetailLine
             text={detailText}
             tone={nodeData.status === "error" || !nodeData.workflowName ? "danger" : "muted"}
           />
+          <RelationJump href={nodeData.relatedRunAnchor} label={relationJumpLabel} />
         </div>
       </div>
       <Handle

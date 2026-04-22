@@ -34,6 +34,11 @@ class _MCPRuntimeStub:
                 "name": "pdf_summary",
                 "source": "agent-reach-external",
             },
+            "agent-reach-external:pdf_to_docx": {
+                "id": "agent-reach-external:pdf_to_docx",
+                "name": "pdf_to_docx",
+                "source": "agent-reach-external",
+            },
             "agent-reach-external:weather": {
                 "id": "agent-reach-external:weather",
                 "name": "weather_lookup",
@@ -145,6 +150,7 @@ def test_free_workflow_registers_builtin_skills() -> None:
     service = _build_service()
     names = {item["name"] for item in service.list_skills()}
     assert names == {
+        "search_light_execution_skill",
         "task_status_skill",
         "task_list_skill",
     }
@@ -155,6 +161,7 @@ def test_free_workflow_external_only_registers_only_readonly_builtin_skills(monk
     service = _build_service()
     names = {item["name"] for item in service.list_skills()}
     assert names == {
+        "search_light_execution_skill",
         "task_status_skill",
         "task_list_skill",
     }
@@ -172,6 +179,126 @@ def test_task_status_and_task_list_skills() -> None:
     assert list_result["ok"] is True
     assert len(list_result["result"]["items"]) == 3
     assert list_result["result"]["total"] >= 3
+
+
+def test_project_light_ops_builds_task_board_for_agent_context() -> None:
+    service = _build_service()
+
+    result = service.run(
+        text="帮我看下任务看板",
+        required_capabilities=["task_listing"],
+        payload={
+            "task_id": "task-board-1",
+            "request_text": "帮我看下任务看板",
+            "route_decision": {
+                "workflow_mode": "free_workflow",
+                "required_capabilities": ["task_listing"],
+            },
+        },
+    )
+
+    assert result["ok"] is True
+    assert result["selected_skill"] == "search_light_execution_skill"
+    assert result["result"]["operation"] == "task_board"
+    assert result["result"]["task_board"]["total"] >= len(result["result"]["task_board"]["items"])
+
+
+def test_project_light_ops_delegates_weather_for_agent_context() -> None:
+    registry = SkillRegistryService()
+    runtime = SkillRuntimeService(registry=registry)
+    service = FreeWorkflowService(registry=registry, runtime=runtime, mcp_runtime=_MCPRuntimeStub())
+
+    result = service.run(
+        text="今天广州天气怎么样？",
+        required_capabilities=["weather_lookup"],
+        payload={
+            "task_id": "task-weather-1",
+            "request_text": "今天广州天气怎么样？",
+            "route_decision": {
+                "workflow_mode": "free_workflow",
+                "required_capabilities": ["weather_lookup"],
+            },
+        },
+    )
+
+    assert result["ok"] is True
+    assert result["selected_skill"] == "search_light_execution_skill"
+    assert result["result"]["operation"] == "weather_lookup"
+    assert result["result"]["delegate_skill"] == "weather_skill"
+    assert result["result"]["delegate_execution"]["selected_path"] == "runtime"
+
+
+def test_project_light_ops_recognizes_simple_text_file(tmp_path) -> None:  # noqa: ANN001
+    file_path = tmp_path / "notes.txt"
+    file_path.write_text("alpha\nbeta\ngamma\n", encoding="utf-8")
+    service = _build_service()
+
+    result = service.run(
+        text="帮我识别一下这个文件",
+        payload={
+            "task_id": "task-file-1",
+            "request_text": "帮我识别一下这个文件",
+            "route_decision": {"workflow_mode": "free_workflow"},
+            "file_path": str(file_path),
+        },
+    )
+
+    assert result["ok"] is True
+    assert result["selected_skill"] == "search_light_execution_skill"
+    assert result["result"]["operation"] == "file_processing"
+    assert result["result"]["file_analysis"]["category"] == "text"
+    assert "notes.txt" in result["result_summary"]
+
+
+def test_search_light_execution_delegates_pdf_to_docx_for_agent_context() -> None:
+    registry = SkillRegistryService()
+    runtime = SkillRuntimeService(registry=registry)
+    service = FreeWorkflowService(registry=registry, runtime=runtime, mcp_runtime=_MCPRuntimeStub())
+
+    result = service.run(
+        text="把这个 pdf 转换成 word 文档",
+        required_capabilities=["pdf_processing", "document_conversion"],
+        payload={
+            "task_id": "task-file-convert-1",
+            "request_text": "把这个 pdf 转换成 word 文档",
+            "route_decision": {
+                "workflow_mode": "free_workflow",
+                "required_capabilities": ["pdf_processing", "document_conversion"],
+            },
+            "file_path": "/tmp/demo.pdf",
+        },
+    )
+
+    assert result["ok"] is True
+    assert result["selected_skill"] == "search_light_execution_skill"
+    assert result["result"]["operation"] == "file_processing"
+    assert result["result"]["delegate_skill"] == "pdf_to_docx_skill"
+    assert result["result"]["delegate_execution"]["selected_path"] == "runtime"
+
+
+def test_project_light_ops_returns_upgrade_required_for_schedule_intent() -> None:
+    service = _build_service()
+
+    result = service.run(
+        text="请每周一下午3点提醒我汇总任务看板",
+        payload={
+            "task_id": "task-schedule-1",
+            "request_text": "请每周一下午3点提醒我汇总任务看板",
+            "route_decision": {
+                "workflow_mode": "free_workflow",
+                "schedule_plan": {
+                    "cron": "0 15 * * 1",
+                    "summary": "每周一 15:00",
+                },
+            },
+        },
+    )
+
+    assert result["ok"] is False
+    assert result["selected_skill"] == "search_light_execution_skill"
+    assert result["error"]["code"] == "upgrade_required"
+    assert result["result"]["operation"] == "schedule_intent"
+    assert result["result"]["schedule_intent"]["detected"] is True
 
 
 def test_weather_and_web_search_route_through_runtime_when_runtime_is_available() -> None:

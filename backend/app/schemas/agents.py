@@ -22,6 +22,14 @@ class AgentBoundSkill(APIModel):
     capabilities: list[str] = Field(default_factory=list)
 
 
+class AgentBoundTool(APIModel):
+    id: str
+    name: str
+    type: str
+    description: str | None = None
+    source: str | None = None
+
+
 class Agent(APIModel):
     id: str
     name: str
@@ -49,6 +57,14 @@ class Agent(APIModel):
     model_binding: AgentModelBinding | None = None
     bound_skill_ids: list[str] = Field(default_factory=list)
     bound_skills: list[AgentBoundSkill] = Field(default_factory=list)
+    bound_tool_ids: list[str] = Field(default_factory=list)
+    bound_tools: list[AgentBoundTool] = Field(default_factory=list)
+    agent_workflow_id: str | None = None
+    input_contract: dict[str, Any] = Field(default_factory=dict)
+    output_contract: dict[str, Any] = Field(default_factory=dict)
+    contract_version: str | None = None
+    deletable: bool = True
+    delete_blocked_reason: str | None = None
 
 
 class AgentListResponse(APIModel):
@@ -72,6 +88,16 @@ class AgentActionResponse(APIModel):
     agent: Agent
 
 
+class AgentEnabledRequest(APIModel):
+    enabled: bool
+
+
+class AgentDeleteResponse(APIModel):
+    ok: bool
+    message: str
+    agent_id: str
+
+
 class AgentConfigRequest(APIModel):
     name: str
     description: str = ""
@@ -80,6 +106,31 @@ class AgentConfigRequest(APIModel):
     provider_key: str | None = None
     model: str | None = None
     skill_ids: list[str] = Field(default_factory=list)
+    tool_ids: list[str] = Field(default_factory=list)
+    agent_workflow_id: str | None = None
+    input_contract: dict[str, Any] | None = None
+    output_contract: dict[str, Any] | None = None
+    contract_version: str | None = None
+
+    def model_dump(self, *args, **kwargs) -> dict[str, Any]:
+        dumped = super().model_dump(*args, **kwargs)
+        if not kwargs.get("exclude_none"):
+            return dumped
+
+        by_alias = bool(kwargs.get("by_alias"))
+        for field_name in (
+            "agent_workflow_id",
+            "input_contract",
+            "output_contract",
+            "contract_version",
+        ):
+            if field_name not in self.model_fields_set:
+                continue
+            if getattr(self, field_name) is not None:
+                continue
+            field_info = self.__class__.model_fields[field_name]
+            dumped[field_info.alias if by_alias and field_info.alias else field_name] = None
+        return dumped
 
 
 class BrainSkillItem(APIModel):

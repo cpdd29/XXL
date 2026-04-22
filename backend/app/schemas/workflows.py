@@ -187,6 +187,8 @@ class WorkflowRunNode(APIModel):
     tokens: int = 0
     started_at: str | None = None
     finished_at: str | None = None
+    attempt: int = 0
+    execution_instance_key: str | None = None
     latest_error: str | None = None
     latest_error_at: str | None = None
     error_count: int = 0
@@ -324,6 +326,32 @@ class WorkflowRunFallbackHistoryItem(APIModel):
     resolved_action: str
 
 
+class WorkflowRunRelationItem(APIModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+        alias_generator=to_camel,
+        from_attributes=True,
+        extra="allow",
+    )
+
+    id: str
+    relation_type: str
+    source_node_id: str | None = None
+    source_node_label: str | None = None
+    source_attempt: int | None = None
+    execution_instance_key: str | None = None
+    target_workflow_id: str
+    target_workflow_name: str | None = None
+    target_run_id: str | None = None
+    target_task_id: str | None = None
+    target_status: str | None = None
+    trigger: str | None = None
+    handoff_note: str | None = None
+    payload_preview: str | None = None
+    created_at: str
+    updated_at: str | None = None
+
+
 class WorkflowRunDispatchContext(APIModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -354,8 +382,18 @@ class WorkflowRunDispatchContext(APIModel):
     manager_packet: ManagerPacket | None = None
     brain_dispatch_summary: BrainDispatchSummary | None = None
     brain_fact_snapshot: dict[str, object] | None = None
+    internal_event_payload: dict[str, object] | None = None
+    workflow_return: dict[str, object] | None = None
     execution_plan_snapshot: WorkflowRunExecutionPlanSnapshot | None = None
     fallback_history: list[WorkflowRunFallbackHistoryItem] = Field(default_factory=list)
+    parent_workflow_id: str | None = None
+    parent_workflow_name: str | None = None
+    parent_run_id: str | None = None
+    parent_node_id: str | None = None
+    parent_node_label: str | None = None
+    workflow_relation_type: str | None = None
+    workflow_relations: list[WorkflowRunRelationItem] = Field(default_factory=list)
+    trigger_payload: dict[str, object] | None = None
     dispatched_at: str | None = None
     execution_agent_id: str | None = None
     execution_agent: str | None = None
@@ -426,6 +464,10 @@ class WorkflowRun(APIModel):
     started_at: str
     completed_at: str | None = None
     current_stage: str
+    runtime_stage: str | None = None
+    final_stage: str | None = None
+    last_completed_node: str | None = None
+    last_completed_node_id: str | None = None
     active_edges: list[str] = Field(default_factory=list)
     nodes: list[WorkflowRunNode] = Field(default_factory=list)
     logs: list[WorkflowRunLog] = Field(default_factory=list)

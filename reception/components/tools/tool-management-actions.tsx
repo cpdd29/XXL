@@ -299,7 +299,7 @@ export function ToolManagementActions({
         <DialogContent className="sm:max-w-2xl">
           <DialogHeader>
             <DialogTitle>{managedType === "skill" ? "编辑 Skill" : "编辑 MCP"}</DialogTitle>
-            <DialogDescription>更新外部触手的接入信息与启用状态。</DialogDescription>
+            <DialogDescription>更新当前能力的接入信息与启用状态。</DialogDescription>
           </DialogHeader>
 
           {managedType === "skill" ? (

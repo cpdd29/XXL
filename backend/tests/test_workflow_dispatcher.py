@@ -335,6 +335,52 @@ def test_workflow_dispatcher_service_process_tick_stops_redispatch_when_agent_qu
     assert released == ["run-agent-queued"]
 
 
+def test_workflow_dispatcher_service_process_tick_keeps_graph_execution_progressing(
+    monkeypatch,
+) -> None:
+    event_bus = FakeEventBus()
+    persistence = FakePersistence()
+    service = WorkflowDispatcherService(
+        event_bus=event_bus,
+        persistence=persistence,
+        dispatcher_id="dispatcher-a",
+    )
+    scheduled: list[tuple[str, float, float]] = []
+    released: list[str] = []
+    dispatch_calls: list[tuple[str, float]] = []
+    store.workflow_runs.insert(0, _workflow_run("run-graph-executing"))
+
+    monkeypatch.setattr(
+        workflow_execution_service,
+        "dispatch_workflow_run",
+        lambda run_id: {
+            "id": run_id,
+            "status": "running",
+            "dispatch_context": {"state": "executing", "execution_engine": "graph_v2"},
+        },
+    )
+    monkeypatch.setattr(
+        service,
+        "dispatch_execution",
+        lambda run_id, *, step_delay, published_at: (
+            dispatch_calls.append((run_id, step_delay)) or True
+        ),
+    )
+    monkeypatch.setattr(
+        workflow_scheduler_service,
+        "schedule",
+        lambda run_id, *, delay, step_delay: scheduled.append((run_id, delay, step_delay)),
+    )
+    monkeypatch.setattr(service, "release_run_claim", lambda run_id: released.append(run_id) or {})
+
+    run = service.process_tick("run-graph-executing", step_delay=0.4)
+
+    assert run["id"] == "run-graph-executing"
+    assert dispatch_calls == [("run-graph-executing", 0.4)]
+    assert scheduled == [("run-graph-executing", 0.4, 0.4)]
+    assert released == []
+
+
 def test_workflow_dispatcher_service_schedule_slot_respects_active_foreign_claim() -> None:
     event_bus = FakeEventBus()
     persistence = FakePersistence()

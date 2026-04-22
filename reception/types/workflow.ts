@@ -7,11 +7,89 @@ export type WorkflowNodeType =
   | 'parallel'
   | 'merge'
   | 'workflow'
+  | 'sub_workflow'
+  | 'trigger_workflow'
   | 'tool'
   | 'transform'
   | 'output'
   | 'aggregate'
-export type WorkflowTriggerType = 'message' | 'schedule' | 'webhook' | 'internal' | 'manual'
+
+export const WORKFLOW_TRIGGER_TYPES = [
+  'message',
+  'schedule',
+  'webhook',
+  'internal',
+  'manual',
+] as const
+
+export type WorkflowTriggerType = (typeof WORKFLOW_TRIGGER_TYPES)[number]
+
+export type WorkflowTriggerTypeOption = {
+  value: WorkflowTriggerType
+  label: string
+}
+
+export const WORKFLOW_TRIGGER_TYPE_LABELS: Record<WorkflowTriggerType, string> = {
+  message: '消息触发',
+  schedule: '定时触发',
+  webhook: 'Webhook 触发',
+  internal: '工作流触发',
+  manual: '手动触发',
+}
+
+export const WORKFLOW_TRIGGER_TYPE_OPTIONS: WorkflowTriggerTypeOption[] = WORKFLOW_TRIGGER_TYPES.map(
+  (value) => ({
+    value,
+    label: WORKFLOW_TRIGGER_TYPE_LABELS[value],
+  }),
+)
+
+export const WORKFLOW_STATUSES = ['draft', 'active', 'running', 'paused'] as const
+
+export type WorkflowKnownStatus = (typeof WORKFLOW_STATUSES)[number]
+export type WorkflowStatus = WorkflowKnownStatus | (string & {})
+
+export type WorkflowStatusOption = {
+  value: WorkflowKnownStatus
+  label: string
+}
+
+export const WORKFLOW_STATUS_LABELS: Record<WorkflowKnownStatus, string> = {
+  draft: '草稿',
+  active: '启用中',
+  running: '运行中',
+  paused: '已暂停',
+}
+
+export const WORKFLOW_STATUS_OPTIONS: WorkflowStatusOption[] = WORKFLOW_STATUSES.map((value) => ({
+  value,
+  label: WORKFLOW_STATUS_LABELS[value],
+}))
+
+export const WORKFLOW_PAGE_CATEGORIES = ['basic', 'professional', 'free', 'agent'] as const
+
+export type WorkflowPageCategory = (typeof WORKFLOW_PAGE_CATEGORIES)[number]
+
+export type WorkflowPageCategoryOption = {
+  value: WorkflowPageCategory
+  label: string
+}
+
+export const WORKFLOW_PAGE_DEFAULT_CATEGORY: WorkflowPageCategory = 'basic'
+
+export const WORKFLOW_PAGE_CATEGORY_LABELS: Record<WorkflowPageCategory, string> = {
+  basic: '基础工作流',
+  professional: '专业工作流',
+  free: '自由工作流',
+  agent: 'agent工作流',
+}
+
+export const WORKFLOW_PAGE_CATEGORY_OPTIONS: WorkflowPageCategoryOption[] = WORKFLOW_PAGE_CATEGORIES.map(
+  (value) => ({
+    value,
+    label: WORKFLOW_PAGE_CATEGORY_LABELS[value],
+  }),
+)
 
 export interface WorkflowTrigger {
   type: WorkflowTriggerType
@@ -56,7 +134,7 @@ export interface Workflow {
   name: string
   description: string
   version: string
-  status: string
+  status: WorkflowStatus
   updatedAt: string
   nodeCount: number
   edgeCount: number
@@ -148,6 +226,8 @@ export interface WorkflowRunNode {
   tokens: number
   startedAt?: string | null
   finishedAt?: string | null
+  attempt?: number
+  executionInstanceKey?: string | null
   latestError?: string | null
   latestErrorAt?: string | null
   errorCount: number
@@ -171,6 +251,25 @@ export interface WorkflowRunLog {
   type: 'info' | 'success' | 'warning' | 'error'
   agent: string
   message: string
+}
+
+export interface WorkflowRunRelationItem {
+  id: string
+  relationType: string
+  sourceNodeId?: string | null
+  sourceNodeLabel?: string | null
+  sourceAttempt?: number | null
+  executionInstanceKey?: string | null
+  targetWorkflowId: string
+  targetWorkflowName?: string | null
+  targetRunId?: string | null
+  targetTaskId?: string | null
+  targetStatus?: string | null
+  trigger?: string | null
+  handoffNote?: string | null
+  payloadPreview?: string | null
+  createdAt: string
+  updatedAt?: string | null
 }
 
 export interface WorkflowRunMonitor {
@@ -213,12 +312,22 @@ export interface WorkflowRunDispatchContext {
   managerPacket?: import('@/types/task').ManagerPacket | null
   brainDispatchSummary?: import('@/types/task').BrainDispatchSummary | null
   brainFactSnapshot?: Record<string, unknown> | null
+  internalEventPayload?: Record<string, unknown> | null
+  workflowReturn?: Record<string, unknown> | null
   executionPlanSnapshot?: Record<string, unknown> | null
   fallbackHistory?: Array<Record<string, unknown>>
   fallbackRecoveryState?: string | null
   fallbackRecoveryReason?: string | null
   fallbackRecoveryAction?: string | null
   fallbackRecoveryAt?: string | null
+  parentWorkflowId?: string | null
+  parentWorkflowName?: string | null
+  parentRunId?: string | null
+  parentNodeId?: string | null
+  parentNodeLabel?: string | null
+  workflowRelationType?: string | null
+  workflowRelations?: WorkflowRunRelationItem[]
+  triggerPayload?: Record<string, unknown> | null
   manualHandoffRequiredAt?: string | null
   manualHandoffSource?: string | null
   manualHandoffOperator?: string | null
@@ -239,6 +348,18 @@ export interface WorkflowRunDispatchContext {
   lastContextPatchAt?: string | null
   lastContextPatchTraceId?: string | null
   lastContextPatchPreview?: string | null
+  workflowCallStack?: string[]
+  internalEventId?: string | null
+  internalEventStatus?: string | null
+  internalEventAttemptCount?: number | null
+  triggeredWorkflowIds?: string[]
+  triggeredRunIds?: string[]
+  triggeredTaskIds?: string[]
+  selectedNodeId?: string | null
+  selectedNodeLabel?: string | null
+  selectedNodeType?: string | null
+  selectedNodeDescription?: string | null
+  selectedNodeConfig?: Record<string, unknown> | null
 }
 
 export interface WorkflowRun {
@@ -255,6 +376,10 @@ export interface WorkflowRun {
   startedAt: string
   completedAt?: string | null
   currentStage: string
+  runtimeStage?: string | null
+  finalStage?: string | null
+  lastCompletedNode?: string | null
+  lastCompletedNodeId?: string | null
   activeEdges: string[]
   nodes: WorkflowRunNode[]
   logs: WorkflowRunLog[]

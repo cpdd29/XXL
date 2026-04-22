@@ -1,6 +1,8 @@
 from collections import deque
 from datetime import UTC, datetime, timedelta
 
+import pytest
+
 from app.brain_core.coordinator.service import brain_coordinator_service
 from app.brain_core.manager.policies import (
     build_clarify_question,
@@ -58,9 +60,15 @@ from app.brain_core.security.state import (
     normalized_persisted_timestamps,
     serialize_penalty,
 )
+from app.services.mandatory_workflow_registry_service import ensure_mandatory_workflows_registered
 from app.brain_core.reception.service import reception_service
 from app.brain_core.routing.service import RoutingService
 from app.schemas.messages import ChannelType, UnifiedMessage
+
+
+@pytest.fixture(autouse=True)
+def _ensure_foundation_workflows() -> None:
+    ensure_mandatory_workflows_registered()
 
 
 def test_routing_service_normalizes_route_decision_with_execution_plan() -> None:
@@ -138,32 +146,128 @@ def test_routing_service_normalize_route_decision_builds_standard_execution_plan
     assert normalized["fallbackPolicy"] == normalized["fallback_policy"]
 
 
-def test_routing_service_route_message_fallback_keeps_summary_fields(monkeypatch) -> None:
+def test_routing_service_route_message_keeps_summary_fields_for_workflow_only_entry(
+    monkeypatch,
+) -> None:
     service = RoutingService()
 
     monkeypatch.setattr(
         "app.services.workflow_execution_service.select_workflow_candidates_for_message",
-        lambda *args, **kwargs: [],
+        lambda *args, **kwargs: [
+            (
+                {
+                    "id": "blocked-1",
+                    "name": "Blocked Workflow 1",
+                    "nodes": [
+                        {"id": "n1", "type": "agent", "label": "搜索 Agent", "agent_id": "search"},
+                    ],
+                    "agent_bindings": ["search"],
+                },
+                "已识别意图: search；命中工作流: Blocked Workflow 1；路由依据: 意图=search",
+            ),
+            (
+                {
+                    "id": "workflow-2",
+                    "name": "Workflow Orchestrator 2",
+                    "nodes": [
+                        {
+                            "id": "n2",
+                            "type": "workflow",
+                            "label": "外接执行层",
+                            "workflow_id": "mandatory-workflow-external-tentacle-dispatch",
+                        },
+                    ],
+                    "agent_bindings": [],
+                },
+                "已识别意图: search；命中工作流: Workflow Orchestrator 2；路由依据: message 默认兜底",
+            ),
+        ],
+    )
+    monkeypatch.setattr(
+        "app.services.workflow_execution_service.resolve_workflow_execution_agent",
+        lambda workflow, intent, route_seed=None: None,
     )
 
-    result = service.route_message(text="请帮我写一封客户回访邮件")
+    result = service.route_message(text="请帮我搜索数据库", channel="telegram")
     route_decision = result["route_decision"]
 
-    assert route_decision["routing_strategy"] == "workflow_or_agent_dispatch_fallback"
-    assert route_decision["routingStrategy"] == "workflow_or_agent_dispatch_fallback"
-    assert route_decision["route_rationale"]["routing_strategy"] == "workflow_or_agent_dispatch_fallback"
-    assert route_decision["routeRationale"]["routing_strategy"] == "workflow_or_agent_dispatch_fallback"
-    assert route_decision["fallback_policy"]["mode"] == "agent_dispatch_fallback"
-    assert route_decision["fallbackPolicy"]["mode"] == "agent_dispatch_fallback"
-    assert route_decision["candidate_workflows"] == []
-    assert route_decision["candidateWorkflows"] == []
-    assert route_decision["skipped_workflows"] == []
-    assert route_decision["skippedWorkflows"] == []
-    assert "工作流不可执行" in route_decision["route_message"]
-    assert "已切换为直达 Agent 执行" in route_decision["routeMessage"]
+    assert route_decision["workflow_id"] == "workflow-2"
+    assert route_decision["workflowId"] == "workflow-2"
+    assert route_decision["routing_strategy"] == "workflow_trigger+execution_agent_support"
+    assert route_decision["routingStrategy"] == "workflow_trigger+execution_agent_support"
+    assert route_decision["route_rationale"]["routing_strategy"] == "workflow_trigger+execution_agent_support"
+    assert route_decision["routeRationale"]["routing_strategy"] == "workflow_trigger+execution_agent_support"
+    assert route_decision["fallback_policy"]["mode"] == "none"
+    assert route_decision["fallbackPolicy"]["mode"] == "none"
+    assert len(route_decision["candidate_workflows"]) == 2
+    assert len(route_decision["candidateWorkflows"]) == 2
+    assert route_decision["skipped_workflows"] == [
+        {
+            "workflow_id": "blocked-1",
+            "workflow_name": "Blocked Workflow 1",
+            "reason": "missing_execution_agent",
+        }
+    ]
+    assert route_decision["skippedWorkflows"] == route_decision["skipped_workflows"]
+    assert route_decision["execution_support"]["support_source"] == "workflow_deferred_execution"
+    assert "Workflow Orchestrator 2" in route_decision["route_message"]
+    assert "已跳过不可执行工作流: Blocked Workflow 1" in route_decision["routeMessage"]
+
+
+def test_routing_service_allows_orchestration_workflow_without_direct_execution_agent(monkeypatch) -> None:
+    service = RoutingService()
+
+    monkeypatch.setattr(
+        "app.services.workflow_execution_service.select_workflow_candidates_for_message",
+        lambda *args, **kwargs: [
+            (
+                {
+                    "id": "mandatory-workflow-brain-foundation",
+                    "name": "基础工作流 · v2.0",
+                    "nodes": [
+                        {"id": "1", "type": "agent", "label": "安全 Agent", "agent_id": "security"},
+                        {"id": "2", "type": "agent", "label": "对话 Agent", "agent_id": "conversation"},
+                        {
+                            "id": "3",
+                            "type": "agent",
+                            "label": "需求分析任务分发 Agent",
+                            "agent_id": "requirement_dispatcher",
+                        },
+                        {
+                            "id": "4",
+                            "type": "workflow",
+                            "label": "外接触手执行层",
+                            "workflow_id": "mandatory-workflow-external-tentacle-dispatch",
+                        },
+                    ],
+                    "agent_bindings": ["security", "conversation", "requirement_dispatcher"],
+                },
+                "已识别意图: search；命中工作流: 基础工作流 · v2.0；路由依据: message 默认兜底",
+            )
+        ],
+    )
+    monkeypatch.setattr(
+        "app.services.workflow_execution_service.resolve_workflow_execution_agent",
+        lambda workflow, intent, route_seed=None: None,
+    )
+    monkeypatch.setattr(
+        "app.services.workflow_execution_service.resolve_agent_dispatch_execution_agent",
+        lambda intent, route_seed=None: None,
+    )
+
+    result = service.route_message(text="请帮我搜索数据库设计文档")
+    route_decision = result["route_decision"]
+
+    assert result["workflow"] is not None
+    assert result["workflow"]["id"] == "mandatory-workflow-brain-foundation"
+    assert route_decision["workflow_id"] == "mandatory-workflow-brain-foundation"
+    assert route_decision["execution_agent_id"] is None
+    assert route_decision["execution_support"]["support_source"] == "workflow_deferred_execution"
+    assert "已进入工作流编排" in route_decision["route_message"]
 
 
 def test_brain_coordinator_builds_dispatch_plan_for_message_payload() -> None:
+    ensure_mandatory_workflows_registered()
     plan = brain_coordinator_service.build_dispatch_plan(
         {
             "text": "请帮我写一个客户回访邮件",
@@ -177,6 +281,11 @@ def test_brain_coordinator_builds_dispatch_plan_for_message_payload() -> None:
 
     assert plan.intent == "write"
     assert plan.reception.text == "请帮我写一个客户回访邮件"
+    assert plan.agent_dispatch is False
+    assert plan.route_decision["workflow_id"] == "mandatory-workflow-brain-foundation"
+    assert plan.route_decision["workflowId"] == "mandatory-workflow-brain-foundation"
+    assert plan.route_decision["routing_strategy"] == "workflow_trigger+execution_agent_support"
+    assert plan.route_decision["fallback_policy"]["mode"] == "none"
     assert plan.route_decision["workflow_mode"] == "free_workflow"
     assert plan.route_decision["executionPlan"]["mode"] == "free_workflow"
     assert plan.route_decision["requiredCapabilities"]
@@ -189,9 +298,10 @@ def test_brain_coordinator_builds_dispatch_plan_for_message_payload() -> None:
     assert plan.manager_packet["delivery_mode"] == "structured_result"
     assert plan.manager_packet["session_state"] == "executing"
     assert plan.manager_packet["state_label"] == "执行中"
-    assert plan.brain_dispatch_summary["dispatch_mode"] in {"agent_dispatch", "workflow_run"}
-    assert plan.brain_dispatch_summary["dispatch_type"] in {"agent_dispatch", "workflow_run"}
-    assert plan.brain_dispatch_summary["dispatch_type_legacy"] in {"direct_agent", "workflow_run"}
+    assert plan.brain_dispatch_summary["dispatch_mode"] == "workflow_run"
+    assert plan.brain_dispatch_summary["dispatch_type"] == "workflow_run"
+    assert plan.brain_dispatch_summary["dispatch_type_legacy"] == "workflow_run"
+    assert plan.brain_dispatch_summary["workflow_name"] == "基础工作流 · v2.0"
     assert plan.brain_dispatch_summary["execution_agent"]
     assert plan.brain_dispatch_summary["summary_line"]
     assert plan.brain_dispatch_summary["session_state"] == plan.manager_packet["session_state"]
@@ -524,6 +634,18 @@ def test_routing_rules_classify_intent() -> None:
     assert fallback_assessment["reasons"]["help"] == ["default_help_fallback"]
 
 
+def test_routing_rules_model_identity_question_prefers_chat_reply_over_clarify() -> None:
+    interaction_mode = routing_rules.classify_interaction_mode("你是什么模型", intent="help")
+    reception_mode = routing_rules.classify_reception_mode(
+        "你是什么模型",
+        intent="help",
+        interaction_mode=interaction_mode,
+    )
+
+    assert interaction_mode == "chat"
+    assert reception_mode != "clarify"
+
+
 def test_routing_planner_builds_dynamic_execution_plan() -> None:
     plan = routing_planner.build_dynamic_execution_plan(
         "请先检索安全网关设计文档，再写一封给客户的说明邮件",
@@ -793,10 +915,19 @@ def test_orchestration_service_builds_message_task_artifacts_and_launch_plan() -
             "workflow_mode": "free_workflow",
             "interaction_mode": "task",
             "reception_mode": "task_handoff",
+            "workflow_id": "mandatory-workflow-brain-foundation",
+            "workflow_name": "基础工作流 · v2.0",
             "execution_agent_id": "agent-writer",
+            "routing_strategy": "workflow_trigger+execution_agent_support",
+            "fallback_policy": {"mode": "none", "target": None, "on_failure": "human_handoff"},
+            "execution_plan": {
+                "mode": "free_workflow",
+                "strategy": "workflow_trigger+execution_agent_support",
+                "plan_type": "single_path",
+            },
         },
         manager_packet={"next_owner": "Writer Agent"},
-        brain_dispatch_summary={"summary_line": "dispatch"},
+        brain_dispatch_summary={"summary_line": "dispatch", "dispatch_type": "workflow_run"},
         interaction_mode="task",
         approval_required=False,
         confirmation_status=None,
@@ -818,7 +949,7 @@ def test_orchestration_service_builds_message_task_artifacts_and_launch_plan() -
         intent="write",
         route_message="已识别意图并准备派发",
         execution_agent_name="Writer Agent",
-        agent_dispatch=True,
+        agent_dispatch=False,
         state_machine_version="brain_fact_layer_v1",
         warnings=["warning-1"],
         truncate_text=lambda text, limit: text[:limit],
@@ -831,20 +962,22 @@ def test_orchestration_service_builds_message_task_artifacts_and_launch_plan() -
         memory_step_message=lambda _: "已注入记忆",
     )
     launch_plan = orchestration_service.build_message_run_launch_plan(
-        agent_dispatch=True,
+        agent_dispatch=False,
         confirmation_pending=artifacts.confirmation_pending,
-        workflow_id="workflow-1",
+        workflow_id="mandatory-workflow-brain-foundation",
         route_decision=artifacts.route_decision,
     )
 
     assert artifacts.dispatch_context["state"] == "queued"
     assert artifacts.dispatch_context["state_machine"]["dispatch_state"] == "queued"
     assert artifacts.task["id"] == "task-1"
+    assert artifacts.task["route_decision"]["workflow_id"] == "mandatory-workflow-brain-foundation"
     assert artifacts.task["route_decision"]["execution_agent_id"] == "agent-writer"
     assert len(artifacts.task_steps) == 5
-    assert launch_plan.mode == "agent_dispatch"
+    assert launch_plan.mode == "workflow_run"
+    assert launch_plan.workflow_id == "mandatory-workflow-brain-foundation"
     assert launch_plan.execution_agent_id == "agent-writer"
-    assert launch_plan.should_queue_agent_execution is True
+    assert launch_plan.should_queue_agent_execution is False
 
 
 def test_orchestration_service_create_task_steps_uses_agent_dispatch_flag() -> None:
@@ -876,7 +1009,7 @@ def test_brain_dispatch_plan_exposes_agent_dispatch_flag() -> None:
         }
     )
 
-    assert isinstance(plan.agent_dispatch, bool)
+    assert plan.agent_dispatch is False
 
 
 def test_orchestration_service_applies_confirmation_transition_to_task_and_run() -> None:

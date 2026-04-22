@@ -285,6 +285,32 @@
       }
     },
     {
+      "id": "mcp-tool-browser-automation",
+      "name": "delivery_note_browser_automation",
+      "type": "mcp",
+      "source": "workbot-external-mcp",
+      "source_kind": "mcp_server",
+      "enabled": true,
+      "description": "Scenario-specific browser MCP for delivery note export and customer send.",
+      "tags": ["mcp", "browser", "professional", "delivery-note", "externalized", "runtime"],
+      "provider": "mcp-http",
+      "bridge_mode": "runtime_bridge",
+      "permissions": {
+        "requires_permission": true,
+        "scopes": ["agents:read", "tasks:write"],
+        "roles": ["admin", "operator"],
+        "approval_required": false
+      },
+      "config_summary": {
+        "base_url": "${WORKBOT_BROWSER_AUTOMATION_MCP_BASE_URL:-http://127.0.0.1:8099}",
+        "invoke_path": "/execute",
+        "http_method": "POST",
+        "request_mode": "wrapped_payload",
+        "timeout_seconds": 25,
+        "retry_attempts": 1
+      }
+    },
+    {
       "id": "agent-reach-upstream:mcp:exa",
       "name": "exa",
       "type": "mcp",

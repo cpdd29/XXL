@@ -52,6 +52,8 @@ const nodeTypeLabels: Record<string, string> = {
   parallel: "并行节点",
   merge: "合流节点",
   workflow: "子工作流节点",
+  sub_workflow: "子工作流节点",
+  trigger_workflow: "触发工作流节点",
   tool: "历史工具节点",
   transform: "转换节点",
   output: "输出节点",
@@ -97,6 +99,16 @@ export function WorkflowNodeConfigDialog({
   const nodeType = selectedNode?.type ?? "agent"
   const triggerFieldMeta = getWorkflowTriggerFieldMeta(workflowMeta.trigger.type)
   const triggerTypeOptions = getWorkflowTriggerOptions(workflowMeta.trigger.type)
+  const hasBindableChildWorkflows = workflows.length > 0
+  const selectedWorkflowId = selectedNode?.workflowId ?? undefined
+  const hasSelectedWorkflowOption = selectedWorkflowId
+    ? workflows.some((workflow) => workflow.id === selectedWorkflowId)
+    : false
+  const childWorkflowSelectValue = hasSelectedWorkflowOption
+    ? selectedWorkflowId
+    : hasBindableChildWorkflows
+      ? "__unbound__"
+      : undefined
 
   return (
     <Dialog open={open && Boolean(selectedNode)} onOpenChange={onOpenChange}>
@@ -259,13 +271,13 @@ export function WorkflowNodeConfigDialog({
                   </NodeSection>
                 ) : null}
 
-                {nodeType === "workflow" ? (
+                {["workflow", "sub_workflow", "trigger_workflow"].includes(nodeType) ? (
                   <NodeSection title="子工作流配置">
                     <div className="space-y-3">
                       <div className="space-y-2">
                         <div className="text-xs text-muted-foreground">绑定子工作流</div>
                         <Select
-                          value={selectedNode.workflowId ?? "__unbound__"}
+                          value={childWorkflowSelectValue}
                           disabled={!canEditConfiguration}
                           onValueChange={(value) =>
                             onNodeWorkflowChange(value === "__unbound__" ? undefined : value)
@@ -275,22 +287,36 @@ export function WorkflowNodeConfigDialog({
                             <SelectValue placeholder="选择一个子工作流" />
                           </SelectTrigger>
                           <SelectContent>
-                            <SelectItem value="__unbound__">未绑定</SelectItem>
-                            {workflows.map((workflow) => (
-                              <SelectItem key={workflow.id} value={workflow.id}>
-                                {workflow.name} · {workflow.version}
-                              </SelectItem>
-                            ))}
+                            {hasBindableChildWorkflows ? (
+                              <>
+                                <SelectItem value="__unbound__">未绑定</SelectItem>
+                                {workflows.map((workflow) => (
+                                  <SelectItem key={workflow.id} value={workflow.id}>
+                                    {workflow.name} · {workflow.version}
+                                  </SelectItem>
+                                ))}
+                              </>
+                            ) : (
+                              <div className="px-2 py-6 text-center text-sm text-muted-foreground">
+                                暂无可绑定子工作流
+                              </div>
+                            )}
                           </SelectContent>
                         </Select>
                       </div>
                       <div className="space-y-2">
-                        <div className="text-xs text-muted-foreground">交接说明</div>
+                        <div className="text-xs text-muted-foreground">
+                          {nodeType === "trigger_workflow" ? "触发说明" : "交接说明"}
+                        </div>
                         <Textarea
                           rows={4}
                           value={getNodeConfigValue(selectedNode, "handoffNote")}
                           disabled={!canEditConfiguration}
-                          placeholder="说明父流程传什么、子流程完成后回传什么"
+                          placeholder={
+                            nodeType === "trigger_workflow"
+                              ? "说明触发条件、触发参数、触发后父流程如何衔接"
+                              : "说明父流程传什么、子流程完成后回传什么"
+                          }
                           onChange={(event) =>
                             onNodeConfigChange("handoffNote", event.target.value || null)
                           }

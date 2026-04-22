@@ -21,7 +21,7 @@ export function AppHeader() {
         <div className="relative">
           <Search className="absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
           <Input
-            placeholder="搜索工作流、执行任务、skill/mcp 接入..."
+            placeholder="搜索工作流、执行任务、SKILL/MCP..."
             className="w-80 bg-secondary pl-10"
           />
         </div>

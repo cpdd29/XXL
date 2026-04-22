@@ -96,6 +96,7 @@ services:
       WORKBOT_WEATHER_MCP_BASE_URL: ${WORKBOT_WEATHER_MCP_BASE_URL:-http://host.docker.internal:8095}
       WORKBOT_ORDER_MCP_BASE_URL: ${WORKBOT_ORDER_MCP_BASE_URL:-http://host.docker.internal:8096}
       WORKBOT_CRM_MCP_BASE_URL: ${WORKBOT_CRM_MCP_BASE_URL:-http://host.docker.internal:8097}
+      WORKBOT_BROWSER_AUTOMATION_MCP_BASE_URL: ${WORKBOT_BROWSER_AUTOMATION_MCP_BASE_URL:-http://host.docker.internal:8099}
     ports:
       - "${BACKEND_PORT:-8080}:8080"
     volumes:

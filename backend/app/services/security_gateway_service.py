@@ -989,7 +989,91 @@ class SecurityGatewayService:
             auth_scope=auth_scope,
         )
 
-    def inspect_text_entrypoint(
+    def _build_block_result(
+        self,
+        *,
+        trace_id: str,
+        user_key: str,
+        auth_scope: str,
+        text: str,
+        prompt_assessment: dict[str, object],
+        warnings: list[str],
+        rewrite_diffs: list[dict[str, object]],
+        trace_context: dict[str, object],
+        blocked_layer: str,
+        status_code: int,
+        detail: str,
+    ) -> dict[str, object]:
+        trace_event = self._build_trace_event(
+            trace_context,
+            layer=blocked_layer,
+            outcome="blocked",
+            status_code=status_code,
+        )
+        return {
+            "allowed": False,
+            "trace_id": trace_id,
+            "audit_trace_id": trace_id,
+            "user_key": user_key,
+            "auth_scope": auth_scope,
+            "sanitized_text": text,
+            "allowed_message": None,
+            "warnings": list(warnings),
+            "warning_count": len(warnings),
+            "prompt_injection_assessment": store.clone(prompt_assessment),
+            "rewrite_diffs": store.clone(rewrite_diffs),
+            "rewrite_diffs_count": len(rewrite_diffs),
+            "trace": trace_event,
+            "status_code": status_code,
+            "detail": detail,
+            "security_verdict": {
+                "allowed": False,
+                "layer": blocked_layer,
+                "status_code": status_code,
+                "detail": detail,
+            },
+        }
+
+    def _build_allow_result(
+        self,
+        *,
+        trace_id: str,
+        user_key: str,
+        auth_scope: str,
+        sanitized_text: str,
+        warnings: list[str],
+        prompt_assessment: dict[str, object],
+        rewrite_diffs: list[dict[str, object]],
+        trace_event: dict[str, object],
+    ) -> dict[str, object]:
+        result = build_security_allow_result(
+            trace_id=trace_id,
+            user_key=user_key,
+            sanitized_text=sanitized_text,
+            warnings=warnings,
+            prompt_assessment=prompt_assessment,
+            rewrite_diffs=rewrite_diffs,
+            trace_event=trace_event,
+        )
+        result.update(
+            {
+                "allowed": True,
+                "audit_trace_id": trace_id,
+                "auth_scope": auth_scope,
+                "allowed_message": sanitized_text,
+                "warning_count": len(warnings),
+                "rewrite_diffs_count": len(rewrite_diffs),
+                "security_verdict": {
+                    "allowed": True,
+                    "layer": str(trace_event.get("layer") or "security_pass"),
+                    "status_code": int(trace_event.get("status_code") or status.HTTP_200_OK),
+                    "detail": "Security flow allowed the request",
+                },
+            }
+        )
+        return result
+
+    def inspect_text_entrypoint_snapshot(
         self,
         *,
         text: str,
@@ -1006,29 +1090,83 @@ class SecurityGatewayService:
             auth_scope=auth_scope,
             now=now,
         )
-        self._enforce_rate_limit_guard(
-            user_key=user_key,
-            now=now,
-            trace_id=trace_id,
-            trace_context=trace_context,
-            normalized_policy=normalized_policy,
-        )
-        self._enforce_auth_scope_guard(
-            user_key=user_key,
-            auth_scope=auth_scope,
-            trace_id=trace_id,
-            trace_context=trace_context,
-        )
-
         normalized_text = str(text or "").strip()
-        prompt_assessment = self._assess_prompt_injection_guard(
-            user_key=user_key,
-            now=now,
-            text=normalized_text,
-            trace_id=trace_id,
-            trace_context=trace_context,
-            normalized_policy=normalized_policy,
-        )
+        prompt_assessment = default_prompt_injection_assessment()
+        warnings: list[str] = []
+        rewrite_notes: list[str] = []
+        rewrite_diffs: list[dict[str, object]] = []
+
+        try:
+            self._enforce_rate_limit_guard(
+                user_key=user_key,
+                now=now,
+                trace_id=trace_id,
+                trace_context=trace_context,
+                normalized_policy=normalized_policy,
+            )
+        except HTTPException as exc:
+            return self._build_block_result(
+                trace_id=trace_id,
+                user_key=user_key,
+                auth_scope=auth_scope,
+                text=normalized_text,
+                prompt_assessment=prompt_assessment,
+                warnings=warnings,
+                rewrite_diffs=rewrite_diffs,
+                trace_context=trace_context,
+                blocked_layer="rate_limit",
+                status_code=exc.status_code,
+                detail=str(exc.detail),
+            )
+
+        try:
+            self._enforce_auth_scope_guard(
+                user_key=user_key,
+                auth_scope=auth_scope,
+                trace_id=trace_id,
+                trace_context=trace_context,
+            )
+        except HTTPException as exc:
+            return self._build_block_result(
+                trace_id=trace_id,
+                user_key=user_key,
+                auth_scope=auth_scope,
+                text=normalized_text,
+                prompt_assessment=prompt_assessment,
+                warnings=warnings,
+                rewrite_diffs=rewrite_diffs,
+                trace_context=trace_context,
+                blocked_layer="auth_rbac",
+                status_code=exc.status_code,
+                detail=str(exc.detail),
+            )
+
+        try:
+            prompt_assessment = self._assess_prompt_injection_guard(
+                user_key=user_key,
+                now=now,
+                text=normalized_text,
+                trace_id=trace_id,
+                trace_context=trace_context,
+                normalized_policy=normalized_policy,
+            )
+        except HTTPException as exc:
+            if str(prompt_assessment.get("verdict") or "").strip() != "block":
+                prompt_assessment = self._prompt_injection_assessment(normalized_text)
+            return self._build_block_result(
+                trace_id=trace_id,
+                user_key=user_key,
+                auth_scope=auth_scope,
+                text=normalized_text,
+                prompt_assessment=prompt_assessment,
+                warnings=warnings,
+                rewrite_diffs=rewrite_diffs,
+                trace_context=trace_context,
+                blocked_layer="prompt_injection",
+                status_code=exc.status_code,
+                detail=str(exc.detail),
+            )
+
         sanitized_text, warnings, rewrite_notes, rewrite_diffs = self._apply_content_redaction_guard(
             text=normalized_text,
             normalized_policy=normalized_policy,
@@ -1041,15 +1179,34 @@ class SecurityGatewayService:
             rewrite_notes=rewrite_notes,
             rewrite_diffs=rewrite_diffs,
         )
-
-        return build_security_allow_result(
+        return self._build_allow_result(
             trace_id=trace_id,
             user_key=user_key,
+            auth_scope=auth_scope,
             sanitized_text=sanitized_text,
             warnings=warnings,
             prompt_assessment=prompt_assessment,
             rewrite_diffs=rewrite_diffs,
             trace_event=trace_event,
+        )
+
+    def inspect_text_entrypoint(
+        self,
+        *,
+        text: str,
+        user_key: str,
+        auth_scope: str,
+    ) -> dict[str, object]:
+        result = self.inspect_text_entrypoint_snapshot(
+            text=text,
+            user_key=user_key,
+            auth_scope=auth_scope,
+        )
+        if bool(result.get("allowed")):
+            return result
+        raise HTTPException(
+            status_code=int(result.get("status_code") or status.HTTP_403_FORBIDDEN),
+            detail=str(result.get("detail") or "Security policy blocked this request"),
         )
 
     def reset(self) -> None:

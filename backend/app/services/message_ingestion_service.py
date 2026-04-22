@@ -10,7 +10,6 @@ from app.brain_core.reception.service import reception_service
 from app.brain_core.task_view.service import task_view_service
 from app.config import get_settings
 from app.schemas.messages import UnifiedMessage, channel_display_name, webhook_auth_scope
-from app.services.agent_execution_worker_service import agent_execution_worker_service
 from app.services.language_service import detect_language
 from app.services.memory_service import memory_service
 from app.services.operational_log_service import append_realtime_event
@@ -20,10 +19,7 @@ from app.services.security_gateway_service import security_gateway_service
 from app.services.store import store
 from app.services.workflow_execution_service import (
     append_context_patch_to_run,
-    complete_agent_execution_job,
-    create_agent_dispatch_run_for_task,
     create_workflow_run_for_task,
-    fail_workflow_run_due_agent_execution_error,
     mark_task_steps_authoritative,
     sync_workflow_run_from_task,
     tick_workflow_run,
@@ -69,6 +65,7 @@ PROFILE_TENANT_NAME_METADATA_KEYS = ("tenant_name", "tenantName")
 ALLOWED_CONTROL_PLANE_ROLES = {"admin", "operator", "viewer"}
 INTERACTION_MODES = {"chat", "task", "workflow_or_direct"}
 PROFESSIONAL_CONFIRM_TIMEOUT_SECONDS = 1800
+CONTEXT_PATCH_TASK_STATUSES = {"pending", "running", "completed"}
 
 
 def _next_task_id() -> str:
@@ -1016,45 +1013,24 @@ def _launch_message_run(
     dispatch_context: dict[str, Any],
     launch_plan: Any,
 ) -> dict:
-    if str(getattr(launch_plan, "mode", "")).strip() == "agent_dispatch":
-        run = create_agent_dispatch_run_for_task(
-            task=task,
-            intent=intent,
-            trigger=entrypoint,
-            memory_hits=memory_hits,
-            warnings=warnings,
-            dispatch_context=dispatch_context,
-        )
-        if bool(getattr(launch_plan, "should_queue_agent_execution", False)):
-            execution_agent_id = str(getattr(launch_plan, "execution_agent_id", "") or "").strip() or None
-            queued = agent_execution_worker_service.enqueue_execution(
-                run_id=str(run.get("id") or ""),
-                task_id=str(task.get("id") or ""),
-                workflow_id=str(run.get("workflow_id") or ""),
-                execution_agent_id=execution_agent_id,
-                step_delay=0.0,
-                published_at=store.now_string(),
-            )
-            if not queued:
-                try:
-                    run = complete_agent_execution_job(
-                        str(run.get("id") or ""),
-                        execution_agent_id=execution_agent_id,
-                    )
-                except Exception as exc:
-                    run = fail_workflow_run_due_agent_execution_error(
-                        str(run.get("id") or ""),
-                        failure_message=f"Agent dispatch 执行失败：{exc}",
-                    )
-        return run
-
+    launch_mode = str(getattr(launch_plan, "mode", "") or "").strip() or "workflow_run"
+    if launch_mode != "workflow_run":
+        raise ValueError("Message ingress launch plan must use workflow_run mode")
+    workflow_id = (
+        str(getattr(launch_plan, "workflow_id", "") or "").strip()
+        or str(task.get("workflow_id") or "").strip()
+        or str((task.get("route_decision") or {}).get("workflow_id") or "").strip()
+        or str((task.get("route_decision") or {}).get("workflowId") or "").strip()
+    )
+    if not workflow_id or workflow_id in {"__agent_dispatch__", "__direct_agent_fallback__"}:
+        raise ValueError("Message ingress must launch a real workflow run")
     return create_workflow_run_for_task(
         task=task,
         intent=intent,
         trigger=entrypoint,
         memory_hits=memory_hits,
         warnings=warnings,
-        workflow_id=str(getattr(launch_plan, "workflow_id", "") or ""),
+        workflow_id=workflow_id,
         dispatch_context=dispatch_context,
     )
 
@@ -1189,20 +1165,86 @@ def _task_route_intent(task: dict | None) -> str | None:
     return reception_service.infer_task_intent(task)
 
 
+def _task_status(task: dict | None) -> str:
+    return str((task or {}).get("status") or "").strip().lower()
+
+
+def _find_latest_task_for_user(user_key: str) -> dict | None:
+    latest_task: dict | None = None
+    latest_message_at: datetime | None = None
+    normalized_user_key = str(user_key or "").strip()
+    if not normalized_user_key:
+        return None
+
+    for candidate in _load_tasks_for_bootstrap():
+        task_id = str(candidate.get("id") or "").strip()
+        if not task_id or str(candidate.get("user_key") or "").strip() != normalized_user_key:
+            continue
+
+        task = _find_task(task_id) or _sync_cached_task(candidate)
+        candidate_message_at = _latest_message_at_for_task(task)
+        if latest_message_at is None or candidate_message_at > latest_message_at:
+            latest_task = task
+            latest_message_at = candidate_message_at
+
+    return latest_task
+
+
+def _find_latest_context_patch_task_for_user(user_key: str) -> dict | None:
+    latest_task = _find_latest_task_for_user(user_key)
+    if _task_status(latest_task) not in CONTEXT_PATCH_TASK_STATUSES:
+        return None
+    return latest_task
+
+
+def _resolve_context_patch_task_for_user(user_key: str) -> tuple[str, datetime] | None:
+    normalized_user_key = str(user_key or "").strip()
+    if not normalized_user_key:
+        return None
+
+    task_id = ACTIVE_TASKS_BY_USER.get(normalized_user_key)
+    last_message_at = LAST_MESSAGE_AT_BY_USER.get(normalized_user_key)
+    if task_id and last_message_at:
+        task = _find_task(task_id)
+        if _task_status(task) in CONTEXT_PATCH_TASK_STATUSES:
+            latest_message_at = _latest_message_at_for_task(task)
+            if latest_message_at > last_message_at:
+                last_message_at = latest_message_at
+                LAST_MESSAGE_AT_BY_USER[normalized_user_key] = latest_message_at
+            ACTIVE_TASKS_BY_USER[normalized_user_key] = task_id
+            return task_id, last_message_at
+
+    latest_task = _find_latest_context_patch_task_for_user(normalized_user_key)
+    if latest_task is None:
+        ACTIVE_TASKS_BY_USER.pop(normalized_user_key, None)
+        LAST_MESSAGE_AT_BY_USER.pop(normalized_user_key, None)
+        return None
+
+    latest_task_id = str(latest_task.get("id") or "").strip()
+    if not latest_task_id:
+        return None
+
+    latest_message_at = _latest_message_at_for_task(latest_task)
+    ACTIVE_TASKS_BY_USER[normalized_user_key] = latest_task_id
+    LAST_MESSAGE_AT_BY_USER[normalized_user_key] = latest_message_at
+    return latest_task_id, latest_message_at
+
+
 def _should_context_patch(user_key: str, received_at: datetime, message_text: str) -> str | None:
     settings = get_settings()
-    active_task = _resolve_active_task_for_user(user_key)
-    if active_task is None:
+    context_patch_task = _resolve_context_patch_task_for_user(user_key)
+    if context_patch_task is None:
         return None
-    task_id, last_message_at = active_task
+    task_id, last_message_at = context_patch_task
 
     task = _find_task(task_id)
-    if not reception_service.should_context_patch(
+    if task is None or _task_status(task) not in CONTEXT_PATCH_TASK_STATUSES:
+        return None
+    if (received_at - last_message_at).total_seconds() > int(settings.message_debounce_seconds):
+        return None
+    if not reception_service.should_merge_into_active_task(
         active_task=task,
-        last_message_at=last_message_at,
-        received_at=received_at,
         message_text=message_text,
-        message_debounce_seconds=settings.message_debounce_seconds,
     ):
         return None
     return task_id
@@ -1290,6 +1332,16 @@ def ingest_unified_message(
         message.text,
         preferred_language=preferred_language,
     )
+    message_tenant_id, message_tenant_name = _resolved_message_tenant_binding(message)
+    security_context = {
+        "trace_id": str(security_result.get("trace_id") or "").strip() or None,
+        "auth_scope": auth_scope,
+        "warning_count": len(security_result.get("warnings") or []),
+        "prompt_injection_assessment": store.clone(
+            security_result.get("prompt_injection_assessment") or {}
+        ),
+        "rewrite_diffs_count": len(security_result.get("rewrite_diffs") or []),
+    }
     _sync_message_user_profile(message, preferred_language=preferred_language)
 
     short_term_result = memory_service.ingest_message(
@@ -1367,6 +1419,8 @@ def ingest_unified_message(
     interaction_mode = dispatch_plan.interaction_mode
     reception_mode = dispatch_plan.reception_mode
     agent_dispatch = dispatch_plan.agent_dispatch
+    if agent_dispatch:
+        raise ValueError("Message ingress no longer accepts agent_dispatch dispatch plans")
     metadata = orchestration_service.prepare_message_dispatch_metadata(
         route_decision=route_decision,
         manager_packet=dispatch_plan.manager_packet,
@@ -1406,6 +1460,9 @@ def ingest_unified_message(
         clone=store.clone,
         memory_context_lines=_memory_context_lines,
         memory_step_message=_memory_step_message,
+        tenant_id=message_tenant_id,
+        tenant_name=message_tenant_name,
+        security_context=security_context,
     )
     route_decision = artifacts.route_decision
     manager_packet = artifacts.manager_packet

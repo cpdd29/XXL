@@ -132,7 +132,27 @@ class ProjectDocumentSearchService:
             if kind == "markdown":
                 return self._load_markdown_chunks(candidate, source_name=filename)
             return self._load_svg_chunks(candidate)
+        if kind == "svg":
+            virtual_chunks = self._build_virtual_svg_chunks(filename)
+            if virtual_chunks:
+                return virtual_chunks
         return []
+
+    def _build_virtual_svg_chunks(self, filename: str) -> list[DocumentChunk]:
+        alias = SVG_SEARCH_ALIASES.get(filename)
+        if not alias:
+            return []
+        content = f"{filename} {alias}"
+        return [
+            DocumentChunk(
+                source_name=filename,
+                section="Overview",
+                content=content,
+                order=90000 + len(filename),
+                kind="svg",
+                searchable_text=self._normalize_text(content),
+            )
+        ]
 
     def _load_wiki_chunks(self) -> list[DocumentChunk]:
         if not bool(get_settings().enable_wiki_knowledge):

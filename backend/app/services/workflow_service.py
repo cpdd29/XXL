@@ -15,7 +15,7 @@ from app.core.event_subjects import (
 from app.core.event_types import MESSAGE_TYPE_EVENT, MESSAGE_TYPE_RESULT
 from app.core.nats_event_bus import nats_event_bus
 from app.services.persistence_service import persistence_service
-from app.services.store import store
+from app.services.store import LEGACY_WORKFLOW_IDS, store
 from app.services.webhook_guard_service import sanitize_webhook_payload
 from app.services.workflow_execution_service import (
     create_manual_workflow_run,
@@ -50,8 +50,10 @@ WORKFLOW_STORAGE_UNAVAILABLE_DETAIL = "Workflow configuration storage unavailabl
 WORKFLOW_INTERNAL_TRIGGER_NOT_FOUND_DETAIL = "Workflow internal trigger not found"
 INTERNAL_EVENT_STATUS_IGNORED = "ignored"
 WORKFLOW_LIST_PRIORITY_BY_ID = {
-    "workflow-1": 0,
-    "mandatory-workflow-external-tentacle-dispatch": 1,
+    "mandatory-workflow-agent-security-pipeline": -4,
+    "mandatory-workflow-agent-conversation-pipeline": -3,
+    "mandatory-workflow-professional-agent": -2,
+    "mandatory-workflow-free-agent": -1,
 }
 
 
@@ -675,6 +677,11 @@ def _next_workflow_id() -> str:
         if (workflow_id := str(workflow.get("id") or "")).startswith("workflow-")
         and workflow_id.rsplit("-", maxsplit=1)[-1].isdigit()
     ]
+    numeric_ids.extend(
+        int(workflow_id.rsplit("-", maxsplit=1)[-1])
+        for workflow_id in LEGACY_WORKFLOW_IDS
+        if workflow_id.startswith("workflow-") and workflow_id.rsplit("-", maxsplit=1)[-1].isdigit()
+    )
     return f"workflow-{max(numeric_ids, default=0) + 1}"
 
 
@@ -717,6 +724,9 @@ def _load_database_workflow(workflow_id: str) -> tuple[dict | None, bool]:
 
 
 def _find_workflow_mutable(workflow_id: str) -> dict:
+    if str(workflow_id or "").strip() in LEGACY_WORKFLOW_IDS:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Workflow not found")
+
     database_workflow, database_authoritative = _load_database_workflow(workflow_id)
     if database_authoritative:
         if database_workflow is None:
@@ -732,6 +742,8 @@ def _find_workflow_mutable(workflow_id: str) -> dict:
 
 def _persist_workflow(workflow: dict | None) -> None:
     if workflow is None:
+        return
+    if bool(workflow.get("_legacy_hidden_compatibility")):
         return
 
     persist_workflow_state = getattr(persistence_service, "persist_workflow_state", None)
@@ -1470,6 +1482,11 @@ def list_workflows() -> dict:
         items = []
     else:
         items = store.clone(store.workflows)
+    items = [
+        workflow
+        for workflow in items
+        if str(workflow.get("id") or "").strip() not in LEGACY_WORKFLOW_IDS
+    ]
     items = sorted(
         items,
         key=lambda workflow: (
@@ -1529,6 +1546,7 @@ def run_workflow(workflow_id: str, payload: dict | None = None) -> dict:
         workflow_id,
         trigger=payload.get("trigger", "manual"),
         intent=payload.get("intent"),
+        eager_start=True,
     )
     _mark_workflow_running(workflow)
     _persist_workflow(workflow)
@@ -1699,6 +1717,14 @@ def trigger_workflow_internal(
                     f"已接收内部事件 {normalized_event}，"
                     "触发上下文摘要已注入任务描述"
                 ),
+                dispatch_context={
+                    "internal_event_name": normalized_event,
+                    "internal_event_source": resolved_source,
+                    "internal_event_payload": store.clone(payload),
+                    "internal_event_id": delivery_id,
+                    "internal_event_status": "pending",
+                },
+                eager_start=True,
             )
             _mark_workflow_running(workflow)
             _persist_workflow(workflow)

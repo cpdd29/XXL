@@ -40,7 +40,6 @@ import {
 } from "./nodes"
 import {
   useCreateWorkflow,
-  useRunWorkflow,
   useWorkflowMonitor,
   useTickWorkflowRun,
   useUpdateWorkflow,
@@ -65,6 +64,8 @@ const nodeTypes: NodeTypes = {
   parallel: ParallelNode,
   merge: MergeNode,
   workflow: WorkflowCallNode,
+  sub_workflow: WorkflowCallNode,
+  trigger_workflow: WorkflowCallNode,
   tool: ToolNode,
   transform: TransformNode,
   output: OutputNode,
@@ -85,10 +86,18 @@ type FlowNodeData = {
   toolName?: string | null
   workflowId?: string | null
   workflowName?: string | null
+  workflowNodeKind?: "workflow" | "sub_workflow" | "trigger_workflow"
   triggerType?: string
   triggerSummary?: string
   status?: "idle" | "running" | "waiting" | "completed" | "error"
   tokens?: number
+  relationSummary?: string | null
+  relatedRunId?: string | null
+  relatedRunStatus?: "idle" | "pending" | "running" | "waiting" | "completed" | "error" | null
+  relatedRunAnchor?: string | null
+  parentRunId?: string | null
+  parentWorkflowId?: string | null
+  parentNodeId?: string | null
 }
 
 const defaultWorkflowMeta: WorkflowEditorMeta = {
@@ -116,6 +125,7 @@ const defaultWorkflowMeta: WorkflowEditorMeta = {
 const initialNodes: Node[] = []
 
 const initialEdges: Edge[] = []
+const BASIC_WORKFLOW_ID = "mandatory-workflow-brain-foundation"
 
 let nextNodeId = 9
 
@@ -154,6 +164,13 @@ function normalizeNodeType(type?: string | null): WorkflowNodeType {
   return (type ?? "agent") as WorkflowNodeType
 }
 
+function normalizeWorkflowNodeKind(type?: string | null): FlowNodeData["workflowNodeKind"] {
+  if (type === "workflow" || type === "sub_workflow" || type === "trigger_workflow") {
+    return type
+  }
+  return undefined
+}
+
 function defaultLabelForNodeType(type: string) {
   const labelByType: Record<string, string> = {
     trigger: "触发节点",
@@ -162,6 +179,8 @@ function defaultLabelForNodeType(type: string) {
     parallel: "并行节点",
     merge: "合流节点",
     workflow: "子工作流节点",
+    sub_workflow: "子工作流节点",
+    trigger_workflow: "触发工作流节点",
     tool: "历史工具节点",
     transform: "转换节点",
     output: "输出节点",
@@ -247,6 +266,7 @@ function decorateNodeData(
     toolName: boundTool?.name ?? undefined,
     workflowId: node.workflowId ?? undefined,
     workflowName: boundWorkflow?.name ?? undefined,
+    workflowNodeKind: normalizeWorkflowNodeKind(node.type),
     triggerType: normalizedType === "trigger" ? trigger.type : undefined,
     triggerSummary: normalizedType === "trigger" ? getTriggerSummary(trigger) : undefined,
     message: null,
@@ -254,6 +274,13 @@ function decorateNodeData(
     errorCount: 0,
     status: "idle",
     tokens: 0,
+    relationSummary: null,
+    relatedRunId: null,
+    relatedRunStatus: null,
+    relatedRunAnchor: null,
+    parentRunId: null,
+    parentWorkflowId: null,
+    parentNodeId: null,
   }
 }
 
@@ -322,8 +349,80 @@ function toReactFlowEdges(workflow?: Workflow): Edge[] {
   }))
 }
 
+const referencedRunPatterns = [
+  /run=([A-Za-z0-9:_-]+)/i,
+  /运行 ID[:：]\s*([A-Za-z0-9:_-]+)/i,
+]
+
+function extractReferencedRunId(...texts: Array<string | null | undefined>) {
+  for (const text of texts) {
+    const normalized = String(text || "").trim()
+    if (!normalized) continue
+    for (const pattern of referencedRunPatterns) {
+      const matched = normalized.match(pattern)
+      if (matched?.[1]) {
+        return matched[1]
+      }
+    }
+  }
+  return null
+}
+
+function parseWorkflowTriggerReference(trigger?: string | null) {
+  const normalized = String(trigger || "").trim()
+  const [prefix = "", workflowId = "", nodeId = ""] = normalized.split(":", 3)
+  if (!["workflow", "sub_workflow", "trigger_workflow"].includes(prefix)) return null
+  return {
+    parentWorkflowId: workflowId || null,
+    parentNodeId: nodeId || null,
+  }
+}
+
+function workflowRelationSummary(
+  kind: FlowNodeData["workflowNodeKind"],
+  {
+    workflowName,
+    runId,
+    status,
+    latestError,
+  }: {
+    workflowName?: string | null
+    runId?: string | null
+    status?: string | null
+    latestError?: string | null
+  },
+) {
+  const relationLabel = kind === "trigger_workflow" ? "触发流程" : "子流程"
+  const workflowText = workflowName ? ` · ${workflowName}` : ""
+  const runText = runId ? ` · run ${runId}` : ""
+  if (status === "error") {
+    return latestError
+      ? `${relationLabel}${workflowText}${runText} · ${latestError}`
+      : `${relationLabel}${workflowText}${runText} · 执行异常`
+  }
+  if (status === "completed") {
+    return `${relationLabel}${workflowText}${runText} · 已完成`
+  }
+  if (status === "running") {
+    return `${relationLabel}${workflowText}${runText} · 运行中`
+  }
+  if (status === "waiting" || status === "pending") {
+    return `${relationLabel}${workflowText}${runText} · 等待返回`
+  }
+  return runId ? `${relationLabel}${workflowText}${runText}` : null
+}
+
 function applyRunStateToNodes(currentNodes: Node[], run?: WorkflowRun | null): Node[] {
   const runNodesById = new Map((run?.nodes ?? []).map((node) => [node.id, node]))
+  const triggerReference = parseWorkflowTriggerReference(run?.trigger)
+  const relationsBySourceNodeId = new Map(
+    (run?.dispatchContext?.workflowRelations ?? [])
+      .filter((relation) => relation.sourceNodeId)
+      .map((relation) => [String(relation.sourceNodeId), relation]),
+  )
+  const parentRunId = run?.dispatchContext?.parentRunId ?? null
+  const parentWorkflowId = run?.dispatchContext?.parentWorkflowId ?? triggerReference?.parentWorkflowId ?? null
+  const parentNodeId = run?.dispatchContext?.parentNodeId ?? triggerReference?.parentNodeId ?? null
   let changed = false
 
   const nextNodes = currentNodes.map((node) => {
@@ -334,13 +433,65 @@ function applyRunStateToNodes(currentNodes: Node[], run?: WorkflowRun | null): N
     const nextMessage = runNode?.message ?? null
     const nextLatestError = runNode?.latestError ?? null
     const nextErrorCount = runNode?.errorCount ?? 0
+    let relationSummary: string | null = null
+    let relatedRunId: string | null = null
+    let relatedRunStatus: FlowNodeData["relatedRunStatus"] = null
+    let relatedRunAnchor: string | null = null
+    let nextParentRunId: string | null = null
+    let nextParentWorkflowId: string | null = null
+    let nextParentNodeId: string | null = null
+
+    if ((node.type ?? "") === "trigger" && (parentRunId || parentWorkflowId)) {
+      nextParentRunId = parentRunId
+      nextParentWorkflowId = parentWorkflowId
+      nextParentNodeId = parentNodeId
+      relatedRunId = parentRunId
+      relatedRunAnchor = parentRunId ? `#workflow-run-${parentRunId}` : null
+      relationSummary = [
+        "父流程触发",
+        parentWorkflowId ? `流程 ${parentWorkflowId}` : null,
+        parentRunId ? `run ${parentRunId}` : null,
+      ]
+        .filter(Boolean)
+        .join(" · ")
+    } else if (
+      currentData.workflowNodeKind === "workflow" ||
+      currentData.workflowNodeKind === "sub_workflow" ||
+      currentData.workflowNodeKind === "trigger_workflow"
+    ) {
+      const relatedRelation = relationsBySourceNodeId.get(node.id)
+      relatedRunId =
+        relatedRelation?.targetRunId ??
+        extractReferencedRunId(
+          runNode?.message,
+          runNode?.latestError,
+          ...(runNode?.errorHistory ?? []).map((issue) => issue.message),
+        )
+      relatedRunStatus = (relatedRelation?.targetStatus as FlowNodeData["relatedRunStatus"]) ?? null
+      relatedRunAnchor = relatedRunId ? `#workflow-run-${relatedRunId}` : null
+      relationSummary = workflowRelationSummary(currentData.workflowNodeKind, {
+        workflowName: relatedRelation?.targetWorkflowName ?? currentData.workflowName,
+        runId: relatedRunId,
+        status: relatedRunStatus,
+        latestError: runNode?.latestError,
+      })
+    } else if ((run?.trigger ?? "").startsWith("internal:") && (node.type ?? "") === "trigger") {
+      relationSummary = `来源事件 · ${(run?.trigger ?? "").slice("internal:".length) || "internal"}`
+    }
 
     if (
       currentData.status === nextStatus &&
       currentData.tokens === nextTokens &&
       currentData.message === nextMessage &&
       currentData.latestError === nextLatestError &&
-      currentData.errorCount === nextErrorCount
+      currentData.errorCount === nextErrorCount &&
+      currentData.relationSummary === relationSummary &&
+      currentData.relatedRunId === relatedRunId &&
+      currentData.relatedRunStatus === relatedRunStatus &&
+      currentData.relatedRunAnchor === relatedRunAnchor &&
+      currentData.parentRunId === nextParentRunId &&
+      currentData.parentWorkflowId === nextParentWorkflowId &&
+      currentData.parentNodeId === nextParentNodeId
     ) {
       return node
     }
@@ -355,6 +506,13 @@ function applyRunStateToNodes(currentNodes: Node[], run?: WorkflowRun | null): N
         message: nextMessage,
         latestError: nextLatestError,
         errorCount: nextErrorCount,
+        relationSummary,
+        relatedRunId,
+        relatedRunStatus,
+        relatedRunAnchor,
+        parentRunId: nextParentRunId,
+        parentWorkflowId: nextParentWorkflowId,
+        parentNodeId: nextParentNodeId,
       } satisfies FlowNodeData,
     }
   })
@@ -423,14 +581,12 @@ interface WorkflowEditorProps {
 
 export interface WorkflowEditorActionState {
   saveDisabled: boolean
-  runDisabled: boolean
   savePending: boolean
-  runPending: boolean
 }
 
 export interface WorkflowEditorHandle {
   save: () => Promise<void>
-  run: () => Promise<void>
+  setEnabled: (enabled: boolean) => Promise<void>
 }
 
 export const WorkflowEditor = forwardRef<WorkflowEditorHandle, WorkflowEditorProps>(function WorkflowEditor(
@@ -453,7 +609,6 @@ export const WorkflowEditor = forwardRef<WorkflowEditorHandle, WorkflowEditorPro
 
   const createWorkflow = useCreateWorkflow()
   const updateWorkflow = useUpdateWorkflow()
-  const runWorkflow = useRunWorkflow()
   const tickWorkflowRun = useTickWorkflowRun()
   const runsQuery = useWorkflowRuns(workflow?.id)
   const monitorQuery = useWorkflowMonitor(workflow?.id)
@@ -461,7 +616,6 @@ export const WorkflowEditor = forwardRef<WorkflowEditorHandle, WorkflowEditorPro
   const { data: toolsData } = useTools()
   const { runs: realtimeRuns } = useWorkflowRealtime({ workflowId: workflow?.id })
   const canEditDefinition = hasPermission("workflows:definition:write")
-  const canRunWorkflow = hasPermission("workflows:run:create")
   const canTickRun = hasPermission("workflows:run:tick")
   const liveRuns = useMemo<WorkflowRun[]>(
     () => (realtimeRuns.length > 0 ? realtimeRuns : runsQuery.data?.items ?? []),
@@ -470,7 +624,7 @@ export const WorkflowEditor = forwardRef<WorkflowEditorHandle, WorkflowEditorPro
   const activeRun = liveRuns[0] ?? null
   const savePending = createWorkflow.isPending || updateWorkflow.isPending
   const saveDisabled = !canEditDefinition || savePending
-  const runDisabled = !canRunWorkflow || !workflow?.id || runWorkflow.isPending
+  const isBasicWorkflow = String(workflow?.id ?? "").trim() === BASIC_WORKFLOW_ID
   const agentOptions = agentsData?.items ?? []
   const toolOptions = toolsData?.items ?? []
   const workflowOptions = availableWorkflows
@@ -555,11 +709,9 @@ export const WorkflowEditor = forwardRef<WorkflowEditorHandle, WorkflowEditorPro
   useEffect(() => {
     onActionStateChange?.({
       saveDisabled,
-      runDisabled,
       savePending,
-      runPending: runWorkflow.isPending,
     })
-  }, [onActionStateChange, runDisabled, runWorkflow.isPending, saveDisabled, savePending])
+  }, [onActionStateChange, saveDisabled, savePending])
 
   useEffect(() => {
     onDirtyChange?.(isDirty)
@@ -747,11 +899,22 @@ export const WorkflowEditor = forwardRef<WorkflowEditorHandle, WorkflowEditorPro
     workflow?.id,
   ])
 
-  const handleRun = useCallback(async () => {
-    if (runDisabled || !workflow?.id) return
-    await runWorkflow.mutateAsync(workflow.id)
-    await Promise.all([runsQuery.refetch(), monitorQuery.refetch()])
-  }, [monitorQuery, runDisabled, runWorkflow, runsQuery, workflow?.id])
+  const handleSetEnabled = useCallback(
+    async (enabled: boolean) => {
+      if (savePending || !workflow?.id || (!canEditDefinition && !isBasicWorkflow)) return
+
+      const nextMeta = {
+        ...workflowMeta,
+        status: enabled ? "active" : "paused",
+      }
+      const payload = buildDraftPayload({ workflowMeta: nextMeta, nodes, edges })
+
+      await updateWorkflow.mutateAsync({ workflowId: workflow.id, payload })
+      setWorkflowMeta(nextMeta)
+      setSavedSnapshot(serializeDraftPayload(payload))
+    },
+    [canEditDefinition, edges, isBasicWorkflow, nodes, savePending, updateWorkflow, workflow, workflowMeta],
+  )
 
   const handleTickRun = async (runId: string) => {
     await tickWorkflowRun.mutateAsync(runId)
@@ -767,9 +930,9 @@ export const WorkflowEditor = forwardRef<WorkflowEditorHandle, WorkflowEditorPro
     ref,
     () => ({
       save: handleSave,
-      run: handleRun,
+      setEnabled: handleSetEnabled,
     }),
-    [handleRun, handleSave],
+    [handleSave, handleSetEnabled],
   )
 
   return (

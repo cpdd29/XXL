@@ -70,9 +70,7 @@ def build_manager_action(
         return "admit_professional_workflow"
     if reception_mode == "continuation":
         return "continue_active_task"
-    if reception_mode == "task_handoff":
-        return "handoff_to_execution"
-    return "direct_task_entry"
+    return "handoff_to_execution"
 
 
 def build_next_owner(

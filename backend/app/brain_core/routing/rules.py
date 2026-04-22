@@ -60,6 +60,9 @@ CHAT_GREETING_HINTS = {
 }
 CHAT_SMALL_TALK_HINTS = {
     "你是谁",
+    "你是什么模型",
+    "你用的什么模型",
+    "你是哪个模型",
     "你是干嘛的",
     "你能做什么",
     "你可以做什么",
@@ -310,6 +313,12 @@ PROFESSIONAL_ACTION_HINTS = {
     "更新",
     "审批",
     "提交",
+    "下单",
+    "下订单",
+    "下了",
+    "订购",
+    "购买",
+    "成交",
     "推送",
     "fetch",
     "query",
@@ -337,6 +346,37 @@ PROFESSIONAL_DATA_HINTS = {
     "customer",
     "contract",
     "business data",
+}
+PROFESSIONAL_AMBIGUOUS_DATA_HINTS = {
+    "客户",
+    "customer",
+}
+PROFESSIONAL_DELIVERY_NOTE_HINTS = {
+    "送货单",
+    "送货单号",
+    "发货单",
+    "delivery note",
+    "delivery order",
+    "已出路由",
+}
+PROFESSIONAL_DELIVERY_NOTE_ACTION_HINTS = {
+    "导出",
+    "pdf",
+    "export",
+    "发送给客户",
+    "发给客户",
+    "发送客户",
+    "给客户",
+    "send to customer",
+}
+PROFESSIONAL_SYSTEM_NAVIGATION_HINTS = {
+    "登录",
+    "网址",
+    "页面",
+    "列表",
+    "路由",
+    "http://",
+    "https://",
 }
 PERMISSION_REQUIREMENT_HINTS = {
     "权限",
@@ -568,11 +608,25 @@ def is_professional_workflow_request(normalized_text: str) -> bool:
     has_system = contains_any(normalized_text, PROFESSIONAL_SYSTEM_HINTS)
     has_action = contains_any(normalized_text, PROFESSIONAL_ACTION_HINTS)
     has_business_data = contains_any(normalized_text, PROFESSIONAL_DATA_HINTS)
+    has_strict_business_data = contains_any(
+        normalized_text,
+        PROFESSIONAL_DATA_HINTS - PROFESSIONAL_AMBIGUOUS_DATA_HINTS,
+    )
     has_permission_hint = contains_any(normalized_text, PERMISSION_REQUIREMENT_HINTS)
+    is_delivery_note_export = (
+        contains_any(normalized_text, PROFESSIONAL_DELIVERY_NOTE_HINTS)
+        and contains_any(normalized_text, PROFESSIONAL_DELIVERY_NOTE_ACTION_HINTS)
+        and contains_any(normalized_text, PROFESSIONAL_SYSTEM_NAVIGATION_HINTS)
+    )
+
+    if is_delivery_note_export:
+        return True
 
     if has_system and (has_action or has_business_data or has_permission_hint):
         return True
-    if has_permission_hint and has_business_data and (has_action or has_system):
+    if has_strict_business_data and has_action:
+        return True
+    if has_permission_hint and has_strict_business_data and (has_action or has_system):
         return True
     return False
 

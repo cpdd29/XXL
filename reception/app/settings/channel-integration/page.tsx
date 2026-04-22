@@ -664,7 +664,7 @@ export default function ChannelIntegrationSettingsPage() {
             <section className="space-y-4 rounded-xl border border-border/60 bg-background/60 p-4">
               <h2 className="text-sm font-semibold text-foreground">钉钉应用参数</h2>
 
-              <div className="grid gap-4 md:grid-cols-3">
+              <div className="grid gap-4 md:grid-cols-2">
                 <div className="space-y-2">
                   <Label htmlFor={`${channel.key}-app-id`}>App ID</Label>
                   <Input
@@ -674,18 +674,6 @@ export default function ChannelIntegrationSettingsPage() {
                     placeholder="钉钉应用 App ID"
                     onChange={(event) =>
                       updateChannel(channel.key, { appId: event.target.value })
-                    }
-                  />
-                </div>
-                <div className="space-y-2">
-                  <Label htmlFor={`${channel.key}-agent-id`}>Agent ID</Label>
-                  <Input
-                    id={`${channel.key}-agent-id`}
-                    value={settings.agentId}
-                    disabled={!canEditSettings || !hasLoadedSettings || isSaving}
-                    placeholder="用于 OpenAPI 主动发送的 Agent ID"
-                    onChange={(event) =>
-                      updateChannel(channel.key, { agentId: event.target.value })
                     }
                   />
                 </div>
@@ -703,71 +691,55 @@ export default function ChannelIntegrationSettingsPage() {
                 </div>
               </div>
 
-              <div className="grid gap-4 md:grid-cols-2">
-                <div className="space-y-2">
-                  {renderSecretFieldHeader({
-                    id: `${channel.key}-client-secret`,
-                    label: "Client Secret",
-                    hint: buildSecretHint({
-                      value: settings.clientSecret,
-                      clear: settings.clearClientSecret,
-                      hasSaved: savedProvider.hasClientSecret,
-                      masked: savedProvider.clientSecretMasked,
-                      emptyText: "当前未保存 client secret。",
-                      savingText: "已录入新的 client secret，保存后会替换当前配置。",
-                      clearingText: "当前保存的 client secret 将在下次保存时清空。",
-                    }),
-                    action: savedProvider.hasClientSecret ? (
-                      <Button
-                        type="button"
-                        variant="ghost"
-                        size="sm"
-                        disabled={!canEditSettings || !hasLoadedSettings || isSaving}
-                        onClick={() =>
-                          updateChannel(channel.key, {
-                            clientSecret: "",
-                            clearClientSecret: !settings.clearClientSecret,
-                          })
-                        }
-                      >
-                        {settings.clearClientSecret ? "保留现有 Secret" : "清空已保存 Secret"}
-                      </Button>
-                    ) : undefined,
-                  })}
-                  <Input
-                    id={`${channel.key}-client-secret`}
-                    type="password"
-                    autoComplete="off"
-                    value={settings.clientSecret}
-                    disabled={!canEditSettings || !hasLoadedSettings || isSaving}
-                    placeholder="留空表示保留当前 Secret，输入则替换"
-                    onChange={(event) =>
-                      updateChannel(channel.key, {
-                        clientSecret: event.target.value,
-                        clearClientSecret: false,
-                      })
-                    }
-                  />
-                </div>
-                <div className="space-y-2">
-                  <Label htmlFor={`${channel.key}-corp-id`}>Corp ID</Label>
-                  <Input
-                    id={`${channel.key}-corp-id`}
-                    value={settings.corpId}
-                    disabled={!canEditSettings || !hasLoadedSettings || isSaving}
-                    placeholder="可选，用于企业内部应用场景"
-                    onChange={(event) =>
-                      updateChannel(channel.key, { corpId: event.target.value })
-                    }
-                  />
-                  <p className="text-xs text-muted-foreground">
-                    非必填；当后端按租户或企业身份调用钉钉开放平台时可复用该字段。
-                  </p>
-                </div>
+              <div className="space-y-2">
+                {renderSecretFieldHeader({
+                  id: `${channel.key}-client-secret`,
+                  label: "Client Secret",
+                  hint: buildSecretHint({
+                    value: settings.clientSecret,
+                    clear: settings.clearClientSecret,
+                    hasSaved: savedProvider.hasClientSecret,
+                    masked: savedProvider.clientSecretMasked,
+                    emptyText: "当前未保存 client secret。",
+                    savingText: "已录入新的 client secret，保存后会替换当前配置。",
+                    clearingText: "当前保存的 client secret 将在下次保存时清空。",
+                  }),
+                  action: savedProvider.hasClientSecret ? (
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      disabled={!canEditSettings || !hasLoadedSettings || isSaving}
+                      onClick={() =>
+                        updateChannel(channel.key, {
+                          clientSecret: "",
+                          clearClientSecret: !settings.clearClientSecret,
+                        })
+                      }
+                    >
+                      {settings.clearClientSecret ? "保留现有 Secret" : "清空已保存 Secret"}
+                    </Button>
+                  ) : undefined,
+                })}
+                <Input
+                  id={`${channel.key}-client-secret`}
+                  type="password"
+                  autoComplete="off"
+                  value={settings.clientSecret}
+                  disabled={!canEditSettings || !hasLoadedSettings || isSaving}
+                  placeholder="留空表示保留当前 Secret，输入则替换"
+                  onChange={(event) =>
+                    updateChannel(channel.key, {
+                      clientSecret: event.target.value,
+                      clearClientSecret: false,
+                    })
+                  }
+                />
               </div>
             </section>
           ) : null}
 
+          {channel.key !== "dingtalk" ? (
           <section className="space-y-4 rounded-xl border border-border/60 bg-background/60 p-4">
             <h2 className="text-sm font-semibold text-foreground">安全与鉴权</h2>
 
@@ -942,6 +914,7 @@ export default function ChannelIntegrationSettingsPage() {
               </div>
             ) : null}
           </section>
+          ) : null}
       </>
     )
   }

@@ -16,6 +16,9 @@ from app.execution_gateway.contracts import ExecutionRequest
 from app.schemas.messages import UnifiedMessage
 
 
+MESSAGE_INGRESS_FORBIDDEN_WORKFLOW_IDS = {"__agent_dispatch__", "__direct_agent_fallback__"}
+
+
 def _text(value: object) -> str | None:
     normalized = str(value or "").strip()
     return normalized or None
@@ -231,10 +234,22 @@ class OrchestrationService:
         preview_limit: int,
         now_string: Any,
         clone: Any,
+        tenant_id: str | None = None,
+        tenant_name: str | None = None,
+        security_context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         reception_mode = str(
             route_decision.get("reception_mode") or route_decision.get("receptionMode") or ""
         ).strip() or None
+        request_context = {
+            "channel": message.channel.value,
+            "message_id": str(message.message_id),
+            "platform_user_id": str(message.platform_user_id),
+            "chat_id": str(message.chat_id),
+            "session_id": str(message.session_id or ""),
+            "user_key": str(message.user_key or ""),
+            "detected_lang": message.detected_lang,
+        }
         dispatch_context = {
             "type": "message_dispatch",
             "state": "queued",
@@ -259,7 +274,15 @@ class OrchestrationService:
             "reception_mode": reception_mode,
             "receptionMode": reception_mode,
             "route_decision": clone(route_decision),
+            "request_context": request_context,
         }
+        if tenant_id:
+            dispatch_context["tenant_context"] = {
+                "tenant_id": tenant_id,
+                "tenant_name": tenant_name or f"{tenant_id} 租户",
+            }
+        if isinstance(security_context, dict) and security_context:
+            dispatch_context["security_context"] = clone(security_context)
         execution_plan = route_decision.get("execution_plan") or route_decision.get("executionPlan")
         if isinstance(execution_plan, dict) and execution_plan:
             dispatch_context["execution_plan"] = clone(execution_plan)
@@ -319,6 +342,9 @@ class OrchestrationService:
         state_machine_version: str,
         clone: Any,
         memory_context_lines: Any,
+        tenant_id: str | None = None,
+        tenant_name: str | None = None,
+        security_context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         task_status = "pending" if confirmation_pending else "running"
         task_state_machine = self.build_task_state_machine(
@@ -371,6 +397,9 @@ class OrchestrationService:
             "context_patch_audit": [],
             "state_machine": task_state_machine,
             "result": None,
+            "tenant_id": tenant_id,
+            "tenant_name": tenant_name,
+            "security_context": clone(security_context or {}),
         }
 
     def prepare_message_dispatch_metadata(
@@ -439,6 +468,9 @@ class OrchestrationService:
         clone: Any,
         memory_context_lines: Any,
         memory_step_message: Any,
+        tenant_id: str | None = None,
+        tenant_name: str | None = None,
+        security_context: dict[str, Any] | None = None,
     ) -> MessageTaskArtifacts:
         interaction_mode = _text(
             metadata.route_decision.get("interaction_mode") or metadata.route_decision.get("interactionMode")
@@ -461,6 +493,9 @@ class OrchestrationService:
             preview_limit=preview_limit,
             now_string=now_string,
             clone=clone,
+            tenant_id=tenant_id,
+            tenant_name=tenant_name,
+            security_context=security_context,
         )
         if metadata.confirmation_pending:
             dispatch_context["state"] = "awaiting_confirmation"
@@ -494,6 +529,9 @@ class OrchestrationService:
             state_machine_version=state_machine_version,
             clone=clone,
             memory_context_lines=memory_context_lines,
+            tenant_id=tenant_id,
+            tenant_name=tenant_name,
+            security_context=security_context,
         )
         task_steps = self.create_task_steps(
             task_id=task_id,
@@ -528,14 +566,25 @@ class OrchestrationService:
         workflow_id: str | None,
         route_decision: dict[str, Any],
     ) -> MessageRunLaunchPlan:
+        resolved_workflow_id = _text(
+            workflow_id
+            or route_decision.get("workflow_id")
+            or route_decision.get("workflowId")
+        )
+        if agent_dispatch:
+            raise ValueError("Message ingress launch plan no longer supports agent_dispatch mode")
+        if not resolved_workflow_id:
+            raise ValueError("Message ingress launch plan requires a real workflow_id")
+        if resolved_workflow_id in MESSAGE_INGRESS_FORBIDDEN_WORKFLOW_IDS:
+            raise ValueError("Message ingress launch plan must resolve to a real workflow")
         execution_agent_id = _text(
             route_decision.get("execution_agent_id") or route_decision.get("executionAgentId")
         )
         return MessageRunLaunchPlan(
-            mode="agent_dispatch" if agent_dispatch else "workflow_run",
-            workflow_id=_text(workflow_id),
+            mode="workflow_run",
+            workflow_id=resolved_workflow_id,
             execution_agent_id=execution_agent_id,
-            should_queue_agent_execution=bool(agent_dispatch and not confirmation_pending),
+            should_queue_agent_execution=False,
         )
 
     def apply_confirmation_transition(

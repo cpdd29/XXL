@@ -41,11 +41,26 @@ def resolve_workflow_execution_agent(
         route_seed=route_seed,
     )
 
+
+def resolve_named_execution_agent(
+    binding: str | None,
+    *,
+    expected_type: str | None = None,
+    route_seed: str | None = None,
+) -> dict[str, Any] | None:
+    return workflow_execution_service.resolve_named_execution_agent(
+        binding,
+        expected_type=expected_type,
+        route_seed=route_seed,
+    )
+
+
 __all__ = [
     "AGENT_DISPATCH_WORKFLOW_ID",
     "AGENT_DISPATCH_WORKFLOW_NAME",
     "INTENT_AGENT_TYPE_MAP",
     "resolve_agent_dispatch_execution_agent",
+    "resolve_named_execution_agent",
     "resolve_workflow_execution_agent",
     "select_workflow_candidates_for_message",
 ]

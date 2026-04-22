@@ -112,7 +112,13 @@ function mcpSubmitPayload(form: RegisterMcpPayload, tagsInput: string): Register
   }
 }
 
-export function ToolRegistrationActions() {
+type ToolRegistrationMode = "all" | "skill-only" | "mcp-only"
+
+export function ToolRegistrationActions({
+  mode = "all",
+}: {
+  mode?: ToolRegistrationMode
+}) {
   const [skillDialogOpen, setSkillDialogOpen] = useState(false)
   const [mcpDialogOpen, setMcpDialogOpen] = useState(false)
   const [skillForm, setSkillForm] = useState<RegisterSkillPayload>(initialSkillForm)
@@ -128,6 +134,8 @@ export function ToolRegistrationActions() {
 
   const skillPending = registerSkill.isPending
   const mcpPending = registerMcp.isPending
+  const showSkillAction = mode !== "mcp-only"
+  const showMcpAction = mode !== "skill-only"
   const skillPreview = useMemo(
     () => skillSubmitPayload(skillForm, skillTagsInput, skillCapabilitiesInput),
     [skillCapabilitiesInput, skillForm, skillTagsInput],
@@ -200,47 +208,52 @@ export function ToolRegistrationActions() {
   return (
     <>
       <div className="flex flex-wrap items-center gap-2">
-        <Button
-          variant="outline"
-          size="sm"
-          className="shrink-0"
-          onClick={() => {
-            setSkillError("")
-            setSkillDialogOpen(true)
-          }}
-        >
-          <Plus className="mr-2 size-4" />
-          新增 Skill
-        </Button>
-        <Button
-          variant="outline"
-          size="sm"
-          className="shrink-0"
-          onClick={() => {
-            setMcpError("")
-            setMcpDialogOpen(true)
-          }}
-        >
-          <Plus className="mr-2 size-4" />
-          新增 MCP
-        </Button>
+        {showSkillAction ? (
+          <Button
+            variant="outline"
+            size="sm"
+            className="shrink-0"
+            onClick={() => {
+              setSkillError("")
+              setSkillDialogOpen(true)
+            }}
+          >
+            <Plus className="mr-2 size-4" />
+            新增 Skill
+          </Button>
+        ) : null}
+        {showMcpAction ? (
+          <Button
+            variant="outline"
+            size="sm"
+            className="shrink-0"
+            onClick={() => {
+              setMcpError("")
+              setMcpDialogOpen(true)
+            }}
+          >
+            <Plus className="mr-2 size-4" />
+            新增 MCP
+          </Button>
+        ) : null}
       </div>
 
-      <Dialog
-        open={skillDialogOpen}
-        onOpenChange={(open) => {
-          if (skillPending) return
-          setSkillDialogOpen(open)
-          if (!open) {
-            resetSkillForm()
-          }
-        }}
-      >
-        <DialogContent className="sm:max-w-2xl">
-          <DialogHeader>
-            <DialogTitle>新增 Skill</DialogTitle>
-            <DialogDescription>将新的外接 Skill 接入到外部触手目录。</DialogDescription>
-          </DialogHeader>
+      {showSkillAction ? (
+        <Dialog
+          open={skillDialogOpen}
+          onOpenChange={(open) => {
+            if (skillPending) return
+            setSkillDialogOpen(open)
+            if (!open) {
+              resetSkillForm()
+            }
+          }}
+        >
+          <DialogContent className="sm:max-w-2xl">
+            <DialogHeader>
+              <DialogTitle>新增 Skill</DialogTitle>
+              <DialogDescription>将新的 Skill 接入到主脑能力目录。</DialogDescription>
+            </DialogHeader>
 
           <div className="grid gap-4 py-2 sm:grid-cols-2">
             <div className="space-y-2">
@@ -388,41 +401,43 @@ export function ToolRegistrationActions() {
             </div>
           </div>
 
-          {skillError ? <div className="text-sm text-destructive">{skillError}</div> : null}
+            {skillError ? <div className="text-sm text-destructive">{skillError}</div> : null}
 
-          <DialogFooter>
-            <Button
-              variant="outline"
-              onClick={() => {
-                setSkillDialogOpen(false)
-                resetSkillForm()
-              }}
-              disabled={skillPending}
-            >
-              取消
-            </Button>
-            <Button onClick={() => void handleSubmitSkill()} disabled={skillPending}>
-              {skillPending ? "新增中..." : "确认新增"}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+            <DialogFooter>
+              <Button
+                variant="outline"
+                onClick={() => {
+                  setSkillDialogOpen(false)
+                  resetSkillForm()
+                }}
+                disabled={skillPending}
+              >
+                取消
+              </Button>
+              <Button onClick={() => void handleSubmitSkill()} disabled={skillPending}>
+                {skillPending ? "新增中..." : "确认新增"}
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+      ) : null}
 
-      <Dialog
-        open={mcpDialogOpen}
-        onOpenChange={(open) => {
-          if (mcpPending) return
-          setMcpDialogOpen(open)
-          if (!open) {
-            resetMcpForm()
-          }
-        }}
-      >
-        <DialogContent className="sm:max-w-2xl">
-          <DialogHeader>
-            <DialogTitle>新增 MCP</DialogTitle>
-            <DialogDescription>将新的 MCP 服务能力接入到外部触手目录。</DialogDescription>
-          </DialogHeader>
+      {showMcpAction ? (
+        <Dialog
+          open={mcpDialogOpen}
+          onOpenChange={(open) => {
+            if (mcpPending) return
+            setMcpDialogOpen(open)
+            if (!open) {
+              resetMcpForm()
+            }
+          }}
+        >
+          <DialogContent className="sm:max-w-2xl">
+            <DialogHeader>
+              <DialogTitle>新增 MCP</DialogTitle>
+              <DialogDescription>将新的 MCP 服务能力接入到主脑能力目录。</DialogDescription>
+            </DialogHeader>
 
           <div className="grid gap-4 py-2 sm:grid-cols-2">
             <div className="space-y-2">
@@ -561,25 +576,26 @@ export function ToolRegistrationActions() {
             </div>
           </div>
 
-          {mcpError ? <div className="text-sm text-destructive">{mcpError}</div> : null}
+            {mcpError ? <div className="text-sm text-destructive">{mcpError}</div> : null}
 
-          <DialogFooter>
-            <Button
-              variant="outline"
-              onClick={() => {
-                setMcpDialogOpen(false)
-                resetMcpForm()
-              }}
-              disabled={mcpPending}
-            >
-              取消
-            </Button>
-            <Button onClick={() => void handleSubmitMcp()} disabled={mcpPending}>
-              {mcpPending ? "新增中..." : "确认新增"}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+            <DialogFooter>
+              <Button
+                variant="outline"
+                onClick={() => {
+                  setMcpDialogOpen(false)
+                  resetMcpForm()
+                }}
+                disabled={mcpPending}
+              >
+                取消
+              </Button>
+              <Button onClick={() => void handleSubmitMcp()} disabled={mcpPending}>
+                {mcpPending ? "新增中..." : "确认新增"}
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+      ) : null}
     </>
   )
 }

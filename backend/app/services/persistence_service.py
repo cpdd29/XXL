@@ -33,7 +33,7 @@ from app.db.models import (
 from app.services.agent_config_service import build_agent_config_summary
 from app.db.session import create_engine_for_url, create_session_factory
 from app.services.encryption_service import encryption_service
-from app.services.store import store
+from app.services.store import LEGACY_AGENT_IDS, LEGACY_WORKFLOW_IDS, store
 
 
 logger = logging.getLogger(__name__)
@@ -96,6 +96,16 @@ def _normalize_identifier_list(values: list[str] | tuple[str, ...] | set[str] | 
         seen.add(normalized)
         items.append(normalized)
     return items
+
+
+def _is_legacy_agent_id(agent_id: str | None) -> bool:
+    normalized = str(agent_id or "").strip()
+    return bool(normalized) and normalized in LEGACY_AGENT_IDS
+
+
+def _is_legacy_workflow_id(workflow_id: str | None) -> bool:
+    normalized = str(workflow_id or "").strip()
+    return bool(normalized) and normalized in LEGACY_WORKFLOW_IDS
 
 
 def _extract_job_protocol_snapshot(payload: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -232,6 +242,8 @@ class StatePersistenceService:
     def persist_agent_state(self, *, agent: dict[str, Any]) -> bool:
         if not self.enabled or self._session_factory is None:
             return False
+        if _is_legacy_agent_id(agent.get("id")):
+            return self.delete_agent_state(agent_id=str(agent.get("id") or ""))
 
         try:
             with self._session_factory() as session:
@@ -248,6 +260,8 @@ class StatePersistenceService:
     def persist_workflow_state(self, *, workflow: dict[str, Any]) -> bool:
         if not self.enabled or self._session_factory is None:
             return False
+        if _is_legacy_workflow_id(workflow.get("id")):
+            return self.delete_workflow_state(workflow_id=str(workflow.get("id") or ""))
 
         try:
             with self._session_factory() as session:
@@ -260,6 +274,56 @@ class StatePersistenceService:
         except SQLAlchemyError as exc:
             logger.warning("Failed to persist workflow state: %s", exc)
             return False
+
+    def delete_agent_state(self, *, agent_id: str) -> bool:
+        if not self.enabled or self._session_factory is None:
+            return False
+        normalized_ids = _normalize_identifier_list([agent_id])
+        if not normalized_ids:
+            return False
+        return self.delete_agent_states(agent_ids=normalized_ids) >= 0
+
+    def delete_agent_states(self, *, agent_ids: list[str]) -> int:
+        if not self.enabled or self._session_factory is None:
+            return 0
+
+        normalized_ids = _normalize_identifier_list(agent_ids)
+        if not normalized_ids:
+            return 0
+
+        try:
+            with self._session_factory() as session:
+                deleted_count = self._delete_agents_by_ids(session, normalized_ids)
+                session.commit()
+            return deleted_count
+        except SQLAlchemyError as exc:
+            logger.warning("Failed to delete agent states: %s", exc)
+            return 0
+
+    def delete_workflow_state(self, *, workflow_id: str) -> bool:
+        if not self.enabled or self._session_factory is None:
+            return False
+        normalized_ids = _normalize_identifier_list([workflow_id])
+        if not normalized_ids:
+            return False
+        return self.delete_workflow_states(workflow_ids=normalized_ids) >= 0
+
+    def delete_workflow_states(self, *, workflow_ids: list[str]) -> int:
+        if not self.enabled or self._session_factory is None:
+            return 0
+
+        normalized_ids = _normalize_identifier_list(workflow_ids)
+        if not normalized_ids:
+            return 0
+
+        try:
+            with self._session_factory() as session:
+                deleted_count = self._delete_workflows_by_ids(session, normalized_ids)
+                session.commit()
+            return deleted_count
+        except SQLAlchemyError as exc:
+            logger.warning("Failed to delete workflow states: %s", exc)
+            return 0
 
     def persist_user_state(
         self,
@@ -416,6 +480,7 @@ class StatePersistenceService:
                 return [
                     self._agent_record_to_payload(row)
                     for row in session.scalars(select(AgentRecord).order_by(AgentRecord.sort_index)).all()
+                    if not _is_legacy_agent_id(row.id)
                 ]
         except SQLAlchemyError as exc:
             logger.warning("Failed to load agents from database: %s", exc)
@@ -423,6 +488,8 @@ class StatePersistenceService:
 
     def get_agent(self, agent_id: str) -> dict[str, Any] | None:
         if not self.enabled or self._session_factory is None:
+            return None
+        if _is_legacy_agent_id(agent_id):
             return None
 
         try:
@@ -656,6 +723,7 @@ class StatePersistenceService:
                 return [
                     self._workflow_record_to_payload(row)
                     for row in session.scalars(select(WorkflowRecord).order_by(WorkflowRecord.sort_index)).all()
+                    if not _is_legacy_workflow_id(row.id)
                 ]
         except SQLAlchemyError as exc:
             logger.warning("Failed to load workflows from database: %s", exc)
@@ -663,6 +731,8 @@ class StatePersistenceService:
 
     def get_workflow(self, workflow_id: str) -> dict[str, Any] | None:
         if not self.enabled or self._session_factory is None:
+            return None
+        if _is_legacy_workflow_id(workflow_id):
             return None
 
         try:
@@ -3307,11 +3377,58 @@ class StatePersistenceService:
             "updated_at": row.updated_at,
         }
 
+    def _purge_legacy_runtime_store(self) -> None:
+        purge_runtime = getattr(self.runtime_store, "purge_legacy_runtime_state", None)
+        if callable(purge_runtime):
+            removed = purge_runtime()
+            removed_agents = list(removed.get("agents") or []) if isinstance(removed, dict) else []
+            removed_workflows = list(removed.get("workflows") or []) if isinstance(removed, dict) else []
+            if removed_agents:
+                logger.info(
+                    "Purged legacy agents from runtime store: %s",
+                    ", ".join(removed_agents),
+                )
+            if removed_workflows:
+                logger.info(
+                    "Purged legacy workflows from runtime store: %s",
+                    ", ".join(removed_workflows),
+                )
+            return
+
+        self.runtime_store.agents = [
+            agent
+            for agent in getattr(self.runtime_store, "agents", [])
+            if not _is_legacy_agent_id(agent.get("id"))
+        ]
+        self.runtime_store.workflows = [
+            workflow
+            for workflow in getattr(self.runtime_store, "workflows", [])
+            if not _is_legacy_workflow_id(workflow.get("id"))
+        ]
+        self.runtime_store.workflow_runs = [
+            run
+            for run in getattr(self.runtime_store, "workflow_runs", [])
+            if not _is_legacy_workflow_id(run.get("workflow_id"))
+        ]
+
+    def _purge_legacy_persistence(self, session) -> tuple[int, int]:
+        deleted_agents = self._delete_agents_by_ids(session, list(LEGACY_AGENT_IDS))
+        deleted_workflows = self._delete_workflows_by_ids(session, list(LEGACY_WORKFLOW_IDS))
+        return deleted_agents, deleted_workflows
+
     def _bootstrap_runtime_state(self) -> None:
         if not self.enabled or self._session_factory is None:
             return
 
         with self._session_factory() as session:
+            deleted_agents, deleted_workflows = self._purge_legacy_persistence(session)
+            if deleted_agents or deleted_workflows:
+                session.commit()
+                logger.info(
+                    "Purged legacy registry state during bootstrap: %s agents, %s workflows",
+                    deleted_agents,
+                    deleted_workflows,
+                )
             has_seeded_data = any(
                 session.scalar(select(model.id if hasattr(model, "id") else model.user_id).limit(1))
                 is not None
@@ -3322,6 +3439,7 @@ class StatePersistenceService:
                     session.scalar(select(SystemSettingRecord.key).limit(1)) is not None
                 )
 
+        self._purge_legacy_runtime_store()
         if has_seeded_data:
             self._load_into_runtime_store()
         else:
@@ -3368,6 +3486,7 @@ class StatePersistenceService:
             loaded_agents = [
                 self._agent_record_to_payload(row)
                 for row in session.scalars(select(AgentRecord).order_by(AgentRecord.sort_index)).all()
+                if not _is_legacy_agent_id(row.id)
             ]
             self.runtime_store.agents = loaded_agents
 
@@ -3385,12 +3504,14 @@ class StatePersistenceService:
             loaded_workflows = [
                 self._workflow_record_to_payload(row)
                 for row in session.scalars(select(WorkflowRecord).order_by(WorkflowRecord.sort_index)).all()
+                if not _is_legacy_workflow_id(row.id)
             ]
             self.runtime_store.workflows = loaded_workflows
 
             loaded_runs = [
                 self._workflow_run_record_to_payload(row)
                 for row in session.scalars(select(WorkflowRunRecord).order_by(WorkflowRunRecord.sort_index)).all()
+                if not _is_legacy_workflow_id(row.workflow_id)
             ]
             self.runtime_store.workflow_runs = loaded_runs
 
@@ -3428,6 +3549,7 @@ class StatePersistenceService:
                 for row in session.scalars(select(SystemSettingRecord)).all()
             }
             self.runtime_store.system_settings = loaded_system_settings
+        self._purge_legacy_runtime_store()
 
     def _replace_system_settings(self, session) -> None:
         session.execute(delete(SystemSettingRecord))
@@ -3446,6 +3568,11 @@ class StatePersistenceService:
 
     def _replace_agents(self, session) -> None:
         session.execute(delete(AgentRecord))
+        active_agents = [
+            agent
+            for agent in self.runtime_store.agents
+            if not _is_legacy_agent_id(agent.get("id"))
+        ]
         session.add_all(
             AgentRecord(
                 id=agent["id"],
@@ -3463,7 +3590,7 @@ class StatePersistenceService:
                 success_rate=float(agent["success_rate"]),
                 last_active=str(agent["last_active"]),
             )
-            for index, agent in enumerate(self.runtime_store.agents)
+            for index, agent in enumerate(active_agents)
         )
 
     @staticmethod
@@ -3857,6 +3984,43 @@ class StatePersistenceService:
         row.memory_hits = int(run.get("memory_hits", 0))
         row.warnings = self._encrypt_json_payload(deepcopy(run.get("warnings", [])))
 
+    def _delete_agents_by_ids(self, session, agent_ids: list[str]) -> int:
+        normalized_ids = _normalize_identifier_list(agent_ids)
+        if not normalized_ids:
+            return 0
+
+        session.execute(
+            delete(AgentExecutionJobRecord).where(
+                AgentExecutionJobRecord.execution_agent_id.in_(normalized_ids)
+            )
+        )
+        result = session.execute(delete(AgentRecord).where(AgentRecord.id.in_(normalized_ids)))
+        return int(result.rowcount or 0)
+
+    def _delete_workflows_by_ids(self, session, workflow_ids: list[str]) -> int:
+        normalized_ids = _normalize_identifier_list(workflow_ids)
+        if not normalized_ids:
+            return 0
+
+        run_ids = list(
+            session.scalars(
+                select(WorkflowRunRecord.id).where(WorkflowRunRecord.workflow_id.in_(normalized_ids))
+            ).all()
+        )
+        if run_ids:
+            session.execute(
+                delete(WorkflowDispatchJobRecord).where(WorkflowDispatchJobRecord.run_id.in_(run_ids))
+            )
+            session.execute(
+                delete(WorkflowExecutionJobRecord).where(WorkflowExecutionJobRecord.run_id.in_(run_ids))
+            )
+        session.execute(
+            delete(AgentExecutionJobRecord).where(AgentExecutionJobRecord.workflow_id.in_(normalized_ids))
+        )
+        session.execute(delete(WorkflowRunRecord).where(WorkflowRunRecord.workflow_id.in_(normalized_ids)))
+        result = session.execute(delete(WorkflowRecord).where(WorkflowRecord.id.in_(normalized_ids)))
+        return int(result.rowcount or 0)
+
     def _append_audit_log(self, session, log: dict[str, Any]) -> None:
         log_id = str(log["id"]).strip()
         if not log_id:
@@ -3965,6 +4129,11 @@ class StatePersistenceService:
     def _replace_workflows(self, session) -> None:
         session.execute(delete(WorkflowRunRecord))
         session.execute(delete(WorkflowRecord))
+        active_workflows = [
+            workflow
+            for workflow in self.runtime_store.workflows
+            if not _is_legacy_workflow_id(workflow.get("id"))
+        ]
         session.add_all(
             WorkflowRecord(
                 id=workflow["id"],
@@ -3981,8 +4150,13 @@ class StatePersistenceService:
                 nodes=deepcopy(workflow.get("nodes", [])),
                 edges=deepcopy(workflow.get("edges", [])),
             )
-            for index, workflow in enumerate(self.runtime_store.workflows)
+            for index, workflow in enumerate(active_workflows)
         )
+        active_runs = [
+            run
+            for run in self.runtime_store.workflow_runs
+            if not _is_legacy_workflow_id(run.get("workflow_id"))
+        ]
         session.add_all(
             WorkflowRunRecord(
                 id=run["id"],
@@ -4013,7 +4187,7 @@ class StatePersistenceService:
                 memory_hits=int(run.get("memory_hits", 0)),
                 warnings=self._encrypt_json_payload(deepcopy(run.get("warnings", []))),
             )
-            for index, run in enumerate(self.runtime_store.workflow_runs)
+            for index, run in enumerate(active_runs)
         )
 
     def _replace_users(self, session) -> None:

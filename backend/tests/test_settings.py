@@ -660,6 +660,37 @@ def test_update_agent_api_settings_partial_update_keeps_existing_key(
     assert persisted_setting["payload"]["providers"]["openai"]["api_key"].startswith(ENCRYPTED_TEXT_PREFIX)
 
 
+def test_agent_api_runtime_settings_decrypts_persisted_encrypted_key(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    service = _sqlite_service(tmp_path, InMemoryStore())
+    monkeypatch.setattr(settings_service, "persistence_service", service)
+    service.persist_system_setting(
+        key="agent_api",
+        payload={
+            "providers": {
+                "openapi": {
+                    "enabled": True,
+                    "base_url": "https://example.com/v1",
+                    "model": "gpt-5.4",
+                    "endpoint_path": "/responses",
+                    "api_key": settings_service.encryption_service.encrypt_text("sk-openapi-runtime-9999"),
+                }
+            }
+        },
+        updated_at="2026-04-08T00:00:00+00:00",
+    )
+
+    try:
+        runtime_settings = settings_service.get_agent_api_runtime_settings()
+    finally:
+        service.close()
+
+    assert runtime_settings["providers"]["openapi"]["enabled"] is True
+    assert runtime_settings["providers"]["openapi"]["api_key"] == "sk-openapi-runtime-9999"
+
+
 def test_update_agent_api_settings_can_clear_existing_key(
     tmp_path: Path,
     monkeypatch,

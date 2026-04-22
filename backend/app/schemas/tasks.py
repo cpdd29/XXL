@@ -1,5 +1,7 @@
 from typing import Any
 
+from pydantic import ConfigDict, Field
+
 from app.schemas.base import APIModel
 from app.schemas.messages import MessageRouteDecision
 
@@ -65,14 +67,24 @@ class TaskExecutionTraceEntry(APIModel):
 
 
 class TaskResult(APIModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+        alias_generator=APIModel.model_config.get("alias_generator"),
+        from_attributes=True,
+        extra="allow",
+    )
+
     kind: str
     title: str = ""
     summary: str = ""
     content: str = ""
     text: str | None = None
-    bullets: list[str] = []
-    references: list[TaskResultReference] = []
-    execution_trace: list[TaskExecutionTraceEntry] = []
+    bullets: list[str] = Field(default_factory=list)
+    references: list[TaskResultReference] = Field(default_factory=list)
+    execution_trace: list[TaskExecutionTraceEntry] = Field(default_factory=list)
+    contract_version: str | None = None
+    input_snapshot: dict[str, Any] = Field(default_factory=dict)
+    output_snapshot: dict[str, Any] = Field(default_factory=dict)
 
 
 class Task(APIModel):

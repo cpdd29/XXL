@@ -5,8 +5,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.main import app
-from app.services.mandatory_agent_registry_service import ensure_mandatory_agents_registered
-from app.services import security_service
+from app.services import agent_service, security_service
 from app.services.persistence_service import StatePersistenceService
 from app.services.security_gateway_service import security_gateway_service
 from app.services.store import InMemoryStore, store
@@ -160,15 +159,45 @@ def test_security_report_route_aggregates_recent_logs_and_rules(auth_headers) ->
     assert any(item["verdict"] == "block" for item in body["recentIncidents"])
 
 
-def test_security_guardian_route_returns_local_security_agent(auth_headers) -> None:
-    ensure_mandatory_agents_registered()
+def test_security_guardian_route_returns_local_security_agent(auth_headers, monkeypatch) -> None:
+    class _NoAgentPersistence:
+        enabled = False
+
+        @staticmethod
+        def get_agent(_agent_id: str):
+            return None
+
+        @staticmethod
+        def list_agents():
+            return None
+
+    store.agents = [
+        {
+            "id": "local-security-agent",
+            "name": "安全 Agent",
+            "description": "本地安全审查 Agent",
+            "type": "security",
+            "status": "idle",
+            "enabled": True,
+            "tasks_completed": 0,
+            "tasks_total": 0,
+            "avg_response_time": "--",
+            "tokens_used": 0,
+            "tokens_limit": 0,
+            "success_rate": 0.0,
+            "last_active": "未运行",
+            "config_snapshot": {"status": "loaded", "runtime": {}},
+        }
+    ]
+    monkeypatch.setattr(agent_service, "persistence_service", _NoAgentPersistence())
+
     response = client.get("/api/security/guardian", headers=auth_headers)
 
     assert response.status_code == 200
     body = response.json()
-    assert body["id"] == "security-guardian"
-    assert body["type"] == "security_guardian"
-    assert body["name"] == "Security Guardian"
+    assert body["id"] == "local-security-agent"
+    assert body["type"] == "security"
+    assert body["name"] == "安全 Agent"
     assert body["configSummary"]["status"] in {"loaded", "partial", "missing"}
 
 

@@ -65,9 +65,16 @@ const nodeTypes: NodeTypeItem[] = [
     category: "控制节点",
   },
   {
-    type: "workflow",
+    type: "sub_workflow",
     label: "子工作流节点",
-    description: "调用另一个工作流",
+    description: "在父流程中嵌套执行子流程",
+    icon: <WorkflowIcon className="size-4" />,
+    category: "控制节点",
+  },
+  {
+    type: "trigger_workflow",
+    label: "触发工作流节点",
+    description: "流程内触发另一个工作流",
     icon: <WorkflowIcon className="size-4" />,
     category: "控制节点",
   },

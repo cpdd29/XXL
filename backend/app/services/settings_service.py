@@ -389,8 +389,8 @@ def _normalize_agent_api_provider_settings(
     if clear_api_key:
         api_key = None
     elif has_api_key_field:
-        candidate = _coerce_string(raw_api_key, default="")
-        if candidate:
+        candidate = _normalize_agent_api_key(raw_api_key)
+        if candidate is not None:
             api_key = candidate
 
     return {

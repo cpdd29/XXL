@@ -2,6 +2,35 @@ from __future__ import annotations
 
 from copy import deepcopy
 from datetime import UTC, datetime
+from typing import Any
+
+
+LEGACY_WORKFLOW_IDS = frozenset(
+    {
+        "workflow-1",
+        "mandatory-workflow-external-tentacle-dispatch",
+        "mandatory-workflow-conversation",
+        "mandatory-workflow-security",
+        "mandatory-workflow-workflow-designer",
+        "mandatory-workflow-memory",
+        "mandatory-workflow-module-foundation-general-assistant",
+        "mandatory-workflow-module-foundation-requirement-dispatch",
+        "mandatory-workflow-module-foundation-professional-entry",
+        "mandatory-workflow-module-foundation-free-entry",
+        "mandatory-workflow-professional-delivery-note-export",
+        "mandatory-workflow-delivery-note-export-and-send",
+    }
+)
+
+LEGACY_AGENT_IDS = frozenset(
+    {
+        "security-guardian",
+        "workflow_designer",
+        "memory",
+        "search",
+        "write",
+    }
+)
 
 
 class InMemoryStore:
@@ -649,6 +678,132 @@ class InMemoryStore:
         ]
 
         self.workflow_runs = []
+        self.purge_legacy_runtime_state()
+
+    @staticmethod
+    def _normalize_identifier(value: object) -> str:
+        return str(value or "").strip()
+
+    def _delete_items_by_ids(
+        self,
+        items: list[dict[str, Any]],
+        item_ids: set[str] | frozenset[str],
+    ) -> list[str]:
+        if not items or not item_ids:
+            return []
+
+        removed: list[str] = []
+        retained: list[dict[str, Any]] = []
+        for item in items:
+            item_id = self._normalize_identifier(item.get("id"))
+            if item_id and item_id in item_ids:
+                removed.append(item_id)
+                continue
+            retained.append(item)
+        items[:] = retained
+        return removed
+
+    def delete_agents(self, agent_ids: list[str] | tuple[str, ...] | set[str] | frozenset[str]) -> list[str]:
+        normalized = {
+            self._normalize_identifier(agent_id)
+            for agent_id in agent_ids
+            if self._normalize_identifier(agent_id)
+        }
+        if not normalized:
+            return []
+        return self._delete_items_by_ids(self.agents, normalized)
+
+    def delete_agent(self, agent_id: str) -> bool:
+        return bool(self.delete_agents([agent_id]))
+
+    def delete_workflows(
+        self,
+        workflow_ids: list[str] | tuple[str, ...] | set[str] | frozenset[str],
+    ) -> list[str]:
+        normalized = {
+            self._normalize_identifier(workflow_id)
+            for workflow_id in workflow_ids
+            if self._normalize_identifier(workflow_id)
+        }
+        if not normalized:
+            return []
+        removed = self._delete_items_by_ids(self.workflows, normalized)
+        if removed:
+            self.workflow_runs = [
+                run
+                for run in self.workflow_runs
+                if self._normalize_identifier(run.get("workflow_id")) not in normalized
+            ]
+        return removed
+
+    def delete_workflow(self, workflow_id: str) -> bool:
+        return bool(self.delete_workflows([workflow_id]))
+
+    def _clear_agent_workflow_bindings(
+        self,
+        workflow_ids: list[str] | tuple[str, ...] | set[str] | frozenset[str],
+    ) -> list[str]:
+        normalized = {
+            self._normalize_identifier(workflow_id)
+            for workflow_id in workflow_ids
+            if self._normalize_identifier(workflow_id)
+        }
+        if not normalized:
+            return []
+
+        cleaned_agent_ids: list[str] = []
+        for agent in self.agents:
+            agent_id = self._normalize_identifier(agent.get("id"))
+            if not agent_id:
+                continue
+
+            binding_workflow_id = self._normalize_identifier(agent.get("agent_workflow_id"))
+            snapshot = agent.get("config_snapshot")
+            agent_doc = snapshot.get("agent") if isinstance(snapshot, dict) else None
+            runtime = snapshot.get("runtime") if isinstance(snapshot, dict) else None
+            runtime_binding = (
+                runtime.get("agent_workflow_binding")
+                if isinstance(runtime, dict)
+                else None
+            )
+            snapshot_binding_workflow_id = ""
+            if isinstance(runtime_binding, dict):
+                snapshot_binding_workflow_id = self._normalize_identifier(
+                    runtime_binding.get("agent_workflow_id")
+                )
+            if not snapshot_binding_workflow_id and isinstance(agent_doc, dict):
+                snapshot_binding_workflow_id = self._normalize_identifier(
+                    agent_doc.get("agent_workflow_id")
+                )
+
+            if binding_workflow_id not in normalized and snapshot_binding_workflow_id not in normalized:
+                continue
+
+            agent.pop("agent_workflow_id", None)
+            agent.pop("input_contract", None)
+            agent.pop("output_contract", None)
+            agent.pop("contract_version", None)
+
+            if isinstance(agent_doc, dict):
+                agent_doc.pop("agent_workflow_id", None)
+                agent_doc.pop("input_contract", None)
+                agent_doc.pop("output_contract", None)
+                agent_doc.pop("contract_version", None)
+            if isinstance(runtime, dict):
+                runtime.pop("agent_workflow_binding", None)
+
+            cleaned_agent_ids.append(agent_id)
+
+        return cleaned_agent_ids
+
+    def purge_legacy_runtime_state(self) -> dict[str, list[str]]:
+        removed_agents = self.delete_agents(LEGACY_AGENT_IDS)
+        removed_workflows = self.delete_workflows(LEGACY_WORKFLOW_IDS)
+        self._clear_agent_workflow_bindings(LEGACY_WORKFLOW_IDS)
+        return {
+            "agents": removed_agents,
+            "workflows": removed_workflows,
+        }
 
     @staticmethod
     def now_string() -> str:

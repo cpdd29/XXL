@@ -165,6 +165,7 @@ LEGACY_ROUTING_STRATEGY_WORKFLOW_OR_AGENT_FALLBACK = "_".join(
 LEGACY_ROUTING_STRATEGY_ALIASES = {
     LEGACY_ROUTING_STRATEGY_WORKFLOW_OR_AGENT_FALLBACK: CANONICAL_ROUTING_STRATEGY_WORKFLOW_OR_AGENT_DISPATCH_FALLBACK,
 }
+AGENT_DISPATCH_WORKFLOW_IDS = {"__agent_dispatch__", "__direct_agent_fallback__"}
 
 
 def _normalize_language(value: Any) -> str | None:
@@ -437,6 +438,30 @@ def _resolve_route_decision(task: dict, run: dict) -> dict[str, Any] | None:
     return payload_candidates[0] if payload_candidates else None
 
 
+def _run_allows_runtime_shortcuts(run: dict) -> bool:
+    workflow_id = str(run.get("workflow_id") or "").strip()
+    if workflow_id in AGENT_DISPATCH_WORKFLOW_IDS:
+        return True
+    dispatch_context = dispatch_context_from_run(run) or {}
+    current_node_label = str(
+        dispatch_context.get("current_node_label") or dispatch_context.get("currentNodeLabel") or ""
+    ).strip()
+    if "轻执行闭环" in current_node_label:
+        return True
+
+    execution_engine = str(
+        dispatch_context.get("execution_engine") or dispatch_context.get("executionEngine") or ""
+    ).strip().lower()
+    if execution_engine == "graph_v2":
+        return False
+
+    route_decision = route_decision_from_payload(dispatch_context) or {}
+    workflow_mode = str(
+        route_decision.get("workflow_mode") or route_decision.get("workflowMode") or ""
+    ).strip().lower()
+    return workflow_mode in {"free_workflow", "professional_workflow"}
+
+
 def _resolve_manager_packet(task: dict, run: dict) -> dict[str, Any] | None:
     payload_candidates: list[dict[str, Any]] = []
     dispatch_context = run.get("dispatch_context")
@@ -527,7 +552,19 @@ def _free_workflow_payload(task: dict, run: dict) -> dict[str, Any]:
 
 def _should_use_free_workflow_runtime(task: dict, run: dict) -> bool:
     capabilities = set(_resolve_required_capabilities(task, run))
-    if capabilities & {"task_status_lookup", "task_listing", "weather_lookup"}:
+    route_decision = _resolve_route_decision(task, run) or {}
+    schedule_plan = route_decision.get("schedule_plan") or route_decision.get("schedulePlan")
+    if capabilities & {
+        "task_status_lookup",
+        "task_listing",
+        "weather_lookup",
+        "web_search",
+        "live_information_lookup",
+        "information_retrieval",
+        "schedule_intent_detection",
+    }:
+        return True
+    if isinstance(schedule_plan, dict) and schedule_plan:
         return True
     if capabilities & {"pdf_processing", "document_conversion"}:
         return bool(
@@ -1930,14 +1967,24 @@ class AgentExecutionService:
         fallback_contract: dict[str, Any] | None = None,
         aggregation_contract: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        def _merge_snapshot(existing: Any, fallback: dict[str, Any]) -> dict[str, Any]:
+            if not isinstance(existing, dict):
+                return fallback
+            merged = store.clone(existing)
+            for key, value in fallback.items():
+                if key not in merged or merged.get(key) is None:
+                    merged[key] = value
+            return merged
+
         wrapped = store.clone(result)
-        wrapped["dispatch_contract"] = self._dispatch_contract(
+        dispatch_contract = self._dispatch_contract(
             task=task,
             run=run,
             execution_agent=execution_agent,
             result=wrapped,
             execution_plan=execution_plan,
         )
+        wrapped["dispatch_contract"] = dispatch_contract
         if fallback_contract is not None:
             wrapped["fallback_contract"] = store.clone(fallback_contract)
         elif isinstance(wrapped.get("fallback_contract"), dict):
@@ -1946,6 +1993,40 @@ class AgentExecutionService:
             wrapped["aggregation_contract"] = store.clone(aggregation_contract)
         elif isinstance(wrapped.get("aggregation_contract"), dict):
             wrapped["aggregation_contract"] = store.clone(wrapped["aggregation_contract"])
+        wrapped["contract_version"] = (
+            str(wrapped.get("contract_version") or wrapped.get("contractVersion") or "").strip()
+            or str(dispatch_contract.get("contract_version") or "").strip()
+            or "brain-core-v1"
+        )
+        existing_input_snapshot = wrapped.get("input_snapshot") or wrapped.get("inputSnapshot")
+        wrapped["input_snapshot"] = _merge_snapshot(
+            existing_input_snapshot,
+            {
+                "task_id": str(task.get("id") or "").strip() or None,
+                "workflow_run_id": str(run.get("id") or "").strip() or None,
+                "workflow_id": str(run.get("workflow_id") or "").strip() or None,
+                "request_text": _primary_request_text(task),
+                "workflow_mode": _resolve_workflow_mode(task, run),
+                "interaction_mode": _resolve_interaction_mode(task, run),
+                "execution_agent_id": str((execution_agent or {}).get("id") or "").strip() or None,
+                "execution_agent": str((execution_agent or {}).get("name") or "").strip() or None,
+            },
+        )
+        existing_output_snapshot = wrapped.get("output_snapshot") or wrapped.get("outputSnapshot")
+        wrapped["output_snapshot"] = _merge_snapshot(
+            existing_output_snapshot,
+            {
+                "kind": str(wrapped.get("kind") or "").strip() or None,
+                "title": str(wrapped.get("title") or "").strip() or None,
+                "summary": str(wrapped.get("summary") or "").strip() or None,
+                "content_preview": _truncate_text(
+                    str(wrapped.get("content") or wrapped.get("text") or ""),
+                    limit=200,
+                ),
+                "bullets_count": len(wrapped.get("bullets") or []),
+                "references_count": len(wrapped.get("references") or []),
+            },
+        )
         return wrapped
 
     def build_greeting_result(
@@ -1997,17 +2078,12 @@ class AgentExecutionService:
             return provider_result
 
         references: list[dict[str, Any]] = []
-        if str(manager_packet.get("response_contract") or "") == "clarify_first" and str(
-            manager_packet.get("clarify_question") or ""
-        ).strip():
-            text = str(manager_packet.get("clarify_question") or "").strip()
-        else:
-            text = _chat_fallback_text(
-                request_text=request_text,
-                language=language,
-                context_notes=context_notes,
-                reception_mode=reception_mode,
-            )
+        text = _chat_fallback_text(
+            request_text=request_text,
+            language=language,
+            context_notes=context_notes,
+            reception_mode=reception_mode,
+        )
 
         execution_trace = _execution_trace_entries(
             language=language,
@@ -2694,13 +2770,17 @@ class AgentExecutionService:
                 execution_plan=execution_plan,
             )
         workflow_mode = _resolve_workflow_mode(effective_task, run)
-        if workflow_mode == "free_workflow" and _should_use_free_workflow_runtime(effective_task, run):
+        if (
+            _run_allows_runtime_shortcuts(run)
+            and workflow_mode == "free_workflow"
+            and _should_use_free_workflow_runtime(effective_task, run)
+        ):
             return self._execute_free_workflow(
                 task=effective_task,
                 run=run,
                 execution_agent=execution_agent,
             )
-        if workflow_mode == "professional_workflow":
+        if _run_allows_runtime_shortcuts(run) and workflow_mode == "professional_workflow":
             return self._execute_professional_workflow(
                 task=effective_task,
                 run=run,

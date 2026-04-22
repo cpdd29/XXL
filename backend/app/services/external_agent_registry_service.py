@@ -147,6 +147,23 @@ class ExternalAgentRegistryService:
         )
         return deepcopy(self._agents[normalized["id"]])
 
+    def delete_agent(self, agent_id: str) -> dict[str, Any]:
+        normalized_agent_id = _normalize_text(agent_id)
+        item = self._agents.pop(normalized_agent_id, None)
+        if item is None:
+            raise KeyError(f"External agent '{agent_id}' not found")
+        self._append_registry_audit(
+            action="external_agent_registry.deleted",
+            details=f"id={item['id']}; version={item['version']}; family={item['agent_family']}",
+            metadata={
+                "registry": "external_agent_registry",
+                "agent_id": item["id"],
+                "agent_family": item["agent_family"],
+                "version": item["version"],
+            },
+        )
+        return deepcopy(item)
+
     def list_agents(self, *, include_offline: bool = True) -> list[dict[str, Any]]:
         self.prune_expired()
         items: list[dict[str, Any]] = []
@@ -509,6 +526,27 @@ class ExternalAgentRegistryService:
             else None
         )
         item["routable"] = bool(item.get("enabled", True)) and item["circuit_state"] != "open"
+        return deepcopy(item)
+
+    def set_enabled(self, agent_id: str, *, enabled: bool) -> dict[str, Any]:
+        item = self._agents.get(_normalize_text(agent_id))
+        if item is None:
+            raise KeyError(f"External agent '{agent_id}' not found")
+        item["enabled"] = bool(enabled)
+        if not enabled:
+            item["runtime_status"] = "offline"
+            item["runtime_status_reason"] = "agent_disabled"
+            item["status"] = "offline"
+            item["routable"] = False
+            return deepcopy(item)
+
+        runtime_status = _normalize_text(item.get("runtime_status")).lower() or "online"
+        if runtime_status == "offline" and _normalize_text(item.get("runtime_status_reason")) == "agent_disabled":
+            runtime_status = "online"
+        item["runtime_status"] = runtime_status
+        item["runtime_status_reason"] = "agent_enabled"
+        item["status"] = "idle" if runtime_status == "online" else runtime_status
+        item["routable"] = runtime_status in {"online", "degraded"}
         return deepcopy(item)
 
     def recover_agent(self, agent_id: str) -> dict[str, Any]:

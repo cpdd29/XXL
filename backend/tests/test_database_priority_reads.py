@@ -9970,15 +9970,20 @@ def test_workflow_execution_failure_persists_node_error_history_in_database(
 
     assert payload["status"] == "failed"
     failed_node = next(node for node in payload["nodes"] if node["label"] == "搜索 Agent")
-    assert failed_node["latest_error"] == "选定工作流缺少可用的执行 Agent，任务已终止"
+    assert failed_node["latest_error"] == workflow_execution_service.AGENT_FATAL_FAILURE_USER_MESSAGE
     assert failed_node["error_count"] >= 1
     assert persisted_run is not None
     persisted_node = next(node for node in persisted_run["nodes"] if node["label"] == "搜索 Agent")
-    assert persisted_node["latest_error"] == "选定工作流缺少可用的执行 Agent，任务已终止"
+    assert persisted_node["latest_error"] == workflow_execution_service.AGENT_FATAL_FAILURE_USER_MESSAGE
     assert persisted_node["error_count"] >= 1
     assert any(
-        item["message"] == "选定工作流缺少可用的执行 Agent，任务已终止"
+        item["message"] == workflow_execution_service.AGENT_FATAL_FAILURE_USER_MESSAGE
         for item in persisted_node["error_history"]
+    )
+    assert persisted_run["dispatch_context"]["risk_and_safety"]["title"] == "风险与安全"
+    assert (
+        persisted_run["dispatch_context"]["risk_and_safety"]["summary"]
+        == workflow_execution_service.AGENT_FATAL_FAILURE_USER_MESSAGE
     )
 
 
@@ -10106,17 +10111,22 @@ def test_workflow_execution_tick_rejects_missing_database_execution_agent_over_s
 
     assert payload["status"] == "failed"
     assert any(
-        item["message"] == "选定工作流缺少可用的执行 Agent，任务已终止"
+        item["message"] == workflow_execution_service.AGENT_FATAL_FAILURE_USER_MESSAGE
         for item in payload["logs"]
     )
     assert persisted_run is not None
     assert any(
-        item["message"] == "选定工作流缺少可用的执行 Agent，任务已终止"
+        item["message"] == workflow_execution_service.AGENT_FATAL_FAILURE_USER_MESSAGE
         for item in persisted_run["logs"]
     )
     assert persisted_steps is not None
     assert persisted_steps[0]["status"] == "failed"
-    assert persisted_steps[0]["message"] == "选定工作流缺少可用的执行 Agent，任务已终止"
+    assert persisted_steps[0]["message"] == workflow_execution_service.AGENT_FATAL_FAILURE_USER_MESSAGE
+    assert persisted_run["dispatch_context"]["risk_and_safety"]["title"] == "风险与安全"
+    assert (
+        persisted_run["dispatch_context"]["risk_and_safety"]["summary"]
+        == workflow_execution_service.AGENT_FATAL_FAILURE_USER_MESSAGE
+    )
 
 
 def test_workflow_execution_tick_updates_database_agent_runtime_stats(

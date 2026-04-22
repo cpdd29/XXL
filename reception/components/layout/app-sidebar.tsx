@@ -59,7 +59,7 @@ const navSections: NavSection[] = [
         permission: "workflows:read",
       },
       {
-        title: "skill/mcp 接入",
+        title: "SKILL/MCP",
         href: "/tools",
         icon: Wrench,
         permission: "tool_sources:read",

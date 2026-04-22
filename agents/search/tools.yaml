@@ -1,0 +1,187 @@
+policy:
+  execution_scope: "read_only"
+  direct_external_execution: false
+  hidden_tool_access: false
+  publish_or_execute: true
+  runtime_governed_execution: true
+  escalation_targets:
+    - "professional_workflow"
+  escalation_when:
+    - "requires_permission"
+    - "enterprise_system_access"
+    - "crm_data_access"
+    - "order_data_access"
+    - "system_write_operation"
+    - "notification_delivery"
+    - "approval_required"
+    - "long_running_schedule_write"
+tools:
+  - name: "search_light_execution_skill"
+    type: "skill"
+    provider: "internal"
+    enabled: true
+    description: "项目定制的轻闭环 skill，统一判断检索、轻量文件处理、定时识别和升级分流。"
+    tags:
+      - "search-light-execution"
+      - "free-workflow"
+      - "agent"
+    scope: "local_control_plane"
+    mode: "orchestrated"
+    purpose: "作为搜索/轻执行 Agent 的小闭环中枢，优先低成本闭环，再决定是否升级。"
+    runtime_sources:
+      - "internal-skills"
+    capability_bindings:
+      - "web_search"
+      - "live_information_lookup"
+      - "information_retrieval"
+      - "weather_lookup"
+      - "task_status_lookup"
+      - "task_listing"
+      - "pdf_processing"
+      - "document_conversion"
+      - "schedule_intent_detection"
+      - "workflow_upgrade_assessment"
+  - name: "web_search"
+    type: "mcp"
+    provider: "mcp-http"
+    enabled: true
+    description: "运行时检索公开资料与实时信息，适用于需要来源的轻量查询。"
+    tags:
+      - "search"
+      - "live_information_lookup"
+      - "fact_checking"
+      - "agent"
+    scope: "runtime_governed"
+    mode: "read_only"
+    purpose: "补齐最新信息、公开资料和可引用来源。"
+    runtime_sources:
+      - "registered-mcp"
+      - "local-mcp-services"
+    capability_bindings:
+      - "web_search"
+      - "live_information_lookup"
+      - "research"
+      - "fact_checking"
+  - name: "weather_lookup"
+    type: "mcp"
+    provider: "mcp-http"
+    enabled: true
+    description: "查询天气与预报信息，适用于轻量实时问答。"
+    tags:
+      - "weather"
+      - "live_information_lookup"
+      - "agent"
+    scope: "runtime_governed"
+    mode: "read_only"
+    purpose: "返回规范化天气结果，不扩展为重型调度。"
+    runtime_sources:
+      - "registered-mcp"
+      - "local-mcp-services"
+    capability_bindings:
+      - "weather_lookup"
+      - "live_information_lookup"
+  - name: "pdf_read"
+    type: "mcp"
+    provider: "mcp-http"
+    enabled: true
+    description: "读取已提供 PDF 的正文与基础结构。"
+    tags:
+      - "pdf"
+      - "file"
+      - "agent"
+    scope: "runtime_governed"
+    mode: "read_only"
+    purpose: "为轻量文件理解准备文本内容。"
+    runtime_sources:
+      - "local-mcp-services"
+    capability_bindings:
+      - "pdf_processing"
+  - name: "pdf_summary"
+    type: "mcp"
+    provider: "mcp-http"
+    enabled: true
+    description: "对已提供 PDF 生成轻量摘要。"
+    tags:
+      - "pdf"
+      - "summary"
+      - "file"
+      - "agent"
+    scope: "runtime_governed"
+    mode: "read_only"
+    purpose: "处理轻量文档摘要，不扩展成正式写作交付。"
+    runtime_sources:
+      - "local-mcp-services"
+    capability_bindings:
+      - "pdf_processing"
+  - name: "pdf_to_docx"
+    type: "mcp"
+    provider: "mcp-http"
+    enabled: true
+    description: "把已提供 PDF 转成 DOCX，适用于轻量格式转换。"
+    tags:
+      - "pdf"
+      - "conversion"
+      - "file"
+      - "agent"
+    scope: "runtime_governed"
+    mode: "read_only"
+    purpose: "完成轻量文档格式转换，不触发外部派发。"
+    runtime_sources:
+      - "local-mcp-services"
+    capability_bindings:
+      - "document_conversion"
+      - "pdf_processing"
+  - name: "task_status_skill"
+    type: "skill"
+    provider: "internal"
+    enabled: true
+    description: "读取当前进行中任务的状态快照。"
+    tags:
+      - "task"
+      - "status"
+      - "readonly-retained"
+      - "agent"
+    scope: "local_control_plane"
+    mode: "read_only"
+    purpose: "回答当前任务状态查询，不进入专业派工。"
+    runtime_sources:
+      - "internal-skills"
+    capability_bindings:
+      - "task_status_lookup"
+      - "task_listing"
+  - name: "task_list_skill"
+    type: "skill"
+    provider: "internal"
+    enabled: true
+    description: "列出最近任务或当前任务清单。"
+    tags:
+      - "task"
+      - "list"
+      - "readonly-retained"
+      - "agent"
+    scope: "local_control_plane"
+    mode: "read_only"
+    purpose: "回答任务列表查询，不做任务改写。"
+    runtime_sources:
+      - "internal-skills"
+    capability_bindings:
+      - "task_listing"
+      - "task_status_lookup"
+mcp:
+  - source: "registered-mcp"
+    tool_names:
+      - "web_search"
+      - "weather_lookup"
+  - source: "local-mcp-services"
+    tool_names:
+      - "web_search"
+      - "weather_lookup"
+      - "pdf_read"
+      - "pdf_summary"
+      - "pdf_to_docx"
+skills:
+  - source: "internal"
+    ability_names:
+      - "search_light_execution_skill"
+      - "task_status_skill"
+      - "task_list_skill"

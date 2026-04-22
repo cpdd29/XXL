@@ -10,6 +10,29 @@ from app.brain_core.routing.rules import target_agent_name
 from app.brain_core.routing.service import RoutingService
 
 
+def _ensure_workflow_contract(
+    workflow: dict[str, Any] | None,
+    route_decision: dict[str, Any],
+) -> dict[str, Any]:
+    if isinstance(workflow, dict):
+        workflow_id = str(workflow.get("id") or "").strip()
+        workflow_name = str(workflow.get("name") or "").strip()
+        if workflow_id:
+            return {
+                "id": workflow_id,
+                "name": workflow_name or alias_text(route_decision, "workflow_name", "workflowName") or workflow_id,
+            }
+
+    workflow_id = alias_text(route_decision, "workflow_id", "workflowId")
+    workflow_name = alias_text(route_decision, "workflow_name", "workflowName")
+    if not workflow_id:
+        raise ValueError("Message dispatch routing must resolve a real workflow_id")
+    return {
+        "id": workflow_id,
+        "name": workflow_name or workflow_id,
+    }
+
+
 @dataclass(slots=True)
 class BrainDispatchPlan:
     reception: ReceptionPayload
@@ -52,6 +75,7 @@ class BrainCoordinatorService:
         route_message = str(route_result.get("route_message") or route_decision.get("route_message") or "").strip()
         interaction_mode = alias_text(route_decision, "interaction_mode", "interactionMode") or "task"
         reception_mode = alias_text(route_decision, "reception_mode", "receptionMode")
+        workflow = _ensure_workflow_contract(route_result.get("workflow"), route_decision)
         execution_agent_name = str(
             alias_text(route_decision, "execution_agent", "executionAgent") or target_agent_name(intent)
         ).strip() or target_agent_name(intent)
@@ -66,22 +90,21 @@ class BrainCoordinatorService:
         ).to_dict()
         brain_dispatch_summary = self._build_brain_dispatch_summary(
             intent=intent,
-            workflow=route_result.get("workflow"),
+            workflow=workflow,
             route_decision=route_decision,
             manager_packet=manager_packet,
-            agent_dispatch=route_result.get("workflow") is None,
             execution_agent_name=execution_agent_name,
         )
 
         return BrainDispatchPlan(
             reception=reception,
             intent=intent,
-            workflow=route_result.get("workflow"),
+            workflow=workflow,
             route_message=route_message,
             route_decision=route_decision,
             interaction_mode=interaction_mode,
             reception_mode=reception_mode,
-            agent_dispatch=route_result.get("workflow") is None,
+            agent_dispatch=False,
             execution_agent_name=execution_agent_name,
             manager_packet=manager_packet,
             brain_dispatch_summary=brain_dispatch_summary,
@@ -94,7 +117,6 @@ class BrainCoordinatorService:
         workflow: dict[str, Any] | None,
         route_decision: dict[str, Any],
         manager_packet: dict[str, Any],
-        agent_dispatch: bool,
         execution_agent_name: str,
     ) -> dict[str, Any]:
         workflow_name = str(
@@ -114,14 +136,14 @@ class BrainCoordinatorService:
         route_rationale = alias_dict(route_decision, "route_rationale", "routeRationale") or {}
         approval_required = bool(alias_bool(route_decision, "approval_required", "approvalRequired"))
         clarify_required = bool(manager_packet.get("clarify_required"))
-        dispatch_mode = "agent_dispatch" if agent_dispatch else "workflow_run"
-        dispatch_type = "agent_dispatch" if agent_dispatch else "workflow_run"
-        dispatch_type_legacy = "direct_agent" if agent_dispatch else "workflow_run"
-        dispatch_target = execution_agent_name if agent_dispatch else (workflow_name or execution_agent_name)
+        dispatch_mode = "workflow_run"
+        dispatch_type = "workflow_run"
+        dispatch_type_legacy = "workflow_run"
+        dispatch_target = workflow_name or execution_agent_name
         summary_line = (
             f"项目经理 {manager_action or '完成分发'}"
             f" -> 路由 {workflow_mode or interaction_mode or 'unknown'}"
-            f" -> {'直达' if agent_dispatch else '编排'} {dispatch_target or 'unknown'}"
+            f" -> 编排 {dispatch_target or 'unknown'}"
         )
         return {
             "intent": intent,

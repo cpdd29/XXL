@@ -6,10 +6,12 @@ from app.core.authz import require_authenticated_user, require_permission
 from app.schemas.agents import (
     Agent,
     AgentActionResponse,
+    AgentEnabledRequest,
     BrainSkillActionResponse,
     BrainSkillDeleteResponse,
     BrainSkillListResponse,
     BrainSkillUploadRequest,
+    AgentDeleteResponse,
     AgentConfigRequest,
     AgentHeartbeatRequest,
     AgentListResponse,
@@ -17,10 +19,12 @@ from app.schemas.agents import (
 from app.services.brain_skill_service import brain_skill_service
 from app.services.agent_service import (
     create_agent,
+    delete_agent,
     get_agent,
     list_agents,
     reload_agent,
     report_agent_heartbeat,
+    set_agent_enabled,
     update_agent_config,
 )
 from app.services.control_plane_audit_service import append_control_plane_audit_log
@@ -54,7 +58,7 @@ def create_agent_route(
     payload: AgentConfigRequest,
     current_user: dict[str, Any] = Depends(require_authenticated_user),
 ) -> AgentActionResponse:
-    response = AgentActionResponse(**create_agent(payload.model_dump(exclude_none=True)))
+    response = AgentActionResponse(**create_agent(payload.model_dump(exclude_unset=True)))
     append_control_plane_audit_log(
         action="agent.created",
         user=_operator_identity(current_user),
@@ -111,6 +115,44 @@ def delete_brain_skill_route(
     return response
 
 
+@router.delete(
+    "/{agent_id}",
+    response_model=AgentDeleteResponse,
+)
+def delete_agent_route(
+    agent_id: str,
+    current_user: dict[str, Any] = Depends(require_authenticated_user),
+) -> AgentDeleteResponse:
+    response = AgentDeleteResponse(**delete_agent(agent_id))
+    append_control_plane_audit_log(
+        action="agent.deleted",
+        user=_operator_identity(current_user),
+        resource=f"agent.{response.agent_id}",
+        details=f"删除 Agent {response.agent_id}",
+    )
+    return response
+
+
+@router.put(
+    "/{agent_id}/enabled",
+    response_model=AgentActionResponse,
+    dependencies=[Depends(require_permission("agents:reload"))],
+)
+def set_agent_enabled_route(
+    agent_id: str,
+    payload: AgentEnabledRequest,
+    current_user: dict[str, Any] = Depends(require_authenticated_user),
+) -> AgentActionResponse:
+    response = AgentActionResponse(**set_agent_enabled(agent_id, enabled=payload.enabled))
+    append_control_plane_audit_log(
+        action="agent.enabled.updated",
+        user=_operator_identity(current_user),
+        resource=f"agent.{agent_id}",
+        details=f"设置 Agent 启用状态为 {payload.enabled}",
+    )
+    return response
+
+
 @router.get(
     "/{agent_id}/status",
     response_model=Agent,
@@ -130,7 +172,7 @@ def update_agent_config_route(
     payload: AgentConfigRequest,
     current_user: dict[str, Any] = Depends(require_authenticated_user),
 ) -> AgentActionResponse:
-    response = AgentActionResponse(**update_agent_config(agent_id, payload.model_dump(exclude_none=True)))
+    response = AgentActionResponse(**update_agent_config(agent_id, payload.model_dump(exclude_unset=True)))
     append_control_plane_audit_log(
         action="agent.config.updated",
         user=_operator_identity(current_user),

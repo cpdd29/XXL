@@ -1,0 +1,23 @@
+policy:
+  execution_scope: "read_only"
+  direct_external_execution: false
+  hidden_tool_access: false
+  publish_or_execute: false
+tools:
+  - name: "professional_knowledge_reader"
+    scope: "local_control_plane"
+    mode: "read_only"
+    purpose: "读取系统内专业知识库摘要。"
+  - name: "professional_process_reader"
+    scope: "local_control_plane"
+    mode: "read_only"
+    purpose: "读取系统内专业流程说明与步骤摘要。"
+  - name: "web_search_reader"
+    scope: "runtime_governed"
+    mode: "read_only"
+    purpose: "执行公开资料联网查询并返回可引用结果。"
+  - name: "response_formatter"
+    scope: "local_control_plane"
+    mode: "read_only"
+    purpose: "把查询结果整理成可直接交付的答复。"
+mcp: []

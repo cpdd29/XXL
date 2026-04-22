@@ -7,6 +7,8 @@ from fastapi import HTTPException, status
 
 from app.brain_core.routing import planner, rules
 from app.services import execution_directory_service
+from app.services.mandatory_workflow_registry_service import FOUNDATION_BRAIN_WORKFLOW_ID
+from app.services.store import LEGACY_WORKFLOW_IDS as REMOVED_WORKFLOW_IDS
 
 
 def _normalize_text(value: object) -> str:
@@ -27,6 +29,11 @@ ROUTING_STRATEGY_CHAT_DIRECT_AGENT_ALIAS = "chat_direct_agent"
 ROUTING_STRATEGY_DYNAMIC_MULTI_AGENT_DISPATCH = "dynamic_multi_agent_dispatch"
 ROUTING_STRATEGY_WORKFLOW_OR_AGENT_DISPATCH_FALLBACK = "workflow_or_agent_dispatch_fallback"
 ROUTING_STRATEGY_WORKFLOW_OR_DIRECT_AGENT_FALLBACK_ALIAS = "workflow_or_direct_agent_fallback"
+ROUTING_STRATEGY_WORKFLOW_ONLY_ENFORCED = "workflow_only_enforced"
+FORCE_WORKFLOW_GRAPH_EXECUTION = True
+WORKFLOW_ONLY_PREFERRED_WORKFLOW_IDS = (
+    FOUNDATION_BRAIN_WORKFLOW_ID,
+)
 
 ROUTE_DECISION_ALIAS_MAP = {
     "workflow_id": "workflowId",
@@ -105,6 +112,120 @@ def _ensure_dict(value: Any) -> dict[str, Any]:
     return {}
 
 
+def _workflow_id(workflow: dict[str, Any] | None) -> str:
+    if not isinstance(workflow, dict):
+        return ""
+    return str(workflow.get("id") or "").strip()
+
+
+def _workflow_name(workflow: dict[str, Any] | None) -> str:
+    if not isinstance(workflow, dict):
+        return ""
+    return str(workflow.get("name") or "").strip()
+
+
+def _is_legacy_workflow_id(value: object) -> bool:
+    return str(value or "").strip() in REMOVED_WORKFLOW_IDS
+
+
+def _preferred_workflow_candidate(
+    workflow_candidates: list[tuple[dict[str, Any], str]],
+) -> tuple[dict[str, Any], str] | None:
+    eligible_candidates = [
+        (candidate_workflow, route_message)
+        for candidate_workflow, route_message in workflow_candidates
+        if not _is_legacy_workflow_id(_workflow_id(candidate_workflow))
+    ]
+    if not eligible_candidates:
+        return None
+    for workflow_id in WORKFLOW_ONLY_PREFERRED_WORKFLOW_IDS:
+        for candidate_workflow, route_message in eligible_candidates:
+            if _workflow_id(candidate_workflow) == workflow_id:
+                return candidate_workflow, route_message
+    return eligible_candidates[0]
+
+
+def _prioritize_workflow_candidates(
+    workflow_candidates: list[tuple[dict[str, Any], str]],
+) -> list[tuple[dict[str, Any], str]]:
+    preferred_candidate = _preferred_workflow_candidate(workflow_candidates)
+    if preferred_candidate is None:
+        return workflow_candidates
+
+    preferred_workflow_id = _workflow_id(preferred_candidate[0])
+    if preferred_workflow_id not in WORKFLOW_ONLY_PREFERRED_WORKFLOW_IDS:
+        return workflow_candidates
+
+    return [
+        preferred_candidate,
+        *[
+            item
+            for item in workflow_candidates
+            if _workflow_id(item[0]) != preferred_workflow_id
+        ],
+    ]
+
+
+def _preferred_registered_workflow(items: list[dict[str, Any]]) -> dict[str, Any] | None:
+    if not items:
+        return None
+    active_items = [
+        item
+        for item in items
+        if str(item.get("status") or "").strip().lower() in {"", "active", "running"}
+    ]
+    candidates = [
+        item
+        for item in (active_items or items)
+        if not _is_legacy_workflow_id(_workflow_id(item))
+    ]
+    if not candidates:
+        return None
+    for workflow_id in WORKFLOW_ONLY_PREFERRED_WORKFLOW_IDS:
+        for item in candidates:
+            if _workflow_id(item) == workflow_id:
+                return item
+    return candidates[0]
+
+
+def _build_workflow_only_route_message(
+    *,
+    intent: str,
+    workflow: dict[str, Any],
+    base_route_message: str | None = None,
+    no_workflow_available: bool = False,
+    skipped_workflows: list[dict[str, str]] | None = None,
+) -> str:
+    if base_route_message:
+        route_message = f"{base_route_message}；渠道入口已强制保持 workflow-only"
+    else:
+        recovery_reason = "未找到可用工作流候选" if no_workflow_available else "工作流候选当前不可执行"
+        route_message = (
+            f"已识别意图: {intent}；{recovery_reason}；已收口到工作流主链: {_workflow_name(workflow) or _workflow_id(workflow)}"
+        )
+    skipped = [
+        str(item.get("workflow_name") or "").strip()
+        for item in (skipped_workflows or [])
+        if isinstance(item, dict)
+    ]
+    skipped = [item for item in skipped if item]
+    if skipped:
+        route_message = f"{route_message}；已跳过不可执行工作流: {', '.join(skipped)}"
+    return route_message
+
+
+def _resolve_workflow_only_fallback(
+    *,
+    intent: str,
+    workflow_candidates: list[tuple[dict[str, Any], str]],
+) -> tuple[dict[str, Any] | None, str | None]:
+    preferred_candidate = _preferred_workflow_candidate(workflow_candidates)
+    if preferred_candidate is not None:
+        return preferred_candidate
+
+    return None, None
+
+
 def _workflow_declares_execution_targets(workflow: dict[str, Any]) -> bool:
     if any(str(item).strip() for item in _ensure_list(workflow.get("agent_bindings"))):
         return True
@@ -118,10 +239,70 @@ def _workflow_declares_execution_targets(workflow: dict[str, Any]) -> bool:
     return False
 
 
+def _workflow_has_deferred_execution_target(workflow: dict[str, Any]) -> bool:
+    for node in _ensure_list(workflow.get("nodes")):
+        if not isinstance(node, dict):
+            continue
+        node_type = str(node.get("type") or "").strip().lower()
+        if node_type in {"workflow", "sub_workflow", "trigger_workflow"} and str(
+            node.get("workflow_id")
+            or node.get("workflowId")
+            or node.get("sub_workflow_id")
+            or node.get("subWorkflowId")
+            or node.get("target_workflow_id")
+            or node.get("targetWorkflowId")
+            or ""
+        ).strip():
+            return True
+        if node_type == "tool" and str(node.get("tool_id") or node.get("toolId") or "").strip():
+            return True
+    return False
+
+def _build_workflow_only_execution_support(
+    *,
+    intent: str,
+    base_support: dict[str, Any] | None = None,
+    no_workflow_available: bool = False,
+    skipped_workflows: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    support = _ensure_dict(base_support)
+    warnings = [
+        str(item).strip()
+        for item in _ensure_list(support.get("warnings"))
+        if str(item).strip()
+    ]
+    if no_workflow_available and "workflow_candidates_unavailable" not in warnings:
+        warnings.append("workflow_candidates_unavailable")
+    if _ensure_list(skipped_workflows) and "workflow_only_fallback" not in warnings:
+        warnings.append("workflow_only_fallback")
+    return {
+        "supports_intent": (
+            support.get("supports_intent")
+            if isinstance(support.get("supports_intent"), bool)
+            else True
+        ),
+        "support_source": str(support.get("support_source") or "workflow_only_fallback"),
+        "supported_intents": [
+            str(item).strip()
+            for item in _ensure_list(support.get("supported_intents"))
+            if str(item).strip()
+        ]
+        or [intent],
+        "capabilities": [
+            str(item).strip()
+            for item in _ensure_list(support.get("capabilities"))
+            if str(item).strip()
+        ],
+        "warnings": warnings,
+    }
+
+
 def _fallback_mode(route_decision: dict[str, Any]) -> str:
     routing_strategy = _canonical_routing_strategy(_route_value(route_decision, "routing_strategy"))
     if routing_strategy == ROUTING_STRATEGY_WORKFLOW_OR_AGENT_DISPATCH_FALLBACK:
         return "agent_dispatch_fallback"
+    if routing_strategy == ROUTING_STRATEGY_WORKFLOW_ONLY_ENFORCED:
+        return "workflow_recovery"
     if routing_strategy == ROUTING_STRATEGY_DYNAMIC_MULTI_AGENT_DISPATCH:
         return "planner_recovery"
     if str(_route_value(route_decision, "workflow_mode") or "").strip().lower() == "professional_workflow":
@@ -155,9 +336,17 @@ def _build_route_rationale(route_decision: dict[str, Any]) -> dict[str, Any]:
 def _build_fallback_policy(route_decision: dict[str, Any], execution_plan: dict[str, Any]) -> dict[str, Any]:
     fallback_mode = _fallback_mode(route_decision)
     workflow_mode = str(_route_value(route_decision, "workflow_mode") or "").strip().lower()
+    workflow_id = str(_route_value(route_decision, "workflow_id") or "").strip()
+    workflow_graph_enforced = (
+        FORCE_WORKFLOW_GRAPH_EXECUTION
+        and workflow_id not in {execution_directory_service.AGENT_DISPATCH_WORKFLOW_ID, "__direct_agent_fallback__"}
+    )
     fallback_target = (
         str(_route_value(route_decision, "execution_agent") or "").strip() or None
         if fallback_mode == "agent_dispatch_fallback"
+        else str(_route_value(route_decision, "workflow_name") or _route_value(route_decision, "workflow_id") or "").strip()
+        or None
+        if fallback_mode == "workflow_recovery"
         else "user_confirmation"
         if fallback_mode == "approval_gate"
         else "master_bot_planner"
@@ -168,13 +357,17 @@ def _build_fallback_policy(route_decision: dict[str, Any], execution_plan: dict[
         "mode": fallback_mode,
         "target": fallback_target,
         "on_failure": (
-            "retry_or_fail_terminal"
+            "human_handoff"
+            if workflow_graph_enforced
+            else "retry_or_fail_terminal"
             if execution_plan.get("plan_type") == "multi_agent"
             else "direct_fail"
         ),
         "summary": (
             "Workflow candidates unavailable; fallback to agent dispatch"
             if fallback_mode == "agent_dispatch_fallback"
+            else "Workflow candidates unavailable; recovered to mandatory workflow chain"
+            if fallback_mode == "workflow_recovery"
             else "Professional workflow waits for user confirmation"
             if fallback_mode == "approval_gate"
             else "Planner can retry or degrade to single-agent execution"
@@ -245,119 +438,15 @@ class RoutingService:
             if exc.status_code != status.HTTP_404_NOT_FOUND or exc.detail != "Workflow not found":
                 raise
             no_workflow_available = True
-
-        if interaction_mode == "chat" and not workflow_candidates:
-            chat_agent_intent, execution_agent, execution_support = planner.resolve_chat_execution_agent(intent)
-            execution_agent_name = (
-                str(execution_agent.get("name") or "").strip()
-                or rules.target_agent_name(chat_agent_intent)
-            )
-            route_message = f"已识别为接待式对话；直接交由对话 Agent 回复: {execution_agent_name}"
-            route_decision = {
-                "intent": intent,
-                "workflow_id": execution_directory_service.AGENT_DISPATCH_WORKFLOW_ID,
-                "workflow_name": execution_directory_service.AGENT_DISPATCH_WORKFLOW_NAME,
-                "execution_agent_id": str(execution_agent.get("id") or "").strip() or None,
-                "execution_agent": execution_agent_name,
-                "selected_by_message_trigger": False,
-                "route_message": route_message,
-                "intent_confidence": intent_assessment["confidence"],
-                "intent_scores": intent_assessment["scores"],
-                "intent_reasons": intent_assessment["reasons"],
-                "candidate_workflows": [],
-                "skipped_workflows": [],
-                "routing_strategy": ROUTING_STRATEGY_CHAT_AGENT_DISPATCH,
-                "interaction_mode": interaction_mode,
-                "interactionMode": interaction_mode,
-                "reception_mode": reception_mode,
-                "receptionMode": reception_mode,
-                "execution_support": {
-                    **execution_support,
-                    "chat_agent_intent": chat_agent_intent,
-                },
-            }
-            route_decision = self.normalize_route_decision(
-                rules.enrich_route_decision_with_workflow_mode(
-                    route_decision,
-                    text=text,
-                    intent=intent,
-                    interaction_mode=interaction_mode,
-                    reception_mode=reception_mode,
-                ),
-                route_message=route_message,
-                metadata=metadata,
-            )
-            return {
-                "intent": intent,
-                "workflow": None,
-                "route_message": route_message,
-                "route_decision": route_decision,
-            }
+        workflow_candidates = _prioritize_workflow_candidates(workflow_candidates)
 
         dynamic_execution_plan = planner.build_dynamic_execution_plan(text, intent)
+        dynamic_execution_route_message = ""
         if dynamic_execution_plan is not None:
-            execution_steps = dynamic_execution_plan["steps"]
-            execution_agent_name = " + ".join(
-                str(step.get("execution_agent") or "").strip()
-                for step in execution_steps
-                if str(step.get("execution_agent") or "").strip()
+            dynamic_execution_route_message = (
+                f"检测到复合任务；预生成 Master Bot 动态编排"
+                f" ({dynamic_execution_plan['coordination_mode']})：{dynamic_execution_plan['summary']}"
             )
-            route_message = (
-                f"已识别意图: {intent}；检测到复合任务；"
-                f"已启用 Master Bot 动态编排 ({dynamic_execution_plan['coordination_mode']})："
-                f"{dynamic_execution_plan['summary']}"
-            )
-            route_decision = {
-                "intent": intent,
-                "workflow_id": execution_directory_service.AGENT_DISPATCH_WORKFLOW_ID,
-                "workflow_name": execution_directory_service.AGENT_DISPATCH_WORKFLOW_NAME,
-                "execution_agent_id": execution_steps[0].get("execution_agent_id"),
-                "execution_agent": execution_agent_name or "Master Bot Planner",
-                "execution_plan": dynamic_execution_plan,
-                "selected_by_message_trigger": False,
-                "route_message": route_message,
-                "intent_confidence": intent_assessment["confidence"],
-                "intent_scores": intent_assessment["scores"],
-                "intent_reasons": intent_assessment["reasons"],
-                "candidate_workflows": [],
-                "skipped_workflows": [],
-                "routing_strategy": ROUTING_STRATEGY_DYNAMIC_MULTI_AGENT_DISPATCH,
-                "interaction_mode": interaction_mode,
-                "interactionMode": interaction_mode,
-                "reception_mode": reception_mode,
-                "receptionMode": reception_mode,
-                "execution_support": {
-                    "mode": "multi_agent",
-                    "coordination_mode": dynamic_execution_plan["coordination_mode"],
-                    "planned_agent_count": dynamic_execution_plan["planned_agent_count"],
-                    "agents": [
-                        {
-                            "intent": step["intent"],
-                            "execution_agent_id": step.get("execution_agent_id"),
-                            "execution_agent": step.get("execution_agent"),
-                            "agent_type": step.get("agent_type"),
-                        }
-                        for step in execution_steps
-                    ],
-                },
-            }
-            route_decision = self.normalize_route_decision(
-                rules.enrich_route_decision_with_workflow_mode(
-                    route_decision,
-                    text=text,
-                    intent=intent,
-                    interaction_mode=interaction_mode,
-                    reception_mode=reception_mode,
-                ),
-                route_message=route_message,
-                metadata=metadata,
-            )
-            return {
-                "intent": intent,
-                "workflow": None,
-                "route_message": route_message,
-                "route_decision": route_decision,
-            }
 
         skipped_workflows: list[dict[str, str]] = []
         candidate_workflows: list[dict[str, Any]] = []
@@ -365,8 +454,18 @@ class RoutingService:
         execution_support: dict[str, Any] | None = None
         selected_route_message = ""
         selected_workflow = None
+        workflow_only_enforced = False
 
         for candidate_workflow, base_route_message in workflow_candidates:
+            if _is_legacy_workflow_id(_workflow_id(candidate_workflow)):
+                skipped_workflows.append(
+                    {
+                        "workflow_id": str(candidate_workflow.get("id") or ""),
+                        "workflow_name": str(candidate_workflow.get("name") or ""),
+                        "reason": "legacy_workflow_route_disabled",
+                    }
+                )
+                continue
             candidate_execution_agent = execution_directory_service.resolve_workflow_execution_agent(
                 candidate_workflow,
                 intent,
@@ -387,6 +486,17 @@ class RoutingService:
                 }
             )
             if candidate_execution_agent is None:
+                if _workflow_has_deferred_execution_target(candidate_workflow):
+                    execution_support = {
+                        "supports_intent": True,
+                        "support_source": "workflow_deferred_execution",
+                        "supported_intents": [intent],
+                        "capabilities": [],
+                        "warnings": ["execution_agent_resolved_after_workflow_entry"],
+                    }
+                    selected_workflow = candidate_workflow
+                    selected_route_message = base_route_message
+                    break
                 if not _workflow_declares_execution_targets(candidate_workflow):
                     execution_support = {
                         "supports_intent": True,
@@ -407,6 +517,18 @@ class RoutingService:
                 )
                 continue
             if support.get("supports_intent") is False:
+                if _workflow_has_deferred_execution_target(candidate_workflow):
+                    execution_support = {
+                        "supports_intent": True,
+                        "support_source": "workflow_deferred_execution",
+                        "supported_intents": [intent],
+                        "capabilities": [],
+                        "warnings": ["execution_agent_resolved_after_workflow_entry"],
+                    }
+                    execution_agent = None
+                    selected_workflow = candidate_workflow
+                    selected_route_message = base_route_message
+                    break
                 skipped_workflows.append(
                     {
                         "workflow_id": str(candidate_workflow.get("id") or ""),
@@ -421,87 +543,97 @@ class RoutingService:
             selected_route_message = base_route_message
             break
 
-        if execution_agent is None or selected_workflow is None:
-            execution_agent = execution_directory_service.resolve_agent_dispatch_execution_agent(intent)
-            execution_support = planner.execution_agent_support(execution_agent, intent)
-            if execution_agent is None:
+        if selected_workflow is None:
+            selected_workflow, selected_route_message = _resolve_workflow_only_fallback(
+                intent=intent,
+                workflow_candidates=workflow_candidates,
+            )
+            if selected_workflow is None:
                 raise HTTPException(
                     status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                    detail="No enabled direct execution agent available for intent",
+                    detail="No enabled workflow available for intent",
                 )
-
-            execution_agent_name = str(execution_agent.get("name") or "").strip() or rules.target_agent_name(intent)
-            fallback_reason = "未找到可用工作流" if no_workflow_available else "工作流不可执行"
-            route_message = f"已识别意图: {intent}；{fallback_reason}；已切换为直达 Agent 执行: {execution_agent_name}"
-            if skipped_workflows:
-                route_message = (
-                    f"{route_message}；已跳过不可执行工作流: "
-                    f"{', '.join(item['workflow_name'] for item in skipped_workflows if item.get('workflow_name'))}"
-                )
-            route_decision = {
-                "intent": intent,
-                "workflow_id": execution_directory_service.AGENT_DISPATCH_WORKFLOW_ID,
-                "workflow_name": execution_directory_service.AGENT_DISPATCH_WORKFLOW_NAME,
-                "execution_agent_id": str(execution_agent.get("id") or "").strip() or None,
-                "execution_agent": execution_agent_name,
-                "selected_by_message_trigger": False,
-                "route_message": route_message,
-                "intent_confidence": intent_assessment["confidence"],
-                "intent_scores": intent_assessment["scores"],
-                "intent_reasons": intent_assessment["reasons"],
-                "candidate_workflows": candidate_workflows[:5],
-                "skipped_workflows": skipped_workflows,
-                "routing_strategy": ROUTING_STRATEGY_WORKFLOW_OR_AGENT_DISPATCH_FALLBACK,
-                "interaction_mode": interaction_mode,
-                "interactionMode": interaction_mode,
-                "reception_mode": reception_mode,
-                "receptionMode": reception_mode,
-                "execution_support": execution_support,
-            }
-            route_decision = self.normalize_route_decision(
-                rules.enrich_route_decision_with_workflow_mode(
-                    route_decision,
-                    text=text,
-                    intent=intent,
-                    interaction_mode=interaction_mode,
-                    reception_mode=reception_mode,
-                ),
-                route_message=route_message,
-                metadata=metadata,
+            execution_agent = execution_directory_service.resolve_workflow_execution_agent(
+                selected_workflow,
+                intent,
             )
-            return {
-                "intent": intent,
-                "workflow": None,
-                "route_message": route_message,
-                "route_decision": route_decision,
-            }
+            execution_support = _build_workflow_only_execution_support(
+                intent=intent,
+                base_support=planner.execution_agent_support(execution_agent, intent),
+                no_workflow_available=no_workflow_available,
+                skipped_workflows=skipped_workflows,
+            )
+            workflow_only_enforced = True
 
-        execution_agent_name = str(execution_agent.get("name") or "").strip() or rules.target_agent_name(intent)
-        route_message = f"{selected_route_message}；执行代理: {execution_agent_name}"
-        if skipped_workflows:
+        selected_workflow_has_deferred_target = _workflow_has_deferred_execution_target(selected_workflow)
+        fallback_execution_agent = (
+            execution_directory_service.resolve_agent_dispatch_execution_agent(intent)
+            if execution_agent is None or selected_workflow_has_deferred_target
+            else None
+        )
+        execution_agent_for_contract = (
+            fallback_execution_agent
+            if selected_workflow_has_deferred_target and fallback_execution_agent is not None
+            else execution_agent
+        )
+        execution_agent_name = (
+            str((execution_agent_for_contract or {}).get("name") or "").strip()
+            or rules.target_agent_name(intent)
+        )
+        if workflow_only_enforced:
+            route_message = _build_workflow_only_route_message(
+                intent=intent,
+                workflow=selected_workflow,
+                base_route_message=selected_route_message,
+                no_workflow_available=no_workflow_available,
+                skipped_workflows=skipped_workflows,
+            )
+            if execution_agent_for_contract is None:
+                route_message = f"{route_message}；已进入工作流编排，执行代理将在后续节点解析"
+            else:
+                route_message = f"{route_message}；执行代理: {execution_agent_name}"
+        elif execution_agent_for_contract is None:
+            route_message = f"{selected_route_message}；已进入工作流编排，执行代理将在后续节点解析"
+        else:
+            route_message = f"{selected_route_message}；执行代理: {execution_agent_name}"
+        if dynamic_execution_route_message:
+            route_message = f"{route_message}；{dynamic_execution_route_message}"
+        if skipped_workflows and not workflow_only_enforced:
             route_message = (
                 f"{route_message}；已跳过不可执行工作流: "
                 f"{', '.join(item['workflow_name'] for item in skipped_workflows if item.get('workflow_name'))}"
             )
+        routing_strategy = (
+            ROUTING_STRATEGY_WORKFLOW_ONLY_ENFORCED
+            if workflow_only_enforced
+            else "workflow_trigger+execution_agent_support"
+        )
         route_decision = {
             "intent": intent,
             "workflow_id": str(selected_workflow["id"]),
             "workflow_name": str(selected_workflow["name"]),
-            "execution_agent_id": str(execution_agent.get("id") or "").strip() or None,
+            "execution_agent_id": (
+                str((execution_agent_for_contract or {}).get("id") or "").strip()
+                or None
+            ),
             "execution_agent": execution_agent_name,
-            "selected_by_message_trigger": "路由依据: intent fallback" not in selected_route_message,
+            "selected_by_message_trigger": (
+                "路由依据: intent fallback" not in selected_route_message
+                and "workflow-only 主链兜底" not in selected_route_message
+            ),
             "route_message": route_message,
             "intent_confidence": intent_assessment["confidence"],
             "intent_scores": intent_assessment["scores"],
             "intent_reasons": intent_assessment["reasons"],
             "candidate_workflows": candidate_workflows[:5],
             "skipped_workflows": skipped_workflows,
-            "routing_strategy": "workflow_trigger+execution_agent_support",
+            "routing_strategy": routing_strategy,
             "interaction_mode": interaction_mode,
             "interactionMode": interaction_mode,
             "reception_mode": reception_mode,
             "receptionMode": reception_mode,
             "execution_support": execution_support,
+            "execution_plan": dynamic_execution_plan,
         }
         route_decision = self.normalize_route_decision(
             rules.enrich_route_decision_with_workflow_mode(

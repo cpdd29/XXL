@@ -85,6 +85,25 @@ export interface AgentBoundSkill {
   tags?: string[]
 }
 
+export interface AgentBoundTool {
+  id: string
+  name: string
+  type: string
+  description?: string | null
+  source?: string | null
+}
+
+export interface AgentBindableTool {
+  id: string
+  name: string
+  type: string
+  description: string
+  source: string
+  enabled: boolean
+}
+
+export type AgentWorkflowContract = Readonly<Record<string, unknown>>
+
 export interface Agent {
   id: string
   name: string
@@ -118,6 +137,18 @@ export interface Agent {
   modelBinding?: AgentModelBinding | null
   boundSkillIds?: string[] | null
   boundSkills?: AgentBoundSkill[] | null
+  boundToolIds?: string[] | null
+  boundTools?: AgentBoundTool[] | null
+  readonly agent_workflow_id?: string | null
+  readonly input_contract?: AgentWorkflowContract | null
+  readonly output_contract?: AgentWorkflowContract | null
+  readonly contract_version?: string | null
+  readonly agentWorkflowId?: string | null
+  readonly inputContract?: AgentWorkflowContract | null
+  readonly outputContract?: AgentWorkflowContract | null
+  readonly contractVersion?: string | null
+  deletable?: boolean | null
+  deleteBlockedReason?: string | null
 }
 
 export interface AgentRuntimeStatus {
@@ -143,6 +174,12 @@ export interface AgentActionResponse {
   agent: Agent
 }
 
+export interface AgentDeleteResponse {
+  ok: boolean
+  message: string
+  agentId: string
+}
+
 export interface AgentConfigRequest {
   name: string
   description: string
@@ -151,4 +188,9 @@ export interface AgentConfigRequest {
   providerKey?: string | null
   model?: string | null
   skillIds?: string[]
+  toolIds?: string[]
+  agentWorkflowId?: string | null
+  inputContract?: AgentWorkflowContract | null
+  outputContract?: AgentWorkflowContract | null
+  contractVersion?: string | null
 }

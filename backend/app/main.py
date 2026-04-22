@@ -18,8 +18,6 @@ from app.services.workflow_execution_worker_service import workflow_execution_wo
 from app.services.workflow_recovery_service import workflow_recovery_service
 from app.services.memory_service import memory_service
 from app.services.brain_skill_service import brain_skill_service
-from app.services.mandatory_agent_registry_service import ensure_mandatory_agents_registered
-from app.services.mandatory_workflow_registry_service import ensure_mandatory_workflows_registered
 from app.services.persistence_service import persistence_service
 from app.services.dingtalk_stream_service import dingtalk_stream_service
 
@@ -31,8 +29,6 @@ async def lifespan(_: FastAPI):
     _ = agent_execution_worker_service
     persistence_service.initialize()
     brain_skill_service.bootstrap()
-    ensure_mandatory_agents_registered()
-    ensure_mandatory_workflows_registered()
     bootstrap_message_ingestion_state()
     nats_event_bus.initialize()
     workflow_execution_worker_service.start()

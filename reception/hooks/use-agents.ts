@@ -6,7 +6,9 @@ import { queryKeys } from '@/lib/api/query-keys'
 import type {
   Agent,
   AgentActionResponse,
+  AgentBindableTool,
   AgentConfigRequest,
+  AgentDeleteResponse,
   AgentListResponse,
   AgentRuntimeStatus,
 } from '@/types'
@@ -15,6 +17,48 @@ export function useAgents() {
   return useQuery({
     queryKey: queryKeys.agents.list,
     queryFn: () => apiRequest<AgentListResponse>('/api/agents'),
+  })
+}
+
+export function useAgentMcpTools() {
+  return useQuery({
+    queryKey: ['agents', 'mcp-tools'],
+    queryFn: async () => {
+      const payload = await apiRequest<{
+        items?: Array<{
+          id?: string | null
+          name?: string | null
+          type?: string | null
+          description?: string | null
+          source?: string | null
+          sourceId?: string | null
+          source_id?: string | null
+          enabled?: boolean | null
+        }>
+      }>('/api/tools')
+
+      const items: AgentBindableTool[] = (payload.items ?? [])
+        .filter((item) => item?.type === 'mcp')
+        .map((item) => {
+          const id = String(item.id ?? '').trim()
+          const source =
+            String(item.sourceId ?? item.source_id ?? item.source ?? '').trim()
+          return {
+            id,
+            name: String(item.name ?? id).trim() || id,
+            type: String(item.type ?? 'mcp').trim() || 'mcp',
+            description: String(item.description ?? '').trim(),
+            source,
+            enabled: item.enabled !== false,
+          }
+        })
+        .filter((item) => item.id)
+
+      return {
+        items,
+        total: items.length,
+      }
+    },
   })
 }
 
@@ -66,6 +110,36 @@ export function useCreateAgent() {
       }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: queryKeys.agents.list })
+    },
+  })
+}
+
+export function useDeleteAgent() {
+  const queryClient = useQueryClient()
+
+  return useMutation({
+    mutationFn: (agentId: string) =>
+      apiRequest<AgentDeleteResponse>(`/api/agents/${encodeURIComponent(agentId)}`, {
+        method: 'DELETE',
+      }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.agents.list })
+    },
+  })
+}
+
+export function useSetAgentEnabled() {
+  const queryClient = useQueryClient()
+
+  return useMutation({
+    mutationFn: ({ agentId, enabled }: { agentId: string; enabled: boolean }) =>
+      apiRequest<AgentActionResponse>(`/api/agents/${encodeURIComponent(agentId)}/enabled`, {
+        method: 'PUT',
+        body: { enabled },
+      }),
+    onSuccess: (_, variables) => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.agents.list })
+      queryClient.invalidateQueries({ queryKey: queryKeys.agents.status(variables.agentId) })
     },
   })
 }

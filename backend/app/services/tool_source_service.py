@@ -139,6 +139,17 @@ def _local_mcp_specs() -> list[dict[str, Any]]:
             "scopes": ["agents:read", "tasks:write"],
             "roles": ["admin", "operator"],
         },
+        {
+            "id": "mcp-tool-browser-automation",
+            "name": "delivery_note_browser_automation",
+            "description": "Scenario-specific browser automation MCP for delivery note export and customer send",
+            "base_url": os.getenv("WORKBOT_BROWSER_AUTOMATION_MCP_BASE_URL", "http://127.0.0.1:8099"),
+            "invoke_path": "/execute",
+            "method": "POST",
+            "requires_permission": True,
+            "scopes": ["agents:read", "tasks:write"],
+            "roles": ["admin", "operator"],
+        },
     ]
 
 
