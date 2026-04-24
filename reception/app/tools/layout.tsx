@@ -1,6 +1,6 @@
-import { AppHeader } from "@/components/layout/app-header"
-import { AppSidebar } from "@/components/layout/app-sidebar"
-import { AuthGuard } from "@/components/providers/auth-guard"
+import { AppHeader } from "@/shared/layout/app-header"
+import { AppSidebar } from "@/shared/layout/app-sidebar"
+import { AuthGuard } from "@/shared/providers/auth-guard"
 
 export default function ToolsLayout({
   children,

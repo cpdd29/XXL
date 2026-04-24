@@ -1,7 +1,7 @@
 import type { Metadata } from 'next'
 import { Analytics } from '@vercel/analytics/next'
-import { ThemeProvider } from '@/components/theme-provider'
-import { QueryProvider } from '@/components/providers/query-provider'
+import { ThemeProvider } from '@/shared/providers/theme-provider'
+import { QueryProvider } from '@/shared/providers/query-provider'
 import './globals.css'
 
 export const metadata: Metadata = {

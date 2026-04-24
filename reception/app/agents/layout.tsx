@@ -1,6 +1,6 @@
-import { AppSidebar } from "@/components/layout/app-sidebar"
-import { AppHeader } from "@/components/layout/app-header"
-import { AuthGuard } from "@/components/providers/auth-guard"
+import { AppSidebar } from "@/shared/layout/app-sidebar"
+import { AppHeader } from "@/shared/layout/app-header"
+import { AuthGuard } from "@/shared/providers/auth-guard"
 
 export default function AgentsLayout({
   children,
