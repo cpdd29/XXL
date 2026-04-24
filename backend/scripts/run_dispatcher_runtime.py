@@ -14,8 +14,10 @@ BACKEND_ROOT = Path(__file__).resolve().parents[1]
 if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
 
-from app.services.workflow_dispatch_poller_service import workflow_dispatch_poller_service  # noqa: E402
-from app.services.workflow_dispatcher_service import workflow_dispatcher_service  # noqa: E402
+from app.modules.dispatch.workflow_runtime.workflow_dispatch_poller_service import (  # noqa: E402
+    workflow_dispatch_poller_service,
+)
+from app.modules.dispatch.workflow_runtime.workflow_dispatcher_service import workflow_dispatcher_service  # noqa: E402
 
 
 def _configure_dispatcher_runtime(

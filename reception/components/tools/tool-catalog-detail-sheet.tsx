@@ -231,10 +231,6 @@ export function ToolDetailSheet({
                       <MultiBadge items={tool.linkedAgents} empty="未关联执行角色" />
                     </div>
                     <div>
-                      <div className="mb-1 text-xs text-muted-foreground">关联工作流</div>
-                      <MultiBadge items={tool.linkedWorkflows} empty="未关联工作流" />
-                    </div>
-                    <div>
                       <div className="mb-1 text-xs text-muted-foreground">能力标签</div>
                       <MultiBadge items={tool.requiredCapabilities} empty="未定义能力要求" />
                     </div>

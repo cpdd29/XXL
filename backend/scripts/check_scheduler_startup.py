@@ -13,13 +13,24 @@ if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
 
 from app.config import get_settings
-from app.services.persistence_service import persistence_service
-from app.services.scheduler_guard_service import scheduler_guard_service
-from app.services.workflow_dispatch_poller_service import DEFAULT_DISPATCH_POLL_INTERVAL_SECONDS
-from app.services.workflow_dispatcher_service import DEFAULT_DISPATCH_LEASE_SECONDS
+from app.modules.dispatch.workflow_runtime.scheduler_guard_service import scheduler_guard_service
+from app.modules.dispatch.workflow_runtime.workflow_dispatch_poller_service import (
+    DEFAULT_DISPATCH_POLL_INTERVAL_SECONDS,
+)
+from app.modules.dispatch.workflow_runtime.workflow_dispatcher_service import DEFAULT_DISPATCH_LEASE_SECONDS
+from app.platform.persistence.persistence_service import persistence_service
 from scripts.check_nats_contract import run_check as run_nats_contract_check
 from scripts.check_persistence_contract import run_persistence_contract_check
-from scripts.dr_common import platform_readiness
+
+
+def platform_readiness() -> dict[str, Any]:
+    settings = get_settings()
+    return {
+        "environment": settings.environment,
+        "persistence_enabled": bool(getattr(persistence_service, "enabled", False)),
+        "nats_connected": False,
+        "warnings": [],
+    }
 
 
 def _normalize_platform_readiness(

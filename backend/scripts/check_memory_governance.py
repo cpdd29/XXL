@@ -14,7 +14,7 @@ BACKEND_ROOT = Path(__file__).resolve().parents[1]
 if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
 
-from app.services.memory_service import (  # noqa: E402
+from app.modules.organization.application.memory_service import (  # noqa: E402
     MEMORY_SCOPE_GLOBAL,
     MEMORY_SCOPE_TENANT,
     WRITE_SOURCE_EXTERNAL_AGENT,

@@ -618,11 +618,6 @@ export default function SecurityPage() {
           </p>
         </div>
         <div className="flex items-center gap-2">
-          <Link href="/security/alerts">
-            <Button variant="outline" size="sm">
-              统一告警中心
-            </Button>
-          </Link>
           <Button
             variant="outline"
             size="sm"

@@ -14,7 +14,9 @@ BACKEND_ROOT = Path(__file__).resolve().parents[1]
 if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
 
-from app.services.workflow_execution_worker_service import workflow_execution_worker_service  # noqa: E402
+from app.modules.dispatch.workflow_runtime.workflow_execution_worker_service import (  # noqa: E402
+    workflow_execution_worker_service,
+)
 
 
 def _configure_worker_runtime(

@@ -16,10 +16,10 @@ import sys
 if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
 
-from app.services.persistence_service import StatePersistenceService
-from app.services.store import InMemoryStore
-import app.services.security_gateway_service as security_gateway_service_module
-from app.services.security_gateway_service import SecurityGatewayService
+from app.platform.persistence.persistence_service import StatePersistenceService
+from app.platform.persistence.runtime_store import InMemoryStore
+import app.modules.reception.security_monitor.security_gateway_service as security_gateway_service_module
+from app.modules.reception.security_monitor.security_gateway_service import SecurityGatewayService
 
 
 class _NoRedisProvider:

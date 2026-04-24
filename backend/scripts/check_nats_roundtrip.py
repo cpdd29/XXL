@@ -13,16 +13,22 @@ BACKEND_ROOT = Path(__file__).resolve().parents[1]
 if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
 
-from app.core.agent_protocol import build_protocol_envelope
-from app.core.event_subjects import (
+from app.platform.contracts.agent_protocol import build_protocol_envelope
+from app.platform.contracts.event_subjects import (
     AGENT_EXECUTION_CLAIMED_SUBJECT,
     WORKFLOW_EXECUTION_CLAIMED_SUBJECT,
 )
-from app.core.nats_event_bus import NatsEventBus
-from app.core.agent_protocol import protocol_from_message
-from app.services.agent_execution_worker_service import AGENT_EXECUTION_QUEUE, AGENT_EXECUTION_SUBJECT
-from app.services.workflow_dispatcher_service import WORKFLOW_DISPATCH_QUEUE, WORKFLOW_DISPATCH_SUBJECT
-from app.services.workflow_execution_worker_service import (
+from app.platform.messaging.nats_event_bus import NatsEventBus
+from app.platform.contracts.agent_protocol import protocol_from_message
+from app.modules.dispatch.single_agent_runtime.agent_execution_worker_service import (
+    AGENT_EXECUTION_QUEUE,
+    AGENT_EXECUTION_SUBJECT,
+)
+from app.modules.dispatch.workflow_runtime.workflow_dispatcher_service import (
+    WORKFLOW_DISPATCH_QUEUE,
+    WORKFLOW_DISPATCH_SUBJECT,
+)
+from app.modules.dispatch.workflow_runtime.workflow_execution_worker_service import (
     WORKFLOW_EXECUTION_QUEUE,
     WORKFLOW_EXECUTION_SUBJECT,
 )

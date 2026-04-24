@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from app.execution_gateway.contracts import ExecutionRequest
-from app.execution_gateway.skill_execution_gateway import SkillExecutionGateway
+from app.modules.dispatch.skill_runtime.skill_execution_gateway import SkillExecutionGateway
+from app.platform.contracts.execution_protocol import ExecutionRequest
 
 
 def test_skill_execution_gateway_builtin_mode_skips_runtime() -> None:

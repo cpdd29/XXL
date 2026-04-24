@@ -36,8 +36,9 @@ class Settings(BaseSettings):
     message_rate_limit_cooldown_seconds: int = 30
     message_rate_limit_ban_threshold: int = 3
     message_rate_limit_ban_seconds: int = 300
-    message_debounce_seconds: int = 3
-    workflow_execution_poll_interval_seconds: float = 1.0
+    message_debounce_seconds: float = 0.5
+    nats_operation_timeout_seconds: float = 0.25
+    workflow_execution_poll_interval_seconds: float = 0.2
     workflow_execution_lease_seconds: float = 45.0
     workflow_execution_scan_limit: int = 50
     memory_retrieve_limit: int = 5

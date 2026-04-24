@@ -42,7 +42,6 @@ import {
   Clock3,
   FileSearch,
   FileText,
-  GitBranch,
   Link2,
   PlayCircle,
   Sparkles,
@@ -139,8 +138,6 @@ function managerPacketEntries(managerPacket?: ManagerPacket | null) {
     ["nextOwner", "下一归属"],
     ["interactionMode", "交互模式"],
     ["receptionMode", "接待模式"],
-    ["workflowMode", "工作流模式"],
-    ["workflowAdmission", "准入策略"],
     ["taskShape", "任务形态"],
     ["decompositionHint", "拆解提示"],
     ["deliveryMode", "交付模式"],
@@ -159,10 +156,8 @@ function brainDispatchEntries(summary?: BrainDispatchSummary | null) {
 
   const labels: Array<[keyof BrainDispatchSummary, string]> = [
     ["dispatchType", "派发形态"],
-    ["workflowMode", "工作流模式"],
     ["interactionMode", "交互模式"],
     ["receptionMode", "接待模式"],
-    ["workflowName", "工作流"],
     ["executionAgent", "执行代理"],
     ["managerAction", "经理动作"],
     ["nextOwner", "下一归属"],
@@ -338,12 +333,6 @@ export default function TaskDetailPage() {
           </div>
 
           <div className="flex flex-wrap items-center gap-2">
-            <Button asChild variant="outline">
-              <Link href={`/collaboration?taskId=${encodeURIComponent(task.id)}`}>
-                <GitBranch className="mr-2 size-4" />
-                执行过程
-              </Link>
-            </Button>
             <Button variant="outline" onClick={() => void handleRetry()} disabled={!canRetry}>
               <PlayCircle className="mr-2 size-4" />
               重新执行
@@ -689,15 +678,6 @@ export default function TaskDetailPage() {
                 <span className="text-muted-foreground">执行步数</span>
                 <span className="font-medium text-foreground">{steps.length}</span>
               </div>
-              {task.workflowRunId ? (
-                <>
-                  <Separator />
-                  <div className="flex items-center justify-between">
-                    <span className="text-muted-foreground">Workflow Run</span>
-                    <span className="font-medium text-foreground">{task.workflowRunId}</span>
-                  </div>
-                </>
-              ) : null}
               {task.failureMessage ? (
                 <>
                   <Separator />
@@ -730,8 +710,10 @@ export default function TaskDetailPage() {
               </CardHeader>
               <CardContent className="space-y-3 text-sm">
                 <div className="flex items-center justify-between">
-                  <span className="text-muted-foreground">命中工作流</span>
-                  <span className="font-medium text-foreground">{task.routeDecision.workflowName}</span>
+                  <span className="text-muted-foreground">命中路由</span>
+                  <span className="font-medium text-foreground">
+                    {task.routeDecision.executionAgent || task.routeDecision.workflowName || "--"}
+                  </span>
                 </div>
                 <Separator />
                 <div className="flex items-center justify-between">
@@ -843,12 +825,6 @@ export default function TaskDetailPage() {
               <CardTitle className="text-base">推荐动作</CardTitle>
             </CardHeader>
             <CardContent className="space-y-3">
-              <Button asChild className="w-full justify-between">
-                <Link href={`/collaboration?taskId=${encodeURIComponent(task.id)}`}>
-                  查看协作轨迹
-                  <ArrowRight className="size-4" />
-                </Link>
-              </Button>
               <Button asChild variant="outline" className="w-full justify-between">
                 <Link href="/tasks">
                   返回任务列表

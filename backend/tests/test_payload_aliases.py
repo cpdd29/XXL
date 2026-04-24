@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from app.core.payload_aliases import (
+from app.platform.contracts.payload_aliases import (
     alias_bool,
     alias_dict,
     alias_text,
     dispatch_context_from_run,
+    execution_plan_from_payload,
     execution_plan_from_route_decision,
     route_decision_from_run,
     route_decision_from_task,
@@ -45,4 +46,5 @@ def test_route_decision_helpers_resolve_task_and_run_payloads() -> None:
         "intent": "write",
         "executionPlan": {"steps": [{"id": "step-1"}]},
     }
+    assert execution_plan_from_payload(route_decision_from_run(run)) == {"steps": [{"id": "step-1"}]}
     assert execution_plan_from_route_decision(route_decision_from_run(run)) == {"steps": [{"id": "step-1"}]}

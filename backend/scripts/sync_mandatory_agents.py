@@ -9,8 +9,10 @@ BACKEND_ROOT = CURRENT_DIR.parent
 if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
 
-from app.services.mandatory_agent_registry_service import ensure_mandatory_agents_registered
-from app.services.persistence_service import persistence_service
+from app.modules.agent_config.registries.mandatory_agent_registry_service import (
+    ensure_mandatory_agents_registered,
+)
+from app.platform.persistence.persistence_service import persistence_service
 
 
 def main() -> int:

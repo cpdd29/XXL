@@ -14,7 +14,7 @@ if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
 
 from app.config import Settings, get_settings
-from app.core.nats_event_bus import nats_event_bus
+from app.platform.messaging.nats_event_bus import nats_event_bus
 
 
 def _default_nats_url() -> str:

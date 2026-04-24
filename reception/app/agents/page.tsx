@@ -46,7 +46,6 @@ import {
   useSetAgentEnabled,
   useUpdateAgentConfig,
 } from "@/hooks/use-agents"
-import { useWorkflows } from "@/hooks/use-workflows"
 import { useAgentApiSettings } from "@/hooks/use-settings"
 import { toast } from "@/hooks/use-toast"
 import { cn } from "@/lib/utils"
@@ -57,7 +56,6 @@ import type {
   AgentBoundTool,
   AgentConfigRequest,
   BrainSkillItem,
-  Workflow,
 } from "@/types"
 import { Plus, Search, Trash2 } from "lucide-react"
 
@@ -110,15 +108,8 @@ type AgentFormState = {
   type: string
   enabled: boolean
   selectedModel: string
-  selectedWorkflowId: string
   selectedSkillIds: string[]
   selectedToolIds: string[]
-}
-
-type WorkflowOption = {
-  value: string
-  label: string
-  description: string
 }
 
 type AgentConfigBuildResult =
@@ -135,8 +126,6 @@ type AgentConfigBuildResult =
     }
 
 type AgentFilterMode = "all" | "active" | "inactive"
-
-const UNBOUND_WORKFLOW_VALUE = "__unbound__"
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value)
@@ -265,7 +254,6 @@ function defaultFormState(agent: Agent | null, modelOptions: ModelOption[]): Age
     type: agent?.type ?? "default",
     enabled: agent?.enabled ?? true,
     selectedModel,
-    selectedWorkflowId: agent?.agentWorkflowId ?? agent?.agent_workflow_id ?? UNBOUND_WORKFLOW_VALUE,
     selectedSkillIds: resolveAgentBoundSkillIds(agent),
     selectedToolIds: resolveAgentBoundToolIds(agent),
   }
@@ -290,7 +278,6 @@ function buildAgentConfigSyncKey(agent: Agent | null) {
     enabled: agent.enabled,
     providerKey: agent.modelBinding?.providerKey ?? "",
     model: agent.modelBinding?.model ?? "",
-    workflowId: resolveAgentWorkflowId(agent) ?? "",
     skillIds: resolveAgentBoundSkillIds(agent),
     toolIds: resolveAgentBoundToolIds(agent),
   })
@@ -316,24 +303,7 @@ function buildAgentConfigPayload(form: AgentFormState, agent: Agent | null): Age
     }
   }
 
-  const selectedWorkflowId =
-    form.selectedWorkflowId === UNBOUND_WORKFLOW_VALUE ? "" : form.selectedWorkflowId.trim()
-
-  if (form.enabled && !selectedWorkflowId) {
-    return {
-      error: {
-        title: "请选择绑定工作流",
-        description: "启用 Agent 前需要先绑定一个工作流。",
-      },
-    }
-  }
-
   const { providerKey, model } = parseModelValue(form.selectedModel)
-  const existingAgentWorkflowId = agent?.agentWorkflowId ?? agent?.agent_workflow_id ?? null
-  const existingInputContract = agent?.inputContract ?? agent?.input_contract ?? {}
-  const existingOutputContract = agent?.outputContract ?? agent?.output_contract ?? {}
-  const existingContractVersion = agent?.contractVersion ?? agent?.contract_version ?? null
-  const workflowChanged = (existingAgentWorkflowId ?? "") !== selectedWorkflowId
 
   return {
     payload: {
@@ -345,19 +315,6 @@ function buildAgentConfigPayload(form: AgentFormState, agent: Agent | null): Age
       model,
       skillIds: form.selectedSkillIds,
       toolIds: form.selectedToolIds,
-      ...(selectedWorkflowId
-        ? {
-            agentWorkflowId: selectedWorkflowId,
-            inputContract: workflowChanged ? {} : existingInputContract,
-            outputContract: workflowChanged ? {} : existingOutputContract,
-            contractVersion: workflowChanged ? null : existingContractVersion,
-          }
-        : {
-            agentWorkflowId: null,
-            inputContract: null,
-            outputContract: null,
-            contractVersion: null,
-          }),
     } satisfies AgentConfigRequest,
   }
 }
@@ -366,9 +323,6 @@ function AgentConfigFields({
   form,
   setForm,
   modelOptions,
-  workflowOptions,
-  workflowsLoading,
-  workflowsError,
   brainSkills,
   brainSkillsLoading,
   brainSkillsError,
@@ -383,9 +337,6 @@ function AgentConfigFields({
   form: AgentFormState
   setForm: Dispatch<SetStateAction<AgentFormState>>
   modelOptions: ModelOption[]
-  workflowOptions: WorkflowOption[]
-  workflowsLoading: boolean
-  workflowsError: Error | null
   brainSkills: BrainSkillItem[]
   brainSkillsLoading: boolean
   brainSkillsError: Error | null
@@ -454,44 +405,6 @@ function AgentConfigFields({
             </div>
           </div>
         ) : null}
-      </div>
-
-      <div className="space-y-2">
-        <Label htmlFor={`${idPrefix}-workflow`}>绑定工作流</Label>
-        {workflowsLoading ? (
-          <div className="rounded-md border border-border bg-secondary/20 px-3 py-2 text-sm text-muted-foreground">
-            正在加载工作流...
-          </div>
-        ) : workflowsError ? (
-          <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
-            工作流加载失败：{workflowsError.message}
-          </div>
-        ) : workflowOptions.length === 0 ? (
-          <div className="rounded-md border border-border bg-secondary/20 px-3 py-2 text-sm text-muted-foreground">
-            当前没有可绑定的工作流
-          </div>
-        ) : (
-          <Select
-            value={form.selectedWorkflowId}
-            disabled={!canEdit || isSaving}
-            onValueChange={(value) => setForm((current) => ({ ...current, selectedWorkflowId: value }))}
-          >
-            <SelectTrigger id={`${idPrefix}-workflow`}>
-              <SelectValue placeholder="选择工作流" />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value={UNBOUND_WORKFLOW_VALUE}>不绑定工作流</SelectItem>
-              {workflowOptions.map((item) => (
-                <SelectItem key={item.value} value={item.value}>
-                  {item.label}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-        )}
-        <p className="text-xs text-muted-foreground">
-          当前 Agent 的执行主链会按这里绑定的工作流进入轮转。
-        </p>
       </div>
 
       <div className="space-y-2">
@@ -656,9 +569,6 @@ function AgentConfigDialog({
   open,
   agent,
   modelOptions,
-  workflowOptions,
-  workflowsLoading,
-  workflowsError,
   brainSkills,
   brainSkillsLoading,
   brainSkillsError,
@@ -673,9 +583,6 @@ function AgentConfigDialog({
   open: boolean
   agent: Agent | null
   modelOptions: ModelOption[]
-  workflowOptions: WorkflowOption[]
-  workflowsLoading: boolean
-  workflowsError: Error | null
   brainSkills: BrainSkillItem[]
   brainSkillsLoading: boolean
   brainSkillsError: Error | null
@@ -715,9 +622,6 @@ function AgentConfigDialog({
             form={form}
             setForm={setForm}
             modelOptions={modelOptions}
-            workflowOptions={workflowOptions}
-            workflowsLoading={workflowsLoading}
-            workflowsError={workflowsError}
             brainSkills={brainSkills}
             brainSkillsLoading={brainSkillsLoading}
             brainSkillsError={brainSkillsError}
@@ -743,25 +647,13 @@ function AgentConfigDialog({
   )
 }
 
-function resolveAgentWorkflowId(agent: Agent | null) {
-  return agent?.agentWorkflowId ?? agent?.agent_workflow_id ?? null
-}
-
-function resolveBoundWorkflowName(agent: Agent | null, workflowMap: Map<string, Workflow>) {
-  const workflowId = resolveAgentWorkflowId(agent)
-  if (!workflowId) return null
-  return workflowMap.get(workflowId)?.name ?? workflowId
-}
-
 function AgentListItem({
   agent,
   isActive,
-  workflowName,
   onSelect,
 }: {
   agent: Agent
   isActive: boolean
-  workflowName: string | null
   onSelect: (agentId: string) => void
 }) {
   const runtimeStatus = agent.runtimeStatus ?? "unknown"
@@ -800,7 +692,7 @@ function AgentListItem({
 
           <div className="space-y-0.5 text-xs text-muted-foreground">
             <div className="truncate">模型：{agent.modelBinding?.model ?? "未配置"}</div>
-            <div className="truncate">工作流：{workflowName ?? "未绑定"}</div>
+            <div className="truncate">Skill：{resolveAgentBoundSkillIds(agent).length}</div>
           </div>
         </div>
       </div>
@@ -811,9 +703,6 @@ function AgentListItem({
 function AgentDetailPanel({
   agent,
   modelOptions,
-  workflowOptions,
-  workflowsLoading,
-  workflowsError,
   brainSkills,
   brainSkillsLoading,
   brainSkillsError,
@@ -831,9 +720,6 @@ function AgentDetailPanel({
 }: {
   agent: Agent
   modelOptions: ModelOption[]
-  workflowOptions: WorkflowOption[]
-  workflowsLoading: boolean
-  workflowsError: Error | null
   brainSkills: BrainSkillItem[]
   brainSkillsLoading: boolean
   brainSkillsError: Error | null
@@ -940,9 +826,6 @@ function AgentDetailPanel({
           form={form}
           setForm={setForm}
           modelOptions={modelOptions}
-          workflowOptions={workflowOptions}
-          workflowsLoading={workflowsLoading}
-          workflowsError={workflowsError}
           brainSkills={brainSkills}
           brainSkillsLoading={brainSkillsLoading}
           brainSkillsError={brainSkillsError}
@@ -1005,11 +888,6 @@ export default function AgentsPage() {
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null)
   const { data, isLoading, error } = useAgents()
   const {
-    data: workflowsData,
-    isLoading: workflowsLoading,
-    error: workflowsQueryError,
-  } = useWorkflows()
-  const {
     data: brainSkillsData,
     isLoading: brainSkillsLoading,
     error: brainSkillsQueryError,
@@ -1026,10 +904,8 @@ export default function AgentsPage() {
   const setAgentEnabledMutation = useSetAgentEnabled()
   const updateAgentConfigMutation = useUpdateAgentConfig()
   const agents = data?.items ?? []
-  const workflows = workflowsData?.items ?? []
   const brainSkills = brainSkillsData?.items ?? []
   const mcpTools = mcpToolsData?.items ?? []
-  const workflowsError = workflowsQueryError instanceof Error ? workflowsQueryError : null
   const brainSkillsError = brainSkillsQueryError instanceof Error ? brainSkillsQueryError : null
   const mcpToolsError = mcpToolsQueryError instanceof Error ? mcpToolsQueryError : null
   const canEditConfiguration = hasPermission("agents:reload")
@@ -1038,33 +914,6 @@ export default function AgentsPage() {
     [brainSkills],
   )
   const mcpToolMap = useMemo(() => new Map(mcpTools.map((tool) => [tool.id, tool])), [mcpTools])
-  const workflowMap = useMemo(() => new Map(workflows.map((workflow) => [workflow.id, workflow])), [workflows])
-
-  const workflowOptions = useMemo<WorkflowOption[]>(() => {
-    const optionMap = new Map<string, WorkflowOption>()
-
-    for (const workflow of workflows) {
-      const workflowId = String(workflow.id ?? "").trim()
-      if (!workflowId) continue
-      optionMap.set(workflowId, {
-        value: workflowId,
-        label: workflow.name,
-        description: workflow.description ?? "",
-      })
-    }
-
-    for (const agent of agents) {
-      const workflowId = resolveAgentWorkflowId(agent)
-      if (!workflowId || optionMap.has(workflowId)) continue
-      optionMap.set(workflowId, {
-        value: workflowId,
-        label: workflowId,
-        description: "",
-      })
-    }
-
-    return Array.from(optionMap.values()).sort((left, right) => left.label.localeCompare(right.label, "zh-CN"))
-  }, [agents, workflows])
 
   const modelOptions = useMemo<ModelOption[]>(() => {
     const providers = agentApiSettings?.settings?.providers ?? {}
@@ -1091,7 +940,6 @@ export default function AgentsPage() {
           agent.name.toLowerCase().includes(keyword) ||
           agent.description.toLowerCase().includes(keyword) ||
           String(agent.modelBinding?.model ?? "").toLowerCase().includes(keyword) ||
-          String(resolveBoundWorkflowName(agent, workflowMap) ?? "").toLowerCase().includes(keyword) ||
           resolveAgentBoundSkills(agent, brainSkillMap).some((skill) =>
             skill.name.toLowerCase().includes(keyword),
           ) ||
@@ -1101,7 +949,7 @@ export default function AgentsPage() {
         )
       })
       .sort((left, right) => left.name.localeCompare(right.name, "zh-CN"))
-  }, [activeFilter, agents, brainSkillMap, mcpToolMap, searchQuery, workflowMap])
+  }, [activeFilter, agents, brainSkillMap, mcpToolMap, searchQuery])
 
   const activeCount = agents.filter((item) => item.enabled).length
   const runningCount = agents.filter((item) => item.status === "running").length
@@ -1297,7 +1145,6 @@ export default function AgentsPage() {
                       key={agent.id}
                       agent={agent}
                       isActive={agent.id === selectedAgent?.id}
-                      workflowName={resolveBoundWorkflowName(agent, workflowMap)}
                       onSelect={setSelectedAgentId}
                     />
                   ))}
@@ -1311,9 +1158,6 @@ export default function AgentsPage() {
               <AgentDetailPanel
                 agent={selectedAgent}
                 modelOptions={modelOptions}
-                workflowOptions={workflowOptions}
-                workflowsLoading={workflowsLoading}
-                workflowsError={workflowsError}
                 brainSkills={brainSkills}
                 brainSkillsLoading={brainSkillsLoading}
                 brainSkillsError={brainSkillsError}
@@ -1346,9 +1190,6 @@ export default function AgentsPage() {
         open={dialogOpen}
         agent={null}
         modelOptions={modelOptions}
-        workflowOptions={workflowOptions}
-        workflowsLoading={workflowsLoading}
-        workflowsError={workflowsError}
         brainSkills={brainSkills}
         brainSkillsLoading={brainSkillsLoading}
         brainSkillsError={brainSkillsError}

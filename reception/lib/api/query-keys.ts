@@ -2,16 +2,9 @@ export const queryKeys = {
   auth: {
     session: ['auth', 'session'] as const,
   },
-  approvals: {
-    list: (params?: { status?: string; requestType?: string }) =>
-      ['approvals', params?.status ?? 'all', params?.requestType ?? 'all'] as const,
-  },
   dashboard: {
     stats: ['dashboard', 'stats'] as const,
     logs: (limit?: number) => ['dashboard', 'logs', limit ?? null] as const,
-  },
-  collaboration: {
-    overview: (taskId?: string) => ['collaboration', 'overview', taskId ?? null] as const,
   },
   tasks: {
     list: ['tasks'] as const,
@@ -28,9 +21,6 @@ export const queryKeys = {
     sources: ['tools', 'sources'] as const,
     detail: (toolId: string | null) => ['tools', 'detail', toolId ?? null] as const,
     sourceDetail: (sourceId: string | null) => ['tools', 'source-detail', sourceId ?? null] as const,
-  },
-  schedules: {
-    list: ['schedules'] as const,
   },
   users: {
     tenants: ['users', 'tenants'] as const,
@@ -84,7 +74,6 @@ export const queryKeys = {
     rules: ['security', 'rules'] as const,
   },
   settings: {
-    governance: ['settings', 'governance'] as const,
     general: ['settings', 'general'] as const,
     agentApi: ['settings', 'agent-api'] as const,
     channelIntegration: ['settings', 'channel-integration'] as const,
@@ -105,11 +94,5 @@ export const queryKeys = {
         params?.limit ?? 50,
         params?.status ?? 'all',
       ] as const,
-  },
-  workflows: {
-    list: ['workflows'] as const,
-    monitor: (workflowId: string) => ['workflows', workflowId, 'monitor'] as const,
-    runs: (workflowId: string) => ['workflows', workflowId, 'runs'] as const,
-    run: (runId: string) => ['workflows', 'runs', runId] as const,
   },
 }

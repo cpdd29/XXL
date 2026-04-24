@@ -89,7 +89,6 @@ export function useRetryTask() {
       queryClient.invalidateQueries({ queryKey: queryKeys.tasks.list })
       queryClient.invalidateQueries({ queryKey: queryKeys.tasks.detail(taskId) })
       queryClient.invalidateQueries({ queryKey: queryKeys.tasks.steps(taskId) })
-      queryClient.invalidateQueries({ queryKey: ['collaboration'] })
     },
   })
 }

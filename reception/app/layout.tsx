@@ -6,7 +6,7 @@ import './globals.css'
 
 export const metadata: Metadata = {
   title: 'WorkBot - 多Agent协作平台',
-  description: '企业级多Agent协作工作流管理系统',
+  description: '企业级多Agent协作与接待调度平台',
   generator: 'v0.app',
   icons: {
     icon: [

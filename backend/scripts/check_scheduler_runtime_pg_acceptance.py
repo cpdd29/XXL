@@ -16,7 +16,7 @@ BACKEND_ROOT = Path(__file__).resolve().parents[1]
 if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
 
-import app.services.scheduler_guard_service as scheduler_guard_module
+import app.modules.dispatch.workflow_runtime.scheduler_guard_service as scheduler_guard_module
 from app.db.models import (
     AgentExecutionJobRecord,
     TaskRecord,
@@ -25,9 +25,9 @@ from app.db.models import (
     WorkflowExecutionJobRecord,
     WorkflowRunRecord,
 )
-from app.services.persistence_service import StatePersistenceService
-from app.services.scheduler_guard_service import SchedulerGuardService
-from app.services.store import InMemoryStore
+from app.modules.dispatch.workflow_runtime.scheduler_guard_service import SchedulerGuardService
+from app.platform.persistence.persistence_service import StatePersistenceService
+from app.platform.persistence.runtime_store import InMemoryStore
 
 
 DISPATCH_RUNTIME_METHODS = (

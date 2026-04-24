@@ -12,8 +12,8 @@ REPO_ROOT = BACKEND_ROOT.parent
 
 
 ROUTE_FILES = (
-    "backend/app/api/routes/messages.py",
-    "backend/app/api/routes/webhooks.py",
+    "backend/app/modules/reception/api/messages.py",
+    "backend/app/modules/reception/api/webhooks.py",
     "backend/app/api/routes/external_connections.py",
 )
 

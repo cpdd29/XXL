@@ -3,10 +3,10 @@ from __future__ import annotations
 from copy import deepcopy
 from pathlib import Path
 
-from app.services import agent_service
-from app.services.agent_config_service import AgentConfigService
-from app.services.persistence_service import StatePersistenceService
-from app.services.store import InMemoryStore, store
+import app.modules.agent_config.registries.agent_service as agent_service
+from app.modules.agent_config.registries.agent_config_service import AgentConfigService
+from app.platform.persistence.persistence_service import StatePersistenceService
+from app.platform.persistence.runtime_store import InMemoryStore, store
 
 
 def _replace_global_store(seeded_store: InMemoryStore) -> None:
@@ -218,7 +218,7 @@ def test_list_agents_auto_loads_security_agent_config_by_type(
     seeded_store = InMemoryStore()
     seeded_store.agents = [
         {
-            "id": "2",
+            "id": "security-config-agent",
             "name": "安全检测 Agent",
             "description": "检测和过滤敏感内容，保障系统安全",
             "type": "security",
@@ -244,7 +244,7 @@ def test_list_agents_auto_loads_security_agent_config_by_type(
 
     try:
         listed = agent_service.list_agents()
-        fetched = agent_service.get_agent("2")
+        fetched = agent_service.get_agent("security-config-agent")
     finally:
         monkeypatch.setattr(agent_service, "persistence_service", original_persistence_service)
         monkeypatch.setattr(agent_service, "agent_config_service", original_agent_config_service)

@@ -9,7 +9,6 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { useDashboardStats } from "@/hooks/use-dashboard"
 import { useExternalCapabilityGovernanceOverview } from "@/hooks/use-external-connections"
 import { useTasks } from "@/hooks/use-tasks"
-import { useWorkflowMonitor, useWorkflows } from "@/hooks/use-workflows"
 import { ArrowRight, Clock3, Headphones, Shield, Wrench } from "lucide-react"
 
 function formatTimestamp(value?: string | null) {
@@ -163,7 +162,6 @@ function SummaryPill({
 export default function DashboardPage() {
   const dashboardQuery = useDashboardStats()
   const runningTasksQuery = useTasks({ status: "running" })
-  const workflowsQuery = useWorkflows()
   const externalGovernanceQuery = useExternalCapabilityGovernanceOverview(8)
 
   const data = dashboardQuery.data
@@ -171,18 +169,6 @@ export default function DashboardPage() {
   const replyQueue = data?.replyQueue ?? []
   const healthSignals = data?.healthSignals ?? []
   const tentacleMetrics = data?.tentacleMetrics ?? []
-  const workflowCandidates = workflowsQuery.data?.items ?? []
-
-  const primaryWorkflow = useMemo(
-    () =>
-      workflowCandidates.find((item) => ["running", "active"].includes(String(item.status).toLowerCase())) ??
-      workflowCandidates[0],
-    [workflowCandidates],
-  )
-
-  const workflowMonitorQuery = useWorkflowMonitor(primaryWorkflow?.id)
-  const workflowMonitor = workflowMonitorQuery.data
-  const workflowRuns = workflowMonitor?.items ?? []
 
   const runningTasks = useMemo(
     () =>
@@ -192,37 +178,13 @@ export default function DashboardPage() {
     [runningTasksQuery.data?.items],
   )
 
-  const currentTask = useMemo(() => {
-    if (runningTasks.length === 0) return undefined
-    if (!primaryWorkflow) return runningTasks[0]
-    return (
-      runningTasks.find(
-        (task) =>
-          task.workflowId === primaryWorkflow.id ||
-          task.routeDecision?.workflowId === primaryWorkflow.id ||
-          task.routeDecision?.workflowName === primaryWorkflow.name ||
-          task.brainDispatchSummary?.workflowName === primaryWorkflow.name,
-      ) ?? runningTasks[0]
-    )
-  }, [primaryWorkflow, runningTasks])
-
-  const activeRun = useMemo(
-    () =>
-      workflowRuns.find((item) =>
-        ["running", "pending"].includes(item.status) ||
-        ["running", "claimed", "queued", "scheduled", "retry_waiting", "claimed_stale"].includes(
-          item.monitor?.monitorState ?? "",
-        ),
-      ) ?? workflowRuns[0],
-    [workflowRuns],
-  )
-
-  const currentWorkflowName =
-    currentTask?.routeDecision?.workflowName ||
-    currentTask?.brainDispatchSummary?.workflowName ||
-    activeRun?.workflowName ||
-    primaryWorkflow?.name ||
-    "当前暂无命中的工作流"
+  const currentTask = runningTasks[0]
+  const currentTaskLabel =
+    currentTask?.title ||
+    currentTask?.description ||
+    currentTask?.routeDecision?.executionAgent ||
+    currentTask?.agent ||
+    "当前暂无执行中的主线任务"
 
   const humanActionCount = managerQueue.length + replyQueue.length
   const brainHealth = data?.slaSummary.healthStatus ?? "healthy"
@@ -272,26 +234,26 @@ export default function DashboardPage() {
         <MetricCard
           title="执行成功率"
           value={`${successRate}%`}
-          hint={`失败率 ${failureRate}% · 点击查看工作流`}
+          hint={`失败率 ${failureRate}% · 点击查看任务中心`}
           toneClass={healthTone[brainHealth]}
           icon={<Shield className="size-4" />}
-          href="/workflow"
+          href="/tasks"
         />
         <MetricCard
           title="执行中任务"
           value={runningTasks.length}
-          hint={currentTask ? `当前主线：${clipText(currentWorkflowName, 18)}` : "点击查看执行任务模块"}
+          hint={currentTask ? `当前主线：${clipText(currentTaskLabel, 18)}` : "点击查看执行任务模块"}
           toneClass="bg-primary/10 text-primary"
           icon={<Clock3 className="size-4" />}
           href="/tasks"
         />
         <MetricCard
-          title="待人工处理"
+          title="待处理项"
           value={humanActionCount}
           hint={`待确认 ${managerQueue.length} 项 · 待回复 ${replyQueue.length} 项`}
           toneClass="bg-warning/10 text-warning-foreground"
           icon={<Headphones className="size-4" />}
-          href="/reception"
+          href="/tasks"
         />
         <MetricCard
           title="SKILL/MCP"
@@ -426,7 +388,7 @@ export default function DashboardPage() {
         </CardContent>
       </Card>
 
-      {(dashboardQuery.isLoading || runningTasksQuery.isLoading || workflowsQuery.isLoading) && !data ? (
+      {(dashboardQuery.isLoading || runningTasksQuery.isLoading) && !data ? (
         <div className="text-sm text-muted-foreground">正在加载主脑运行状态...</div>
       ) : null}
     </div>

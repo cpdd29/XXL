@@ -9,9 +9,10 @@ from sqlalchemy import delete
 
 from app.db.models import UserProfileRecord, UserRecord
 from app.main import app
-from app.services import auth_service, profile_service
-from app.services.persistence_service import StatePersistenceService
-from app.services.store import InMemoryStore, store
+import app.modules.organization.application.profile_service as profile_service
+import app.platform.auth.auth_service as auth_service
+from app.platform.persistence.persistence_service import StatePersistenceService
+from app.platform.persistence.runtime_store import InMemoryStore, store
 
 
 client = TestClient(app)
@@ -500,7 +501,7 @@ def test_auth_session_route_returns_permission_snapshot(auth_headers_factory) ->
     payload = response.json()
     assert payload["user"]["email"] == "ops@example.com"
     assert payload["roleSummary"]["key"] == "operator"
-    assert "workflows:definition:write" in payload["permissions"]
+    assert "settings:agent-api:write" in payload["permissions"]
     assert "settings:security-policy:write" in payload["permissions"]
     assert any(group["key"] == "security" for group in payload["permissionGroups"])
 

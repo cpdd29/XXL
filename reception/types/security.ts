@@ -37,7 +37,7 @@ export interface SecurityRule {
 }
 
 export interface SecurityEntityRef {
-  type: 'task' | 'run' | 'collaboration' | 'workflow' | 'user' | 'channel'
+  type: 'task' | 'run' | 'workflow' | 'user' | 'channel'
   id: string
   label: string
   href: string

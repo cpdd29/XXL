@@ -1,7 +1,7 @@
 from fastapi.testclient import TestClient
 
 from app.main import app
-from app.services.store import store
+from app.platform.persistence.runtime_store import store
 
 
 client = TestClient(app)

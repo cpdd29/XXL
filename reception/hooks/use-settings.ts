@@ -6,19 +6,11 @@ import { queryKeys } from '@/lib/api/query-keys'
 import type {
   AgentApiSettingsResponse,
   ChannelIntegrationSettingsResponse,
-  ConfigGovernanceResponse,
   GeneralSettingsResponse,
   UpdateAgentApiSettingsRequest,
   UpdateChannelIntegrationSettingsRequest,
   UpdateGeneralSettingsRequest,
 } from '@/types'
-
-export function useConfigGovernance() {
-  return useQuery({
-    queryKey: queryKeys.settings.governance,
-    queryFn: () => apiRequest<ConfigGovernanceResponse>('/api/settings/governance'),
-  })
-}
 
 export function useGeneralSettings() {
   return useQuery({

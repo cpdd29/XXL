@@ -60,8 +60,8 @@ def _check_function(
 
 def run_security_entrypoint_check(*, repo_root: Path | None = None) -> dict[str, Any]:
     resolved_repo_root = (repo_root or REPO_ROOT).resolve()
-    messages_path = resolved_repo_root / "backend/app/api/routes/messages.py"
-    webhooks_path = resolved_repo_root / "backend/app/api/routes/webhooks.py"
+    messages_path = resolved_repo_root / "backend/app/modules/reception/api/messages.py"
+    webhooks_path = resolved_repo_root / "backend/app/modules/reception/api/webhooks.py"
     checks = [
         _check_function(
             file_path=messages_path,
@@ -85,16 +85,6 @@ def run_security_entrypoint_check(*, repo_root: Path | None = None) -> dict[str,
                 "enforce_webhook_rate_limit",
                 "enforce_webhook_payload_size",
                 "ingest_telegram_webhook",
-            ),
-        ),
-        _check_function(
-            file_path=webhooks_path,
-            function_name="workflow_webhook_route",
-            required_calls=(
-                "enforce_webhook_rate_limit",
-                "enforce_webhook_payload_size",
-                "security_gateway_service.inspect_text_entrypoint",
-                "trigger_workflow_webhook",
             ),
         ),
     ]

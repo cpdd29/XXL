@@ -396,7 +396,6 @@ export default function ToolsPage() {
         tool.configSummary.toLowerCase().includes(deferredSearch) ||
         tool.invocationSummary.summary.toLowerCase().includes(deferredSearch) ||
         tool.linkedAgents.some((agent) => agent.toLowerCase().includes(deferredSearch)) ||
-        tool.linkedWorkflows.some((workflow) => workflow.toLowerCase().includes(deferredSearch)) ||
         tool.requiredCapabilities.some((capability) => capability.toLowerCase().includes(deferredSearch))
 
       return matchesSearch

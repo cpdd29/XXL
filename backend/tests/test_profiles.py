@@ -1,9 +1,9 @@
 from fastapi.testclient import TestClient
 
 from app.main import app
-from app.services.memory_service import memory_service
-from app.services.profile_service import TENANT_DIRECTORY_SETTING_KEY
-from app.services.store import store
+from app.modules.organization.application.memory_service import memory_service
+from app.modules.organization.application.profile_service import TENANT_DIRECTORY_SETTING_KEY
+from app.platform.persistence.runtime_store import store
 
 
 client = TestClient(app)

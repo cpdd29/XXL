@@ -3,8 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 import sqlite3
 
-from app.core.sqlite_memory_store import SQLiteMidTermMemoryStore
-from app.services.memory_service import MemoryService
+from app.modules.organization.memory_store.sqlite_memory_store import SQLiteMidTermMemoryStore
+from app.modules.organization.application.memory_service import MemoryService
 
 
 class NoRedisProvider:

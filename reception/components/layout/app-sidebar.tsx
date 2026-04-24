@@ -5,7 +5,6 @@ import { usePathname } from "next/navigation"
 import {
   Bot,
   Building2,
-  GitBranch,
   Headphones,
   LayoutDashboard,
   ListTodo,
@@ -33,58 +32,41 @@ type NavSection = {
 
 const navSections: NavSection[] = [
   {
-    title: "总控视图",
+    title: "工作台",
     items: [
       {
-        title: "主脑总控台",
+        title: "主脑总览",
         href: "/dashboard",
         icon: LayoutDashboard,
         permission: "dashboard:read",
       },
       {
-        title: "执行任务",
+        title: "任务中心",
         href: "/tasks",
         icon: ListTodo,
         permission: "tasks:read",
       },
-      {
-        title: "待人工处理",
-        href: "/reception",
-        icon: Headphones,
-      },
-      {
-        title: "工作流",
-        href: "/workflow",
-        icon: GitBranch,
-        permission: "workflows:read",
-      },
-      {
-        title: "SKILL/MCP",
-        href: "/tools",
-        icon: Wrench,
-        permission: "tool_sources:read",
-      },
     ],
   },
   {
-    title: "可视视图",
-    items: [
-      {
-        title: "摩天大厦",
-        href: "/visualization/skyscraper",
-        icon: Building2,
-        permission: "dashboard:read",
-      },
-    ],
-  },
-  {
-    title: "高级运维",
+    title: "风险治理",
     items: [
       {
         title: "风险与安全",
         href: "/security",
         icon: Shield,
         permission: "security:read",
+      },
+    ],
+  },
+  {
+    title: "能力接入",
+    items: [
+      {
+        title: "SKILL/MCP",
+        href: "/tools",
+        icon: Wrench,
+        permission: "tool_sources:read",
       },
       {
         title: "渠道接入",
@@ -107,7 +89,7 @@ const navSections: NavSection[] = [
     ],
   },
   {
-    title: "系统设置",
+    title: "组织设置",
     items: [
       {
         title: "租户管理",
@@ -136,13 +118,10 @@ function isNavItemActive(pathname: string, href: string) {
   if (href === "/security") return pathname === "/security"
   if (
     href === "/dashboard" ||
-    href === "/reception" ||
     href === "/tasks" ||
     href === "/users" ||
     href === "/agents" ||
-    href === "/tools" ||
-    href === "/workflow" ||
-    href === "/visualization/skyscraper"
+    href === "/tools"
   ) {
     return pathname.startsWith(`${href}/`)
   }

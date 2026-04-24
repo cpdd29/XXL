@@ -17,9 +17,9 @@ if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
 
 from app.db.models import ConversationMessageRecord, UserProfileRecord  # noqa: E402
-from app.services.persistence_service import StatePersistenceService  # noqa: E402
-from app.services.store import InMemoryStore, store  # noqa: E402
-from app.services.tenancy_service import default_scope  # noqa: E402
+from app.modules.organization.application.tenancy_service import default_scope  # noqa: E402
+from app.platform.persistence.persistence_service import StatePersistenceService  # noqa: E402
+from app.platform.persistence.runtime_store import InMemoryStore, store  # noqa: E402
 
 
 DEFAULT_TENANT_STATUS = "active"
