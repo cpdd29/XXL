@@ -2,6 +2,7 @@
 
 import Link from "next/link"
 import { useParams } from "next/navigation"
+import { useEffect, useState } from "react"
 import { Card, CardContent, CardHeader, CardTitle } from "@/shared/ui/card"
 import { Badge } from "@/shared/ui/badge"
 import { Button } from "@/shared/ui/button"
@@ -25,15 +26,23 @@ import { Progress } from "@/shared/ui/progress"
 import { Separator } from "@/shared/ui/separator"
 import { Skeleton } from "@/shared/ui/skeleton"
 import { useCancelTask, useRetryTask, useTaskDetail, useTaskSteps } from "@/modules/dispatch/hooks/use-tasks"
+import { buildAuthenticatedWebSocketUrl } from "@/platform/api/auth-storage"
+import { WS_BASE_URL } from "@/platform/api/config"
 import { toast } from "@/shared/hooks/use-toast"
 import type {
   BrainDispatchSummary,
   ManagerPacket,
+  Task as TaskPayload,
+  TaskAgentGroup as TaskAgentGroupPayload,
+  TaskAgentGroupMember as TaskAgentGroupMemberPayload,
+  TaskAgentGroupTimelineEntry as TaskAgentGroupTimelineEntryPayload,
   TaskExecutionTraceEntry,
   TaskPriority,
+  TaskRealtimeResponse,
   TaskRouteDecision,
   TaskStatus,
   TaskStep,
+  TaskStepsResponse,
 } from "@/shared/types"
 import {
   ArrowLeft,
@@ -45,6 +54,8 @@ import {
   Link2,
   PlayCircle,
   Sparkles,
+  Wifi,
+  WifiOff,
   XCircle,
 } from "lucide-react"
 import { cn } from "@/shared/utils"
@@ -88,6 +99,37 @@ const deliveryStatusConfig: Record<string, string> = {
   sent: "已回传",
   failed: "回传失败",
   skipped: "未自动回传",
+}
+
+type LiveConnectionState = "connecting" | "connected" | "disconnected" | "error"
+
+function liveConnectionMeta(state: LiveConnectionState) {
+  if (state === "connected") {
+    return {
+      label: "实时同步已连接",
+      tone: "bg-success/10 text-success",
+      icon: <Wifi className="size-3.5" />,
+    }
+  }
+  if (state === "connecting") {
+    return {
+      label: "实时同步连接中",
+      tone: "bg-warning/10 text-warning-foreground",
+      icon: <Wifi className="size-3.5" />,
+    }
+  }
+  if (state === "error") {
+    return {
+      label: "实时同步异常",
+      tone: "bg-destructive/10 text-destructive",
+      icon: <WifiOff className="size-3.5" />,
+    }
+  }
+  return {
+    label: "实时同步未连接",
+    tone: "bg-muted text-muted-foreground",
+    icon: <WifiOff className="size-3.5" />,
+  }
 }
 
 function getProgress(steps: TaskStep[], taskStatus?: TaskStatus) {
@@ -193,6 +235,713 @@ function getDeliveryStatusLabel(value?: string) {
   return deliveryStatusConfig[value] ?? value
 }
 
+function isActiveTaskStatus(value?: TaskStatus) {
+  return value === "pending" || value === "running"
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value)
+}
+
+type TaskAgentMemberView = {
+  id: string
+  name: string
+  role: string
+  branchId: string
+  type: string
+  status: string
+  enabled: boolean | null
+  providerKey: string
+  providerLabel: string
+  model: string
+  boundSkillIds: string[]
+  boundToolIds: string[]
+  requestedSkillIds: string[]
+  requestedToolIds: string[]
+  natsSubject: string
+  soul: string
+  runtimeStatus: string
+  currentStepId: string
+  currentStepTitle: string
+  currentStepMessage: string
+  currentStepStartedAt: string
+  currentStepFinishedAt: string
+  selectedForDelivery: boolean | null
+}
+
+type TaskAgentGroupView = {
+  source: "projection" | "fallback"
+  groupId: string
+  groupName: string
+  status: string
+  topology: string
+  coordinationMode: string
+  dispatcherAgentId: string
+  members: TaskAgentMemberView[]
+  acceptanceAgent: TaskAgentMemberView | null
+  requestedSkillIds: string[]
+  requestedToolIds: string[]
+  appliedSkillIds: string[]
+  appliedToolIds: string[]
+  natsSubjects: Array<{ key: string; value: string }>
+  timeline: TaskAgentTimelineView[]
+  warnings: string[]
+}
+
+type TaskAgentTimelineView = {
+  id: string
+  kind: string
+  title: string
+  detail: string
+  timestamp: string
+  actorAgentId: string
+  actorAgentName: string
+  metadata: Array<{ key: string; value: string }>
+}
+
+function normalizeIdentifierList(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    return []
+  }
+
+  return Array.from(
+    new Set(value.map((item) => String(item ?? "").trim()).filter(Boolean)),
+  )
+}
+
+function textValue(value: unknown) {
+  return String(value ?? "").trim()
+}
+
+function stringifyValue(value: unknown) {
+  if (value === null || value === undefined) {
+    return ""
+  }
+  if (typeof value === "string") {
+    return value.trim()
+  }
+  if (typeof value === "number" || typeof value === "boolean") {
+    return String(value)
+  }
+  try {
+    return JSON.stringify(value)
+  } catch {
+    return ""
+  }
+}
+
+function previewSoul(value: string, limit = 220) {
+  if (value.length <= limit) {
+    return value
+  }
+  return `${value.slice(0, limit).trimEnd()}...`
+}
+
+function roleLabel(value: string) {
+  const labels: Record<string, string> = {
+    frontend: "前端",
+    backend: "后端",
+    fullstack: "全栈",
+    integration: "联调",
+    acceptance: "验收",
+    development: "开发",
+  }
+  return labels[value] || value || "未标注角色"
+}
+
+function agentStatusLabel(value: string) {
+  const labels: Record<string, string> = {
+    idle: "空闲",
+    running: "运行中",
+    disabled: "停用",
+    failed: "异常",
+    provisioned: "已编组",
+    draft: "草稿",
+  }
+  return labels[value] || value || "状态未知"
+}
+
+function memberRuntimeStatusLabel(value: string) {
+  const labels: Record<string, string> = {
+    pending: "待启动",
+    running: "执行中",
+    completed: "已完成",
+    failed: "执行失败",
+    cancelled: "已取消",
+    queued: "排队中",
+  }
+  return labels[value] || value || "运行状态未知"
+}
+
+function acceptanceOutcome(taskStatus: TaskStatus, deliveryStatus?: string, runtimeStatus?: string) {
+  if (runtimeStatus === "failed") {
+    return "未通过"
+  }
+  if (runtimeStatus === "completed" && deliveryStatus === "sent") {
+    return "通过并已回传"
+  }
+  if (runtimeStatus === "completed" && deliveryStatus === "failed") {
+    return "通过但回传失败"
+  }
+  if (runtimeStatus === "completed" && taskStatus === "completed") {
+    return "已通过"
+  }
+  if (runtimeStatus === "running") {
+    return "验收中"
+  }
+  if (runtimeStatus === "pending") {
+    return "待验收"
+  }
+  if (taskStatus === "failed") {
+    return "待人工确认"
+  }
+  return "待验收"
+}
+
+function natsSubjectEntries(value: Record<string, unknown> | null | undefined) {
+  if (!isRecord(value)) {
+    return []
+  }
+
+  return Object.entries(value)
+    .map(([key, item]) => ({
+      key,
+      value: stringifyValue(item),
+    }))
+    .filter((item) => item.value !== "")
+}
+
+function timelineMetadataEntries(value: Record<string, unknown> | null | undefined) {
+  if (!isRecord(value)) {
+    return []
+  }
+
+  return Object.entries(value)
+    .map(([key, item]) => ({
+      key,
+      value: stringifyValue(item),
+    }))
+    .filter((item) => item.value !== "")
+}
+
+function normalizeTaskAgentTimelineEntry(
+  entry?: TaskAgentGroupTimelineEntryPayload | null,
+  fallback?: Partial<TaskAgentTimelineView>,
+): TaskAgentTimelineView | null {
+  const normalized: TaskAgentTimelineView = {
+    id: textValue(entry?.id ?? fallback?.id),
+    kind: textValue(entry?.kind ?? fallback?.kind),
+    title: textValue(entry?.title ?? fallback?.title),
+    detail: textValue(entry?.detail ?? fallback?.detail),
+    timestamp: textValue(entry?.timestamp ?? fallback?.timestamp),
+    actorAgentId: textValue(entry?.actorAgentId ?? fallback?.actorAgentId),
+    actorAgentName: textValue(entry?.actorAgentName ?? fallback?.actorAgentName),
+    metadata:
+      entry?.metadata && isRecord(entry.metadata)
+        ? timelineMetadataEntries(entry.metadata)
+        : fallback?.metadata ?? [],
+  }
+
+  if (!normalized.title && !normalized.detail && !normalized.timestamp) {
+    return null
+  }
+
+  return normalized
+}
+
+function normalizeTaskAgentMember(
+  member?: TaskAgentGroupMemberPayload | null,
+  fallback?: Partial<TaskAgentMemberView>,
+): TaskAgentMemberView | null {
+  const normalized: TaskAgentMemberView = {
+    id: textValue(member?.id ?? fallback?.id),
+    name: textValue(member?.name ?? fallback?.name),
+    role: textValue(member?.role ?? fallback?.role),
+    branchId: textValue(member?.branchId ?? fallback?.branchId),
+    type: textValue(member?.type ?? fallback?.type),
+    status: textValue(member?.status ?? fallback?.status),
+    enabled: member?.enabled ?? fallback?.enabled ?? null,
+    providerKey: textValue(member?.providerKey ?? fallback?.providerKey),
+    providerLabel: textValue(member?.providerLabel ?? fallback?.providerLabel),
+    model: textValue(member?.model ?? fallback?.model),
+    boundSkillIds: normalizeIdentifierList(member?.boundSkillIds ?? fallback?.boundSkillIds),
+    boundToolIds: normalizeIdentifierList(member?.boundToolIds ?? fallback?.boundToolIds),
+    requestedSkillIds: normalizeIdentifierList(
+      member?.requestedSkillIds ?? fallback?.requestedSkillIds,
+    ),
+    requestedToolIds: normalizeIdentifierList(
+      member?.requestedToolIds ?? fallback?.requestedToolIds,
+    ),
+    natsSubject: textValue(member?.natsSubject ?? fallback?.natsSubject),
+    soul: textValue(member?.soul ?? fallback?.soul),
+    runtimeStatus: textValue(member?.runtimeStatus ?? fallback?.runtimeStatus),
+    currentStepId: textValue(member?.currentStepId ?? fallback?.currentStepId),
+    currentStepTitle: textValue(member?.currentStepTitle ?? fallback?.currentStepTitle),
+    currentStepMessage: textValue(member?.currentStepMessage ?? fallback?.currentStepMessage),
+    currentStepStartedAt: textValue(member?.currentStepStartedAt ?? fallback?.currentStepStartedAt),
+    currentStepFinishedAt: textValue(member?.currentStepFinishedAt ?? fallback?.currentStepFinishedAt),
+    selectedForDelivery: member?.selectedForDelivery ?? fallback?.selectedForDelivery ?? null,
+  }
+
+  if (
+    !normalized.id &&
+    !normalized.name &&
+    !normalized.role &&
+    !normalized.branchId &&
+    !normalized.model &&
+    normalized.boundSkillIds.length === 0 &&
+    normalized.boundToolIds.length === 0 &&
+    normalized.requestedSkillIds.length === 0 &&
+    normalized.requestedToolIds.length === 0 &&
+    !normalized.natsSubject &&
+    !normalized.soul &&
+    !normalized.runtimeStatus &&
+    !normalized.currentStepTitle &&
+    !normalized.currentStepMessage
+  ) {
+    return null
+  }
+
+  return normalized
+}
+
+function resolveProjectedTaskAgentGroup(taskAgentGroup?: TaskAgentGroupPayload | null): TaskAgentGroupView | null {
+  if (!taskAgentGroup) {
+    return null
+  }
+
+  const members = (taskAgentGroup.developmentAgents ?? [])
+    .map((member) => normalizeTaskAgentMember(member))
+    .filter((member): member is TaskAgentMemberView => Boolean(member))
+
+  const acceptanceAgent = normalizeTaskAgentMember(taskAgentGroup.acceptanceAgent, {
+    role: "acceptance",
+  })
+
+  const projected: TaskAgentGroupView = {
+    source: "projection",
+    groupId: textValue(taskAgentGroup.id),
+    groupName: textValue(taskAgentGroup.name),
+    status: textValue(taskAgentGroup.status),
+    topology: textValue(taskAgentGroup.topology),
+    coordinationMode: textValue(taskAgentGroup.coordinationMode),
+    dispatcherAgentId: textValue(taskAgentGroup.dispatcherAgentId),
+    members,
+    acceptanceAgent,
+    requestedSkillIds: normalizeIdentifierList(taskAgentGroup.requestedSkillIds),
+    requestedToolIds: normalizeIdentifierList(taskAgentGroup.requestedToolIds),
+    appliedSkillIds: normalizeIdentifierList(taskAgentGroup.appliedSkillIds),
+    appliedToolIds: normalizeIdentifierList(taskAgentGroup.appliedToolIds),
+    natsSubjects: natsSubjectEntries(taskAgentGroup.natsSubjects),
+    timeline: (taskAgentGroup.timeline ?? [])
+      .map((entry) => normalizeTaskAgentTimelineEntry(entry))
+      .filter((entry): entry is TaskAgentTimelineView => Boolean(entry)),
+    warnings: normalizeIdentifierList(taskAgentGroup.warnings),
+  }
+
+  if (
+    !projected.groupId &&
+    !projected.groupName &&
+    !projected.status &&
+    !projected.topology &&
+    !projected.coordinationMode &&
+    !projected.dispatcherAgentId &&
+    projected.members.length === 0 &&
+    !projected.acceptanceAgent &&
+    projected.requestedSkillIds.length === 0 &&
+    projected.requestedToolIds.length === 0 &&
+    projected.appliedSkillIds.length === 0 &&
+    projected.appliedToolIds.length === 0 &&
+    projected.natsSubjects.length === 0 &&
+    projected.timeline.length === 0 &&
+    projected.warnings.length === 0
+  ) {
+    return null
+  }
+
+  return projected
+}
+
+function resolveFallbackTaskAgentGroup(routeDecision?: TaskRouteDecision): TaskAgentGroupView | null {
+  if (!routeDecision || !isRecord(routeDecision.executionPlan)) {
+    return null
+  }
+
+  const executionPlan = routeDecision.executionPlan
+  const metadata = isRecord(executionPlan.metadata) ? executionPlan.metadata : null
+  const fanIn = isRecord(executionPlan.fanIn)
+    ? executionPlan.fanIn
+    : isRecord(executionPlan.fan_in)
+      ? executionPlan.fan_in
+      : null
+  const steps = Array.isArray(executionPlan.steps) ? executionPlan.steps : []
+  const members = steps
+    .map((step) => {
+      if (!isRecord(step)) return null
+      return normalizeTaskAgentMember(undefined, {
+        role: textValue(step.role) || "development",
+        id: textValue(step.executionAgentId ?? step.execution_agent_id),
+        name:
+          textValue(step.executionAgent ?? step.execution_agent) ||
+          textValue(step.executionAgentId ?? step.execution_agent_id) ||
+          "未命名成员",
+        branchId: textValue(step.branchId ?? step.branch_id),
+      })
+    })
+    .filter((item): item is TaskAgentMemberView => Boolean(item))
+
+  const warnings = Array.isArray(metadata?.warnings)
+    ? metadata.warnings.map((item) => String(item ?? "").trim()).filter(Boolean)
+    : []
+
+  const groupId = String(metadata?.groupId ?? metadata?.group_id ?? "").trim()
+  const groupName = String(metadata?.groupName ?? metadata?.group_name ?? "").trim()
+  const acceptanceAgentId = String(
+    metadata?.acceptanceAgentId ?? metadata?.acceptance_agent_id ?? fanIn?.aggregatorId ?? fanIn?.aggregator_id ?? "",
+  ).trim()
+  const acceptanceAgentName = String(
+    metadata?.acceptanceAgentName ?? metadata?.acceptance_agent_name ?? fanIn?.aggregator ?? "",
+  ).trim()
+  const topology = String(routeDecision.executionScope ?? executionPlan.planType ?? executionPlan.plan_type ?? "").trim()
+  const coordinationMode = String(
+    executionPlan.coordinationMode ?? executionPlan.coordination_mode ?? "",
+  ).trim()
+
+  if (!groupId && !groupName && members.length === 0 && !acceptanceAgentId && !acceptanceAgentName) {
+    return null
+  }
+
+  const timeline: TaskAgentTimelineView[] = [
+    {
+      id: `${groupId || "task-group"}:fallback-created`,
+      kind: "group_created",
+      title: "识别到开发组",
+      detail: `${groupName || groupId || "当前任务开发组"} 已出现在执行计划中。`,
+      timestamp: "",
+      actorAgentId: "",
+      actorAgentName: "",
+      metadata: [],
+    },
+    ...members.map((member, index) => ({
+      id: `${groupId || "task-group"}:fallback-member:${member.id || index + 1}`,
+      kind: "development_agent_provisioned",
+      title: "识别到开发成员",
+      detail: `${member.name || member.id || "开发 Agent"} 承担 ${roleLabel(member.role)} 角色。`,
+      timestamp: "",
+      actorAgentId: member.id,
+      actorAgentName: member.name,
+      metadata: member.branchId
+        ? [
+            {
+              key: "branch",
+              value: member.branchId,
+            },
+          ]
+        : [],
+    })),
+  ]
+  if (acceptanceAgentId || acceptanceAgentName) {
+    timeline.push({
+      id: `${groupId || "task-group"}:fallback-acceptance`,
+      kind: "acceptance_agent_provisioned",
+      title: "识别到验收成员",
+      detail: `${acceptanceAgentName || acceptanceAgentId} 承担最终验收。`,
+      timestamp: "",
+      actorAgentId: acceptanceAgentId,
+      actorAgentName: acceptanceAgentName,
+      metadata: [],
+    })
+  }
+
+  return {
+    source: "fallback",
+    groupId,
+    groupName,
+    status: "",
+    topology,
+    coordinationMode,
+    dispatcherAgentId: "",
+    members,
+    acceptanceAgent:
+      acceptanceAgentId || acceptanceAgentName
+        ? {
+            id: acceptanceAgentId,
+            name: acceptanceAgentName || acceptanceAgentId,
+            role: "acceptance",
+            branchId: "",
+            type: "",
+            status: "",
+            enabled: null,
+            providerKey: "",
+            providerLabel: "",
+            model: "",
+            boundSkillIds: [],
+            boundToolIds: [],
+            requestedSkillIds: [],
+            requestedToolIds: [],
+            natsSubject: "",
+            soul: "",
+            runtimeStatus: "",
+            currentStepId: "",
+            currentStepTitle: "",
+            currentStepMessage: "",
+            currentStepStartedAt: "",
+            currentStepFinishedAt: "",
+            selectedForDelivery: null,
+          }
+        : null,
+    requestedSkillIds: [],
+    requestedToolIds: [],
+    appliedSkillIds: [],
+    appliedToolIds: [],
+    natsSubjects: [],
+    timeline,
+    warnings,
+  }
+}
+
+function resolveTaskAgentGroup(
+  taskAgentGroup?: TaskAgentGroupPayload | null,
+  routeDecision?: TaskRouteDecision,
+): TaskAgentGroupView | null {
+  return resolveProjectedTaskAgentGroup(taskAgentGroup) ?? resolveFallbackTaskAgentGroup(routeDecision)
+}
+
+function CapabilityBadges({
+  items,
+  emptyText,
+  emphasis = false,
+}: {
+  items: string[]
+  emptyText: string
+  emphasis?: boolean
+}) {
+  if (items.length === 0) {
+    return (
+      <div className="rounded-lg bg-secondary/35 px-3 py-2 text-xs leading-5 text-muted-foreground">
+        {emptyText}
+      </div>
+    )
+  }
+
+  return (
+    <div className="flex flex-wrap gap-2">
+      {items.map((item) => (
+        <Badge
+          key={item}
+          variant={emphasis ? "secondary" : "outline"}
+          className={emphasis ? "bg-primary/10 text-primary" : "border-border text-muted-foreground"}
+        >
+          {item}
+        </Badge>
+      ))}
+    </div>
+  )
+}
+
+function TaskAgentMemberCard({
+  member,
+  title,
+}: {
+  member: TaskAgentMemberView
+  title: string
+}) {
+  const capabilityRows = [
+    {
+      label: "请求技能",
+      items: member.requestedSkillIds,
+      emptyText: "没有声明额外请求技能",
+    },
+    {
+      label: "实际绑定技能",
+      items: member.boundSkillIds,
+      emptyText: "当前未绑定技能",
+      emphasis: true,
+    },
+    {
+      label: "请求工具",
+      items: member.requestedToolIds,
+      emptyText: "没有声明额外请求工具",
+    },
+    {
+      label: "实际绑定工具",
+      items: member.boundToolIds,
+      emptyText: "当前未绑定工具",
+      emphasis: true,
+    },
+  ]
+
+  return (
+    <div className="rounded-xl border border-border bg-secondary/20 p-3">
+      <div className="flex flex-col gap-3">
+        <div className="flex flex-col gap-2 md:flex-row md:items-start md:justify-between">
+          <div>
+            <div className="text-xs uppercase tracking-[0.18em] text-muted-foreground">{title}</div>
+            <div className="mt-1 font-medium text-foreground">{member.name || member.id || "未命名成员"}</div>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <Badge variant="secondary" className="bg-primary/10 text-primary">
+              {roleLabel(member.role)}
+            </Badge>
+            <Badge
+              variant="secondary"
+              className={cn(
+                "text-foreground",
+                member.runtimeStatus === "completed" && "bg-success/15 text-success",
+                member.runtimeStatus === "running" && "bg-primary/15 text-primary",
+                member.runtimeStatus === "failed" && "bg-destructive/10 text-destructive",
+                member.runtimeStatus === "cancelled" && "bg-warning/15 text-warning-foreground",
+                member.runtimeStatus === "pending" && "bg-muted text-muted-foreground",
+                !member.runtimeStatus && "bg-muted text-muted-foreground",
+              )}
+            >
+              {memberRuntimeStatusLabel(member.runtimeStatus)}
+            </Badge>
+            {member.status ? <Badge variant="outline">资源状态: {agentStatusLabel(member.status)}</Badge> : null}
+            <Badge
+              variant="outline"
+              className={member.enabled === false ? "border-warning/40 text-warning-foreground" : undefined}
+            >
+              {member.enabled === null ? "启用状态未知" : member.enabled ? "已启用" : "未启用"}
+            </Badge>
+            {member.selectedForDelivery ? (
+              <Badge variant="secondary" className="bg-warning/15 text-warning-foreground">
+                已选中汇总
+              </Badge>
+            ) : null}
+            {member.model ? (
+              <Badge variant="secondary" className="bg-success/10 text-success">
+                {member.model}
+              </Badge>
+            ) : null}
+          </div>
+        </div>
+
+        <div className="flex flex-wrap gap-2">
+          {member.id ? (
+            <Badge variant="outline" className="border-border text-[11px] text-muted-foreground">
+              Agent ID: {member.id}
+            </Badge>
+          ) : null}
+          {member.branchId ? (
+            <Badge variant="outline" className="border-border text-[11px] text-muted-foreground">
+              Branch: {member.branchId}
+            </Badge>
+          ) : null}
+          {member.type ? (
+            <Badge variant="outline" className="border-border text-[11px] text-muted-foreground">
+              类型: {member.type}
+            </Badge>
+          ) : null}
+          {member.providerLabel || member.providerKey ? (
+            <Badge variant="outline" className="border-border text-[11px] text-muted-foreground">
+              提供方: {member.providerLabel || member.providerKey}
+            </Badge>
+          ) : null}
+          {member.natsSubject ? (
+            <Badge variant="outline" className="border-border text-[11px] text-muted-foreground">
+              NATS: {member.natsSubject}
+            </Badge>
+          ) : null}
+        </div>
+
+        {member.currentStepTitle || member.currentStepMessage ? (
+          <div className="rounded-lg bg-background p-3">
+            <div className="flex flex-col gap-2 md:flex-row md:items-start md:justify-between">
+              <div>
+                <div className="text-xs text-muted-foreground">当前步骤</div>
+                <div className="mt-1 text-sm font-medium text-foreground">
+                  {member.currentStepTitle || "执行中"}
+                </div>
+                {member.currentStepMessage ? (
+                  <div className="mt-1 text-xs leading-5 text-muted-foreground">
+                    {member.currentStepMessage}
+                  </div>
+                ) : null}
+              </div>
+              <div className="text-xs text-muted-foreground">
+                {member.currentStepStartedAt ? <div>开始: {member.currentStepStartedAt}</div> : null}
+                {member.currentStepFinishedAt ? <div className="mt-1">结束: {member.currentStepFinishedAt}</div> : null}
+                {member.currentStepId ? <div className="mt-1">Step ID: {member.currentStepId}</div> : null}
+              </div>
+            </div>
+          </div>
+        ) : null}
+
+        {capabilityRows.map((row) => (
+          <div key={`${member.id}-${row.label}`} className="space-y-2">
+            <div className="text-xs text-muted-foreground">{row.label}</div>
+            <CapabilityBadges items={row.items} emptyText={row.emptyText} emphasis={row.emphasis} />
+          </div>
+        ))}
+
+        {member.soul ? (
+          <div className="space-y-2">
+            <div className="text-xs text-muted-foreground">soul 预览</div>
+            <div className="rounded-lg bg-background p-3 font-mono text-[11px] leading-5 text-muted-foreground">
+              <div className="whitespace-pre-wrap break-words">{previewSoul(member.soul)}</div>
+            </div>
+          </div>
+        ) : null}
+      </div>
+    </div>
+  )
+}
+
+function TaskAgentTimelineCard({ entry }: { entry: TaskAgentTimelineView }) {
+  return (
+    <div className="rounded-xl border border-border bg-secondary/20 p-3">
+      <div className="flex flex-col gap-3">
+        <div className="flex flex-col gap-2 md:flex-row md:items-start md:justify-between">
+          <div>
+            <div className="font-medium text-foreground">{entry.title}</div>
+            {entry.detail ? (
+              <div className="mt-1 text-xs leading-5 text-muted-foreground">{entry.detail}</div>
+            ) : null}
+          </div>
+          <div className="flex flex-wrap gap-2">
+            {entry.kind ? <Badge variant="outline">{entry.kind}</Badge> : null}
+            {entry.timestamp ? (
+              <Badge variant="secondary" className="bg-primary/10 text-primary">
+                {entry.timestamp}
+              </Badge>
+            ) : null}
+          </div>
+        </div>
+
+        {entry.actorAgentName || entry.actorAgentId ? (
+          <div className="flex flex-wrap gap-2">
+            {entry.actorAgentName ? (
+              <Badge variant="secondary" className="bg-success/10 text-success">
+                {entry.actorAgentName}
+              </Badge>
+            ) : null}
+            {entry.actorAgentId ? (
+              <Badge variant="outline" className="border-border text-[11px] text-muted-foreground">
+                Agent ID: {entry.actorAgentId}
+              </Badge>
+            ) : null}
+          </div>
+        ) : null}
+
+        {entry.metadata.length > 0 ? (
+          <div className="flex flex-wrap gap-2">
+            {entry.metadata.slice(0, 6).map((item) => (
+              <Badge
+                key={`${entry.id}-${item.key}`}
+                variant="outline"
+                className="border-border text-[11px] text-muted-foreground"
+              >
+                {formatTraceMetadataLabel(item.key)}: {item.value}
+              </Badge>
+            ))}
+          </div>
+        ) : null}
+      </div>
+    </div>
+  )
+}
+
 function LoadingView() {
   return (
     <div className="space-y-6 p-6">
@@ -213,14 +962,109 @@ function LoadingView() {
 export default function TaskDetailPage() {
   const params = useParams<{ taskId: string }>()
   const taskId = params.taskId
-  const { data: task, isLoading, error } = useTaskDetail(taskId)
-  const { data: stepsData, isLoading: stepsLoading } = useTaskSteps(taskId)
+  const [liveTask, setLiveTask] = useState<TaskPayload | null>(null)
+  const [liveSteps, setLiveSteps] = useState<TaskStepsResponse | null>(null)
+  const [liveState, setLiveState] = useState<LiveConnectionState>("connecting")
+  const pollingFallbackEnabled = liveState !== "connected"
+  const taskQuery = useTaskDetail(taskId, { live: pollingFallbackEnabled })
+  const task = liveTask ?? taskQuery.data
+  const stepsQuery = useTaskSteps(taskId, {
+    live: pollingFallbackEnabled,
+    taskStatus: task?.status,
+  })
+  const stepsData = liveSteps ?? stepsQuery.data
+  const { isLoading, error } = taskQuery
+  const { isLoading: stepsLoading } = stepsQuery
   const cancelTaskMutation = useCancelTask()
   const retryTaskMutation = useRetryTask()
   const steps = stepsData?.items ?? []
   const brainDispatchEntriesList = brainDispatchEntries(task?.brainDispatchSummary)
+  const taskAgentGroup = resolveTaskAgentGroup(task?.taskAgentGroup, task?.routeDecision)
+  const liveMeta = liveConnectionMeta(liveState)
+  const showLiveBadge = Boolean(task) && (isActiveTaskStatus(task?.status) || liveState !== "disconnected")
 
-  if (isLoading) {
+  useEffect(() => {
+    setLiveTask(null)
+    setLiveSteps(null)
+    setLiveState("connecting")
+  }, [taskId])
+
+  useEffect(() => {
+    if (!taskId) {
+      setLiveState("error")
+      return
+    }
+
+    let cancelled = false
+    let socket: WebSocket | null = null
+    let retryTimer: ReturnType<typeof setTimeout> | null = null
+
+    const connect = () => {
+      const wsUrl = buildAuthenticatedWebSocketUrl(
+        `/api/tasks/${encodeURIComponent(taskId)}/realtime`,
+        WS_BASE_URL,
+      )
+      if (!wsUrl) {
+        setLiveState("error")
+        return
+      }
+
+      setLiveState("connecting")
+      socket = new WebSocket(wsUrl)
+
+      socket.onopen = () => {
+        if (!cancelled) {
+          setLiveState("connected")
+        }
+      }
+
+      socket.onmessage = (event) => {
+        if (cancelled) return
+        try {
+          const payload = JSON.parse(event.data) as TaskRealtimeResponse
+          if (payload.task) {
+            setLiveTask(payload.task)
+          }
+          if (payload.steps) {
+            setLiveSteps(payload.steps)
+          }
+          if (payload.messageType === "snapshot" || payload.messageType === "keepalive") {
+            setLiveState("connected")
+          }
+        } catch {
+          setLiveState("error")
+        }
+      }
+
+      socket.onerror = () => {
+        if (!cancelled) {
+          setLiveState("error")
+        }
+      }
+
+      socket.onclose = () => {
+        if (cancelled) return
+        setLiveState("disconnected")
+        retryTimer = setTimeout(() => {
+          connect()
+        }, 3000)
+      }
+    }
+
+    connect()
+
+    return () => {
+      cancelled = true
+      if (retryTimer) {
+        clearTimeout(retryTimer)
+      }
+      if (socket) {
+        socket.close()
+      }
+    }
+  }, [taskId])
+
+  if (isLoading && !task) {
     return <LoadingView />
   }
 
@@ -257,6 +1101,7 @@ export default function TaskDetailPage() {
   const status = statusConfig[task.status]
   const priority = priorityConfig[task.priority]
   const progress = getProgress(steps, task.status)
+  const liveRefreshing = isActiveTaskStatus(task.status)
   const canCancel = task.status === "pending" || task.status === "running"
   const canRetry = task.status !== "running"
   const taskResult = task.result
@@ -323,6 +1168,12 @@ export default function TaskDetailPage() {
               <Badge variant="secondary" className={status.color}>
                 {status.label}
               </Badge>
+              {showLiveBadge ? (
+                <Badge variant="secondary" className={liveMeta.tone}>
+                  <span className="mr-1">{liveMeta.icon}</span>
+                  {liveMeta.label}
+                </Badge>
+              ) : null}
               <Badge variant="secondary" className={priority.color}>
                 优先级: {priority.label}
               </Badge>
@@ -539,7 +1390,11 @@ export default function TaskDetailPage() {
               <div className="flex items-center justify-between">
                 <CardTitle className="text-lg">执行步骤</CardTitle>
                 <span className="text-xs text-muted-foreground">
-                  {stepsLoading ? "同步中..." : `${steps.length} steps`}
+                  {liveState === "connected"
+                    ? "实时同步中"
+                    : stepsLoading
+                      ? "同步中..."
+                      : `${steps.length} steps`}
                 </span>
               </div>
             </CardHeader>
@@ -815,6 +1670,231 @@ export default function TaskDetailPage() {
                       {task.managerPacket.clarifyQuestion}
                     </div>
                   </div>
+                ) : null}
+              </CardContent>
+            </Card>
+          ) : null}
+
+          {taskAgentGroup ? (
+            <Card className="bg-card">
+              <CardHeader className="pb-3">
+                <div className="flex items-center justify-between gap-3">
+                  <CardTitle className="text-base">任务子智能体</CardTitle>
+                  <div className="flex flex-wrap justify-end gap-2">
+                    {taskAgentGroup.source === "fallback" ? (
+                      <Badge variant="outline" className="border-warning/40 text-warning-foreground">
+                        兼容视图
+                      </Badge>
+                    ) : (
+                      <Badge variant="secondary" className="bg-success/10 text-success">
+                        正式任务域
+                      </Badge>
+                    )}
+                    {taskAgentGroup.status ? <Badge variant="outline">{taskAgentGroup.status}</Badge> : null}
+                    {taskAgentGroup.topology ? (
+                      <Badge variant="secondary" className="bg-primary/10 text-primary">
+                        {taskAgentGroup.topology}
+                      </Badge>
+                    ) : null}
+                    {taskAgentGroup.coordinationMode ? (
+                      <Badge variant="outline">{taskAgentGroup.coordinationMode}</Badge>
+                    ) : null}
+                  </div>
+                </div>
+              </CardHeader>
+              <CardContent className="space-y-3 text-sm">
+                <div className="flex items-center justify-between gap-3">
+                  <span className="text-muted-foreground">开发组</span>
+                  <span className="text-right font-medium text-foreground">
+                    {taskAgentGroup.groupName || taskAgentGroup.groupId || "--"}
+                  </span>
+                </div>
+                <Separator />
+                <div className="flex items-center justify-between gap-3">
+                  <span className="text-muted-foreground">分发责任</span>
+                  <span className="text-right font-medium text-foreground">
+                    {taskAgentGroup.dispatcherAgentId || "requirement dispatch agent"}
+                  </span>
+                </div>
+                <Separator />
+                <div className="space-y-2">
+                  <div className="text-muted-foreground">能力编排</div>
+                  <div className="grid gap-3">
+                    <div className="space-y-2 rounded-xl bg-secondary/25 p-3">
+                      <div className="text-xs text-muted-foreground">请求技能</div>
+                      <CapabilityBadges
+                        items={taskAgentGroup.requestedSkillIds}
+                        emptyText="当前任务没有显式请求技能"
+                      />
+                    </div>
+                    <div className="space-y-2 rounded-xl bg-secondary/25 p-3">
+                      <div className="text-xs text-muted-foreground">实际技能</div>
+                      <CapabilityBadges
+                        items={taskAgentGroup.appliedSkillIds}
+                        emptyText="当前还没有实际绑定技能"
+                        emphasis
+                      />
+                    </div>
+                    <div className="space-y-2 rounded-xl bg-secondary/25 p-3">
+                      <div className="text-xs text-muted-foreground">请求工具</div>
+                      <CapabilityBadges
+                        items={taskAgentGroup.requestedToolIds}
+                        emptyText="当前任务没有显式请求工具"
+                      />
+                    </div>
+                    <div className="space-y-2 rounded-xl bg-secondary/25 p-3">
+                      <div className="text-xs text-muted-foreground">实际工具</div>
+                      <CapabilityBadges
+                        items={taskAgentGroup.appliedToolIds}
+                        emptyText="当前还没有实际绑定工具"
+                        emphasis
+                      />
+                    </div>
+                  </div>
+                </div>
+                <Separator />
+                <div className="space-y-2">
+                  <div className="text-muted-foreground">组间通信</div>
+                  {taskAgentGroup.natsSubjects.length > 0 ? (
+                    <div className="space-y-2">
+                      {taskAgentGroup.natsSubjects.map((subject) => (
+                        <div
+                          key={`${subject.key}-${subject.value}`}
+                          className="rounded-xl bg-secondary/35 p-3 text-xs leading-5 text-foreground"
+                        >
+                          <div className="font-medium">{subject.key}</div>
+                          <div className="mt-1 break-all text-muted-foreground">{subject.value}</div>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <div className="rounded-xl bg-secondary/35 p-3 text-xs leading-5 text-muted-foreground">
+                      当前任务还没有暴露组级 NATS subject。
+                    </div>
+                  )}
+                </div>
+                <Separator />
+                <div className="space-y-2">
+                  <div className="text-muted-foreground">创建痕迹</div>
+                  {taskAgentGroup.timeline.length > 0 ? (
+                    <div className="space-y-2">
+                      {taskAgentGroup.timeline.map((entry) => (
+                        <TaskAgentTimelineCard key={entry.id || `${entry.kind}-${entry.title}`} entry={entry} />
+                      ))}
+                    </div>
+                  ) : (
+                    <div className="rounded-xl bg-secondary/35 p-3 text-xs leading-5 text-muted-foreground">
+                      当前任务还没有沉淀出可展示的编组时间线。
+                    </div>
+                  )}
+                </div>
+                <Separator />
+                <div className="space-y-2">
+                  <div className="text-muted-foreground">开发成员</div>
+                  {taskAgentGroup.members.length > 0 ? (
+                    <div className="space-y-2">
+                      {taskAgentGroup.members.map((member, index) => (
+                        <TaskAgentMemberCard
+                          key={`${member.role}-${member.id}-${member.branchId}-${index}`}
+                          member={member}
+                          title={`开发成员 ${index + 1}`}
+                        />
+                      ))}
+                    </div>
+                  ) : (
+                    <div className="rounded-xl bg-secondary/35 p-3 text-xs leading-5 text-muted-foreground">
+                      当前任务还没有展开出可见的开发成员。
+                    </div>
+                  )}
+                </div>
+                {taskAgentGroup.acceptanceAgent ? (
+                  <>
+                    <Separator />
+                    <div className="space-y-2">
+                      <div className="text-muted-foreground">验收责任</div>
+                      <TaskAgentMemberCard member={taskAgentGroup.acceptanceAgent} title="验收 Agent" />
+                    </div>
+                  </>
+                ) : null}
+                {taskAgentGroup.warnings.length > 0 ? (
+                  <>
+                    <Separator />
+                    <div className="space-y-2">
+                      <div className="text-muted-foreground">编组提示</div>
+                      <div className="rounded-xl bg-warning/10 p-3 text-xs leading-5 text-foreground">
+                        {taskAgentGroup.warnings.join("；")}
+                      </div>
+                    </div>
+                  </>
+                ) : null}
+                {taskAgentGroup.source === "fallback" ? (
+                  <>
+                    <Separator />
+                    <div className="rounded-xl bg-warning/10 p-3 text-xs leading-5 text-foreground">
+                      当前任务还在使用旧执行计划做兼容展示，建议让任务详情接口返回正式的
+                      <code className="mx-1 rounded bg-background px-1 py-0.5 text-[11px]">taskAgentGroup</code>
+                      投影后再观察。
+                    </div>
+                  </>
+                ) : null}
+              </CardContent>
+            </Card>
+          ) : null}
+
+          {taskAgentGroup?.acceptanceAgent ? (
+            <Card className="bg-card">
+              <CardHeader className="pb-3">
+                <CardTitle className="text-base">验收摘要</CardTitle>
+              </CardHeader>
+              <CardContent className="space-y-3 text-sm">
+                <div className="flex items-center justify-between gap-3">
+                  <span className="text-muted-foreground">验收成员</span>
+                  <span className="text-right font-medium text-foreground">
+                    {taskAgentGroup.acceptanceAgent.name || taskAgentGroup.acceptanceAgent.id || "--"}
+                  </span>
+                </div>
+                <Separator />
+                <div className="flex items-center justify-between gap-3">
+                  <span className="text-muted-foreground">验收结论</span>
+                  <Badge variant="secondary" className="bg-primary/10 text-primary">
+                    {acceptanceOutcome(
+                      task.status,
+                      task.deliveryStatus,
+                      taskAgentGroup.acceptanceAgent.runtimeStatus,
+                    )}
+                  </Badge>
+                </div>
+                <Separator />
+                <div className="flex items-center justify-between gap-3">
+                  <span className="text-muted-foreground">运行状态</span>
+                  <span className="font-medium text-foreground">
+                    {memberRuntimeStatusLabel(taskAgentGroup.acceptanceAgent.runtimeStatus)}
+                  </span>
+                </div>
+                <Separator />
+                <div className="flex items-center justify-between gap-3">
+                  <span className="text-muted-foreground">回传状态</span>
+                  <span className="font-medium text-foreground">
+                    {getDeliveryStatusLabel(task.deliveryStatus)}
+                  </span>
+                </div>
+                {taskAgentGroup.acceptanceAgent.currentStepTitle ? (
+                  <>
+                    <Separator />
+                    <div className="space-y-2">
+                      <div className="text-muted-foreground">当前步骤</div>
+                      <div className="rounded-xl bg-secondary/35 p-3 text-xs leading-5 text-foreground">
+                        <div className="font-medium">
+                          {taskAgentGroup.acceptanceAgent.currentStepTitle}
+                        </div>
+                        {taskAgentGroup.acceptanceAgent.currentStepMessage ? (
+                          <div className="mt-1 text-muted-foreground">
+                            {taskAgentGroup.acceptanceAgent.currentStepMessage}
+                          </div>
+                        ) : null}
+                      </div>
+                    </div>
+                  </>
                 ) : null}
               </CardContent>
             </Card>

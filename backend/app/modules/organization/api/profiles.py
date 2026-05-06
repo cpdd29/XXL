@@ -5,23 +5,29 @@ from fastapi.responses import Response
 
 from app.platform.auth.authz import require_authenticated_user, require_permission
 from app.modules.organization.schemas.profiles import (
+    CreateCustomerProfileRequest,
     CreateProfileTenantRequest,
     ProfileActionResponse,
     ProfileActivityResponse,
+    ProfileDeleteActionResponse,
     ProfileDetail,
     ProfileListResponse,
     ProfileTenantActionResponse,
+    ProfileTenantServiceRegistrationCodeActionResponse,
     ProfileTenantOptionsResponse,
     UpdateProfileRequest,
 )
 from app.modules.organization.application.profile_service import (
+    generate_profile_tenant_service_registration_code,
     create_profile_tenant,
+    delete_profile,
     delete_profile_tenant,
     export_profiles_csv,
     get_profile,
     get_profile_activity,
     list_profile_tenants,
     list_profiles,
+    upsert_profile,
     update_profile,
 )
 
@@ -81,6 +87,23 @@ def delete_profile_tenant_route(
     )
 
 
+@router.post(
+    "/tenants/{tenant_id}/service-registration-code",
+    response_model=ProfileTenantServiceRegistrationCodeActionResponse,
+    dependencies=[Depends(require_permission("users:profile:write"))],
+)
+def generate_profile_tenant_service_registration_code_route(
+    tenant_id: str,
+    current_user: dict = Depends(require_authenticated_user),
+) -> ProfileTenantServiceRegistrationCodeActionResponse:
+    return ProfileTenantServiceRegistrationCodeActionResponse(
+        **generate_profile_tenant_service_registration_code(
+            tenant_id=tenant_id,
+            current_user=current_user,
+        )
+    )
+
+
 @router.get(
     "",
     response_model=ProfileListResponse,
@@ -98,6 +121,24 @@ def list_profiles_route(
             tenant_id=tenant_id,
             search=search,
             management_view=management,
+        )
+    )
+
+
+@router.post(
+    "",
+    response_model=ProfileActionResponse,
+    dependencies=[Depends(require_permission("users:profile:write"))],
+)
+def create_profile_route(
+    payload: CreateCustomerProfileRequest,
+    current_user: dict = Depends(require_authenticated_user),
+) -> ProfileActionResponse:
+    return ProfileActionResponse(
+        **upsert_profile(
+            current_user=current_user,
+            profile_id=payload.profile_id,
+            changes=payload.model_dump(exclude_unset=True, exclude={"profile_id"}),
         )
     )
 
@@ -166,8 +207,23 @@ def update_profile_route(
         **update_profile(
             profile_id,
             current_user=current_user,
-            tags=payload.tags,
-            notes=payload.notes,
-            preferred_language=payload.preferred_language,
+            changes=payload.model_dump(exclude_unset=True),
+        )
+    )
+
+
+@router.delete(
+    "/{profile_id}",
+    response_model=ProfileDeleteActionResponse,
+    dependencies=[Depends(require_permission("users:profile:write"))],
+)
+def delete_profile_route(
+    profile_id: str,
+    current_user: dict = Depends(require_authenticated_user),
+) -> ProfileDeleteActionResponse:
+    return ProfileDeleteActionResponse(
+        **delete_profile(
+            profile_id,
+            current_user=current_user,
         )
     )

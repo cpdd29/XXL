@@ -8,6 +8,8 @@ export interface BrainSkillItem {
   tags: string[]
   capabilities: string[]
   uploadedAt?: string | null
+  scope?: 'global' | 'tenant' | 'unknown' | null
+  ownerTenantId?: string | null
 }
 
 export interface BrainSkillListResponse {
@@ -18,6 +20,13 @@ export interface BrainSkillListResponse {
 export interface BrainSkillUploadRequest {
   fileName: string
   content: string
+  scope?: 'shared' | 'tenant'
+  ownerTenantId?: string | null
+}
+
+export interface BrainSkillScopeUpdateRequest {
+  scope: 'shared' | 'tenant'
+  ownerTenantId?: string | null
 }
 
 export interface BrainSkillActionResponse {

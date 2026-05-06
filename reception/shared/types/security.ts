@@ -115,15 +115,23 @@ export interface SecurityIncidentReviewActionResponse {
 }
 
 export interface SecurityPolicySettings {
+  inputMonitorEnabled: boolean
+  outputMonitorEnabled: boolean
   messageRateLimitPerMinute: number
   messageRateLimitCooldownSeconds: number
   messageRateLimitBanThreshold: number
   messageRateLimitBanSeconds: number
   securityIncidentWindowSeconds: number
+  dosProtectionEnabled: boolean
   promptRuleBlockThreshold: number
   promptClassifierBlockThreshold: number
   promptInjectionEnabled: boolean
+  xssEnabled: boolean
+  keywordBlocklistEnabled: boolean
+  keywordBlocklist: string[]
+  keywordBlockThreshold: number
   contentRedactionEnabled: boolean
+  auditEnabled: boolean
 }
 
 export interface SecurityPolicySettingsResponse {
@@ -133,6 +141,19 @@ export interface SecurityPolicySettingsResponse {
 }
 
 export interface UpdateSecurityPolicySettingsRequest extends SecurityPolicySettings {}
+
+export interface ApprovalItemLite {
+  id: string
+  title: string
+  status: string
+}
+
+export interface ApprovalActionResponseLite {
+  ok: boolean
+  message: string
+  approvalRequired?: boolean | null
+  approval: ApprovalItemLite
+}
 
 export interface SecurityReportResponse {
   generatedAt: string
@@ -303,11 +324,15 @@ export interface AuditLog {
   id: string
   timestamp: string
   action: string
+  actionLabel?: string | null
   user: string
   resource: string
+  resourceLabel?: string | null
+  moduleLabel?: string | null
   status: Extract<LogType, 'success' | 'warning' | 'error'>
   ip: string
   details: string
+  operatorSummary?: string | null
   metadata?: Record<string, unknown> | null
 }
 

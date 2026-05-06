@@ -192,6 +192,92 @@ def test_update_profile_route_updates_tags_notes_and_language(auth_headers_facto
     assert store.user_profiles["profile-alpha-update"]["tenant_id"] == "tenant-alpha"
 
 
+def test_delete_profile_route_respects_scope_and_removes_profile(auth_headers_factory) -> None:
+    store.user_profiles["tenant-operator-delete-profile"] = {
+        "id": "tenant-operator-delete-profile",
+        "tenant_id": "tenant-alpha",
+        "tenant_name": "Alpha Corp",
+    }
+    _seed_profile(
+        "profile-alpha-delete",
+        tenant_id="tenant-alpha",
+        tenant_name="Alpha Corp",
+        name="待删除画像",
+        channel="telegram",
+        account_id="alpha-delete-user",
+    )
+    _seed_profile(
+        "profile-beta-delete",
+        tenant_id="tenant-beta",
+        tenant_name="Beta Inc",
+        name="跨租户待删除画像",
+        channel="wecom",
+        account_id="beta-delete-user",
+    )
+
+    blocked = client.delete(
+        "/api/profiles/profile-beta-delete",
+        headers=auth_headers_factory(
+            role="operator",
+            user_id="tenant-operator-delete-profile",
+            email="tenant.operator.delete@example.test",
+        ),
+    )
+    assert blocked.status_code == 403
+    assert blocked.json()["detail"] == "Cross-tenant access denied for profile scope"
+
+    allowed = client.delete(
+        "/api/profiles/profile-alpha-delete",
+        headers=auth_headers_factory(
+            role="operator",
+            user_id="tenant-operator-delete-profile",
+            email="tenant.operator.delete@example.test",
+        ),
+    )
+    assert allowed.status_code == 200
+    payload = allowed.json()
+    assert payload["ok"] is True
+    assert payload["deletedProfileId"] == "profile-alpha-delete"
+    assert "profile-alpha-delete" not in store.user_profiles
+    assert "profile-beta-delete" in store.user_profiles
+
+
+def test_create_profile_route_supports_customer_profile_fields(auth_headers) -> None:
+    response = client.post(
+        "/api/profiles",
+        headers=auth_headers,
+        json={
+            "profileId": "customer-alpha-001",
+            "tenantId": "tenant-alpha",
+            "tenantName": "Alpha Corp",
+            "customerId": "crm-customer-001",
+            "companyName": "甲方企业",
+            "contactName": "张客户",
+            "mobile": "13800000001",
+            "serviceStatus": "serving",
+            "channelAccounts": [{"platform": "wechat", "accountId": "wx-alpha-001"}],
+            "tags": ["重点客户"],
+            "notes": "首个接待客户主档。",
+            "preferredLanguage": "zh",
+            "firstSeenAt": "2026-04-20T09:00:00+00:00",
+            "lastSeenAt": "2026-04-21T10:30:00+00:00",
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["ok"] is True
+    assert payload["profile"]["id"] == "customer-alpha-001"
+    assert payload["profile"]["customerId"] == "crm-customer-001"
+    assert payload["profile"]["companyName"] == "甲方企业"
+    assert payload["profile"]["contactName"] == "张客户"
+    assert payload["profile"]["mobile"] == "13800000001"
+    assert payload["profile"]["serviceStatus"] == "serving"
+    assert payload["profile"]["channelAccounts"] == [{"platform": "wechat", "accountId": "wx-alpha-001"}]
+    assert store.user_profiles["customer-alpha-001"]["tenant_id"] == "tenant-alpha"
+    assert store.user_profiles["customer-alpha-001"]["customer_id"] == "crm-customer-001"
+
+
 def test_profiles_export_is_scoped_to_current_tenant(auth_headers_factory) -> None:
     store.user_profiles["tenant-operator-export"] = {
         "id": "tenant-operator-export",
@@ -289,6 +375,42 @@ def test_profile_tenant_routes_support_create_and_delete_for_platform_scope(auth
     assert refreshed_response.status_code == 200
     refreshed_ids = [item["id"] for item in refreshed_response.json()["items"]]
     assert "tenant-gamma-labs" not in refreshed_ids
+
+
+def test_profile_tenant_service_registration_code_route_replaces_previous_pending_code(auth_headers) -> None:
+    create_response = client.post(
+        "/api/profiles/tenants",
+        json={
+            "name": "Tenant Registration",
+            "description": "注册码测试租户",
+        },
+        headers=auth_headers,
+    )
+    assert create_response.status_code == 200
+    tenant_id = create_response.json()["tenant"]["id"]
+
+    first_response = client.post(
+        f"/api/profiles/tenants/{tenant_id}/service-registration-code",
+        headers=auth_headers,
+    )
+    assert first_response.status_code == 200
+    first_payload = first_response.json()
+    assert first_payload["ok"] is True
+    assert first_payload["tenantId"] == tenant_id
+    assert first_payload["status"] == "issued"
+    assert first_payload["registrationCode"].startswith("SR-")
+
+    second_response = client.post(
+        f"/api/profiles/tenants/{tenant_id}/service-registration-code",
+        headers=auth_headers,
+    )
+    assert second_response.status_code == 200
+    second_payload = second_response.json()
+    assert second_payload["ok"] is True
+    assert second_payload["tenantId"] == tenant_id
+    assert second_payload["status"] == "issued"
+    assert second_payload["registrationCode"].startswith("SR-")
+    assert second_payload["registrationCode"] != first_payload["registrationCode"]
 
 
 def test_profiles_management_view_allows_cross_tenant_preview_for_tenant_management(auth_headers_factory) -> None:
@@ -546,3 +668,74 @@ def test_profile_tenant_delete_allows_default_tenant_when_empty(auth_headers) ->
     refreshed_response = client.get("/api/profiles/tenants", headers=auth_headers)
     assert refreshed_response.status_code == 200
     assert all(item["id"] != "default" for item in refreshed_response.json()["items"])
+
+
+def test_long_term_memory_routes_support_customer_and_tenant_scoped_queries(auth_headers) -> None:
+    create_profile_response = client.post(
+        "/api/profiles",
+        headers=auth_headers,
+        json={
+            "profileId": "memory-customer-alpha",
+            "tenantId": "tenant-alpha",
+            "customerId": "memory-customer-alpha",
+            "contactName": "记忆客户",
+            "preferredLanguage": "zh",
+        },
+    )
+    assert create_profile_response.status_code == 200
+
+    customer_memory_response = client.post(
+        "/api/memory/long-term",
+        headers=auth_headers,
+        json={
+            "tenantId": "tenant-alpha",
+            "subjectType": "customer",
+            "subjectId": "memory-customer-alpha",
+            "memoryType": "customer_preference",
+            "title": "语言偏好",
+            "content": "客户希望默认使用中文回复，并优先提供报价摘要。",
+            "summary": "偏好中文回复",
+            "keywords": ["中文", "报价"],
+        },
+    )
+    assert customer_memory_response.status_code == 200
+
+    tenant_memory_response = client.post(
+        "/api/memory/long-term",
+        headers=auth_headers,
+        json={
+            "tenantId": "tenant-beta",
+            "subjectType": "tenant",
+            "memoryType": "tenant_rule",
+            "title": "接待规则",
+            "content": "Beta 租户要求所有首次接待先确认预算区间。",
+            "summary": "首次接待需确认预算",
+        },
+    )
+    assert tenant_memory_response.status_code == 200
+
+    scoped_customer_list = client.get(
+        "/api/memory/long-term",
+        params={
+            "tenantId": "tenant-alpha",
+            "subjectId": "memory-customer-alpha",
+            "subjectType": "customer",
+        },
+        headers=auth_headers,
+    )
+    assert scoped_customer_list.status_code == 200
+    scoped_payload = scoped_customer_list.json()
+    assert scoped_payload["total"] == 1
+    assert scoped_payload["items"][0]["memoryType"] == "customer_preference"
+    assert scoped_payload["items"][0]["subjectId"] == "memory-customer-alpha"
+
+    tenant_filtered_list = client.get(
+        "/api/memory/long-term",
+        params={"tenantId": "tenant-alpha"},
+        headers=auth_headers,
+    )
+    assert tenant_filtered_list.status_code == 200
+    tenant_filtered_payload = tenant_filtered_list.json()
+    assert tenant_filtered_payload["total"] == 1
+    assert tenant_filtered_payload["items"][0]["tenantId"] == "tenant-alpha"
+    assert tenant_filtered_payload["items"][0]["subjectType"] == "customer"

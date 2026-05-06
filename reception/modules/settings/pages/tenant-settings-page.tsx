@@ -1,7 +1,7 @@
 "use client"
 
-import { startTransition, useEffect, useMemo, useState, type KeyboardEvent, type MouseEvent } from "react"
-import { Copy, Plus, Search, Sparkles, Trash2, Users } from "lucide-react"
+import { startTransition, useEffect, useMemo, useRef, useState, type KeyboardEvent, type MouseEvent } from "react"
+import { Copy, Plus, Search, Sparkles, Ticket, Trash2, Users } from "lucide-react"
 import {
   AlertDialog,
   AlertDialogAction,
@@ -38,8 +38,11 @@ import { Textarea } from "@/shared/ui/textarea"
 import { useAuth } from "@/modules/auth/hooks/use-auth"
 import {
   useCreateUserTenant,
+  useDeleteUserProfile,
   useDeleteUserTenant,
+  useGenerateTenantServiceRegistrationCode,
   useManagedUserTenants,
+  useUserProfile,
   useUsers,
 } from "@/modules/organization/hooks/use-users"
 import { toast } from "@/shared/hooks/use-toast"
@@ -113,6 +116,39 @@ function platformLabel(platform: string) {
   return platformLabelMap[platform] ?? platform
 }
 
+function normalizeProfileMemoryItems(items?: string[] | null) {
+  return (items ?? []).map((item) => item.trim()).filter(Boolean)
+}
+
+function profileSummaryText(profile: UserPortrait) {
+  return (
+    profile.profileSummary?.trim() ||
+    profile.interactionSummary?.trim() ||
+    profile.notes?.trim() ||
+    "暂无更多画像摘要。"
+  )
+}
+
+async function copyTextWithFallback(value: string) {
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(value)
+    return
+  }
+  const textarea = document.createElement("textarea")
+  textarea.value = value
+  textarea.setAttribute("readonly", "true")
+  textarea.style.position = "absolute"
+  textarea.style.left = "-9999px"
+  document.body.appendChild(textarea)
+  textarea.focus()
+  textarea.select()
+  const copied = document.execCommand("copy")
+  document.body.removeChild(textarea)
+  if (!copied) {
+    throw new Error("浏览器未完成复制，请手动复制")
+  }
+}
+
 function StatusBadge({ status }: { status: UserTenantStatus }) {
   const meta = getTenantStatusMeta(status)
 
@@ -178,23 +214,7 @@ function TenantListItem({
     event.stopPropagation()
 
     try {
-      if (navigator.clipboard?.writeText) {
-        await navigator.clipboard.writeText(tenant.id)
-      } else {
-        const textarea = document.createElement("textarea")
-        textarea.value = tenant.id
-        textarea.setAttribute("readonly", "true")
-        textarea.style.position = "absolute"
-        textarea.style.left = "-9999px"
-        document.body.appendChild(textarea)
-        textarea.focus()
-        textarea.select()
-        const copied = document.execCommand("copy")
-        document.body.removeChild(textarea)
-        if (!copied) {
-          throw new Error("浏览器未完成复制，请手动复制")
-        }
-      }
+      await copyTextWithFallback(tenant.id)
 
       toast({
         title: "租户 ID 已复制",
@@ -304,26 +324,123 @@ function ProfilePreviewItem({ profile }: { profile: UserPortrait }) {
           : null}
       </div>
       <p className="mt-4 text-sm text-muted-foreground">
-        {profile.interactionSummary?.trim() || profile.notes?.trim() || "暂无更多画像摘要。"}
+        {profileSummaryText(profile)}
       </p>
     </div>
   )
 }
 
+function ProfileMemoryGroup({
+  title,
+  items,
+  emptyLabel,
+}: {
+  title: string
+  items?: string[] | null
+  emptyLabel: string
+}) {
+  const normalizedItems = normalizeProfileMemoryItems(items)
+
+  return (
+    <div className="rounded-md border border-border px-3 py-2">
+      <div className="text-xs text-muted-foreground">{title}</div>
+      {normalizedItems.length > 0 ? (
+        <div className="mt-2 flex flex-wrap gap-2">
+          {normalizedItems.map((item) => (
+            <Badge key={`${title}-${item}`} variant="secondary" className="max-w-full whitespace-normal text-left">
+              {item}
+            </Badge>
+          ))}
+        </div>
+      ) : (
+        <div className="mt-1 text-sm text-muted-foreground">{emptyLabel}</div>
+      )}
+    </div>
+  )
+}
+
+function ProfilePreviewCard({
+  profile,
+  canDelete,
+  isDeleting,
+  onOpen,
+  onDelete,
+}: {
+  profile: UserPortrait
+  canDelete: boolean
+  isDeleting: boolean
+  onOpen: (profile: UserPortrait) => void
+  onDelete: (profile: UserPortrait) => void
+}) {
+  const handleOpen = () => {
+    onOpen(profile)
+  }
+
+  const handleOpenByKey = (event: KeyboardEvent<HTMLDivElement>) => {
+    if (event.key !== "Enter" && event.key !== " ") {
+      return
+    }
+    event.preventDefault()
+    handleOpen()
+  }
+
+  return (
+    <div
+      role="button"
+      tabIndex={0}
+      aria-label={`查看画像详情 ${profile.name}`}
+      onClick={handleOpen}
+      onKeyDown={handleOpenByKey}
+      className="relative cursor-pointer rounded-xl outline-none focus-visible:ring-2 focus-visible:ring-primary/40"
+    >
+      <ProfilePreviewItem profile={profile} />
+      {canDelete ? (
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon-sm"
+          className="absolute bottom-3 right-3 text-muted-foreground hover:text-destructive"
+          title={`删除画像 ${profile.name}`}
+          aria-label={`删除画像 ${profile.name}`}
+          disabled={isDeleting}
+          onClick={(event) => {
+            event.stopPropagation()
+            onDelete(profile)
+          }}
+          onKeyDown={(event) => {
+            event.stopPropagation()
+          }}
+        >
+          <Trash2 className="size-4" />
+        </Button>
+      ) : null}
+    </div>
+  )
+}
+
 export default function TenantManagementPage() {
-  const { hasPermission } = useAuth()
+  const { hasPermission, isAuthenticated, isSessionLoading } = useAuth()
   const [searchQuery, setSearchQuery] = useState("")
   const [selectedTenantId, setSelectedTenantId] = useState("")
   const [previewPage, setPreviewPage] = useState(1)
+  const [profileDetailDialogOpen, setProfileDetailDialogOpen] = useState(false)
+  const [activeProfile, setActiveProfile] = useState<UserPortrait | null>(null)
   const [createDialogOpen, setCreateDialogOpen] = useState(false)
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false)
+  const [deleteProfileDialogOpen, setDeleteProfileDialogOpen] = useState(false)
+  const [pendingDeleteProfile, setPendingDeleteProfile] = useState<UserPortrait | null>(null)
   const [tenantDraft, setTenantDraft] = useState(EMPTY_TENANT_DRAFT)
-  const { data, isLoading, error } = useManagedUserTenants()
+  const generateCodeCooldownAt = useRef(0)
+  const shouldLoadTenants = isAuthenticated && !isSessionLoading
+  const { data, isLoading, error } = useManagedUserTenants(shouldLoadTenants)
   const createTenant = useCreateUserTenant()
   const deleteTenant = useDeleteUserTenant()
+  const deleteUserProfile = useDeleteUserProfile()
+  const generateServiceCode = useGenerateTenantServiceRegistrationCode()
 
   const tenants = useMemo(() => data?.items ?? [], [data?.items])
   const canManageTenants = hasPermission("users:profile:write")
+  const isTenantListLoading = !isAuthenticated || isSessionLoading || (shouldLoadTenants && isLoading)
 
   const filteredTenants = useMemo(() => {
     const keyword = searchQuery.trim().toLowerCase()
@@ -374,9 +491,14 @@ export default function TenantManagementPage() {
     isFetching: isProfileFetching,
   } = useUsers({
     tenantId: selectedTenant?.id,
-    enabled: Boolean(selectedTenant?.id),
+    enabled: shouldLoadTenants && Boolean(selectedTenant?.id),
     management: true,
   })
+  const {
+    data: profileDetailData,
+    isLoading: isProfileDetailLoading,
+    error: profileDetailError,
+  } = useUserProfile(activeProfile?.id ?? "")
 
   const previewAllProfiles = useMemo(() => profileData?.items ?? [], [profileData?.items])
   const previewCount = profileData
@@ -384,6 +506,7 @@ export default function TenantManagementPage() {
     : selectedTenant?.profileCount ?? 0
   const previewPageCount = Math.max(1, Math.ceil(previewCount / PREVIEW_PAGE_SIZE))
   const canDeleteSelectedTenant = canManageTenants && Boolean(selectedTenant)
+  const canGenerateServiceCode = canManageTenants && Boolean(selectedTenant)
 
   useEffect(() => {
     setPreviewPage(1)
@@ -470,6 +593,69 @@ export default function TenantManagementPage() {
     }
   }
 
+  const handleRequestDeleteProfile = (profile: UserPortrait) => {
+    if (!canManageTenants) {
+      return
+    }
+    setPendingDeleteProfile(profile)
+    setDeleteProfileDialogOpen(true)
+  }
+
+  const handleDeleteProfile = async () => {
+    if (!pendingDeleteProfile) {
+      return
+    }
+
+    try {
+      await deleteUserProfile.mutateAsync({ userId: pendingDeleteProfile.id })
+      setDeleteProfileDialogOpen(false)
+      toast({
+        title: "画像已删除",
+        description: `${pendingDeleteProfile.name} 已从当前租户画像中移除。`,
+      })
+      setPendingDeleteProfile(null)
+    } catch (deleteError) {
+      toast({
+        title: "删除画像失败",
+        description: deleteError instanceof Error ? deleteError.message : "未知错误",
+        variant: "destructive",
+      })
+    }
+  }
+
+  const handleOpenProfileDetail = (profile: UserPortrait) => {
+    setActiveProfile(profile)
+    setProfileDetailDialogOpen(true)
+  }
+
+  const profileDetail = profileDetailData ?? activeProfile
+
+  const handleGenerateServiceCode = async () => {
+    if (!selectedTenant || !canGenerateServiceCode) {
+      return
+    }
+    const now = Date.now()
+    if (now - generateCodeCooldownAt.current < 1200) {
+      return
+    }
+    generateCodeCooldownAt.current = now
+
+    try {
+      const response = await generateServiceCode.mutateAsync({ tenantId: selectedTenant.id })
+      await copyTextWithFallback(response.registrationCode)
+      toast({
+        title: "服务识别码已生成并复制",
+        description: `${selectedTenant.name}：${response.registrationCode}`,
+      })
+    } catch (error) {
+      toast({
+        title: "生成服务识别码失败",
+        description: error instanceof Error ? error.message : "未知错误",
+        variant: "destructive",
+      })
+    }
+  }
+
   return (
     <>
       <div className="flex min-h-full flex-col gap-4 p-4 md:gap-6 md:p-6 lg:h-full lg:overflow-hidden">
@@ -518,7 +704,7 @@ export default function TenantManagementPage() {
                 <div className="rounded-lg border border-destructive/30 bg-destructive/5 p-3 text-sm text-destructive">
                   租户列表加载失败：{error instanceof Error ? error.message : "未知错误"}
                 </div>
-              ) : isLoading ? (
+              ) : isTenantListLoading ? (
                 <TenantListSkeleton />
               ) : filteredTenants.length === 0 ? (
                 <Empty className="border border-dashed border-border bg-secondary/20">
@@ -552,17 +738,29 @@ export default function TenantManagementPage() {
               <CardHeader className="shrink-0">
                 <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
                   <CardTitle className="text-base">画像预览</CardTitle>
-                  <div className="flex flex-wrap items-center gap-2">
-                    {selectedTenant ? (
-                      <Badge variant="secondary">{selectedTenant.name}</Badge>
-                    ) : null}
-                    <Badge variant="outline" className="border-border">
-                      {selectedTenant
-                        ? isProfileFetching
-                          ? "同步中..."
-                          : `${previewCount} 份画像`
-                        : "未选择租户"}
-                    </Badge>
+                  <div className="flex flex-wrap items-center justify-end gap-2">
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      disabled={!canGenerateServiceCode || generateServiceCode.isPending}
+                      onClick={() => void handleGenerateServiceCode()}
+                    >
+                      <Ticket className="size-4" />
+                      {generateServiceCode.isPending ? "生成中..." : "生成服务识别码"}
+                    </Button>
+                    <div className="flex flex-wrap items-center gap-2">
+                      {selectedTenant ? (
+                        <Badge variant="secondary">{selectedTenant.name}</Badge>
+                      ) : null}
+                      <Badge variant="outline" className="border-border">
+                        {selectedTenant
+                          ? isProfileFetching
+                            ? "同步中..."
+                            : `${previewCount} 份画像`
+                          : "未选择租户"}
+                      </Badge>
+                    </div>
                   </div>
                 </div>
               </CardHeader>
@@ -606,7 +804,16 @@ export default function TenantManagementPage() {
                   <div className="flex h-full min-h-0 flex-col gap-4 lg:flex-1">
                     <div className="space-y-4 lg:min-h-0 lg:flex-1 lg:overflow-y-auto">
                       {previewProfiles.map((profile) => (
-                        <ProfilePreviewItem key={profile.id} profile={profile} />
+                        <ProfilePreviewCard
+                          key={profile.id}
+                          profile={profile}
+                          canDelete={canManageTenants}
+                          isDeleting={
+                            deleteUserProfile.isPending && pendingDeleteProfile?.id === profile.id
+                          }
+                          onOpen={handleOpenProfileDetail}
+                          onDelete={handleRequestDeleteProfile}
+                        />
                       ))}
                     </div>
                     <div className="flex shrink-0 flex-col gap-3 border-t border-border pt-4 sm:flex-row sm:items-center sm:justify-between">
@@ -646,6 +853,142 @@ export default function TenantManagementPage() {
           </div>
         </div>
       </div>
+
+      <Dialog
+        open={profileDetailDialogOpen}
+        onOpenChange={(open) => {
+          setProfileDetailDialogOpen(open)
+          if (!open) {
+            setActiveProfile(null)
+          }
+        }}
+      >
+        <DialogContent className="max-h-[80vh] overflow-y-auto sm:max-w-2xl">
+          <DialogHeader>
+            <DialogTitle>人员画像详情</DialogTitle>
+            <DialogDescription>
+              {profileDetail?.name ? `${profileDetail.name} · ${profileDetail.tenantName}` : "查看当前租户人员画像详情"}
+            </DialogDescription>
+          </DialogHeader>
+          {profileDetailError ? (
+            <div className="rounded-lg border border-destructive/30 bg-destructive/5 p-3 text-sm text-destructive">
+              画像详情加载失败：{profileDetailError instanceof Error ? profileDetailError.message : "未知错误"}
+            </div>
+          ) : isProfileDetailLoading && !profileDetail ? (
+            <div className="space-y-3">
+              <Skeleton className="h-5 w-40" />
+              <Skeleton className="h-5 w-56" />
+              <Skeleton className="h-20 w-full" />
+            </div>
+          ) : profileDetail ? (
+            <div className="space-y-4">
+              <div className="grid grid-cols-1 gap-3 text-sm sm:grid-cols-2">
+                <div className="rounded-md border border-border px-3 py-2">
+                  <div className="text-xs text-muted-foreground">画像 ID</div>
+                  <div className="mt-1 font-mono text-foreground">{profileDetail.id}</div>
+                </div>
+                <div className="rounded-md border border-border px-3 py-2">
+                  <div className="text-xs text-muted-foreground">租户</div>
+                  <div className="mt-1 text-foreground">{profileDetail.tenantName}</div>
+                </div>
+                <div className="rounded-md border border-border px-3 py-2">
+                  <div className="text-xs text-muted-foreground">账号</div>
+                  <div className="mt-1 text-foreground">
+                    {profileDetail.email || profileDetail.platformAccounts?.[0]?.accountId || "暂无可识别账号"}
+                  </div>
+                </div>
+                <div className="rounded-md border border-border px-3 py-2">
+                  <div className="text-xs text-muted-foreground">语言偏好</div>
+                  <div className="mt-1 text-foreground">
+                    {profileDetail.preferredLanguage === "zh" ? "中文" : "English"}
+                  </div>
+                </div>
+                <div className="rounded-md border border-border px-3 py-2">
+                  <div className="text-xs text-muted-foreground">最近活跃</div>
+                  <div className="mt-1 text-foreground">{formatDateTime(profileDetail.lastActiveAt)}</div>
+                </div>
+                <div className="rounded-md border border-border px-3 py-2">
+                  <div className="text-xs text-muted-foreground">累计交互</div>
+                  <div className="mt-1 text-foreground">{profileDetail.totalInteractions}</div>
+                </div>
+                <div className="rounded-md border border-border px-3 py-2">
+                  <div className="text-xs text-muted-foreground">最近接待时间</div>
+                  <div className="mt-1 text-foreground">{formatDateTime(profileDetail.lastReceptionAt)}</div>
+                </div>
+                <div className="rounded-md border border-border px-3 py-2">
+                  <div className="text-xs text-muted-foreground">记忆更新时间来源</div>
+                  <div className="mt-1 text-foreground">{profileDetail.lastUpdatedBy || "暂无记录"}</div>
+                </div>
+              </div>
+              <div className="rounded-md border border-border px-3 py-2">
+                <div className="text-xs text-muted-foreground">来源渠道</div>
+                <div className="mt-2 flex flex-wrap gap-2">
+                  {profileDetail.sourceChannels?.length ? (
+                    profileDetail.sourceChannels.map((channel) => (
+                      <Badge key={`${profileDetail.id}-dialog-${channel}`} variant="outline" className="border-border">
+                        {platformLabel(channel)}
+                      </Badge>
+                    ))
+                  ) : (
+                    <span className="text-sm text-muted-foreground">暂无渠道</span>
+                  )}
+                </div>
+              </div>
+              <div className="rounded-md border border-border px-3 py-2">
+                <div className="text-xs text-muted-foreground">标签</div>
+                <div className="mt-2 flex flex-wrap gap-2">
+                  {profileDetail.tags?.length ? (
+                    profileDetail.tags.map((tag) => (
+                      <Badge key={`${profileDetail.id}-dialog-tag-${tag}`} variant="secondary">
+                        {tag}
+                      </Badge>
+                    ))
+                  ) : (
+                    <span className="text-sm text-muted-foreground">暂无标签</span>
+                  )}
+                </div>
+              </div>
+              <div className="rounded-md border border-border px-3 py-2">
+                <div className="text-xs text-muted-foreground">长期记忆摘要（人员画像）</div>
+                <div className="mt-1 whitespace-pre-wrap text-sm text-foreground">
+                  {profileSummaryText(profileDetail)}
+                </div>
+              </div>
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+                <ProfileMemoryGroup
+                  title="业务偏好"
+                  items={profileDetail.preferences}
+                  emptyLabel="暂无业务偏好。"
+                />
+                <ProfileMemoryGroup
+                  title="长期需求背景"
+                  items={profileDetail.businessBackground}
+                  emptyLabel="暂无长期需求背景。"
+                />
+                <ProfileMemoryGroup
+                  title="历史明确决策"
+                  items={profileDetail.decisionHistory}
+                  emptyLabel="暂无历史明确决策。"
+                />
+              </div>
+            </div>
+          ) : (
+            <div className="text-sm text-muted-foreground">暂无可展示的画像详情。</div>
+          )}
+          <DialogFooter>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => {
+                setProfileDetailDialogOpen(false)
+                setActiveProfile(null)
+              }}
+            >
+              关闭
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       <Dialog
         open={createDialogOpen}
@@ -741,6 +1084,41 @@ export default function TenantManagementPage() {
               }}
             >
               {deleteTenant.isPending ? "删除中..." : "确认删除"}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      <AlertDialog
+        open={deleteProfileDialogOpen}
+        onOpenChange={(open) => {
+          if (deleteUserProfile.isPending) {
+            return
+          }
+          setDeleteProfileDialogOpen(open)
+          if (!open) {
+            setPendingDeleteProfile(null)
+          }
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>确认删除这条画像？</AlertDialogTitle>
+            <AlertDialogDescription>
+              将删除画像“{pendingDeleteProfile?.name ?? "-"}”及其关联会话上下文。此操作不可恢复。
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={deleteUserProfile.isPending}>取消</AlertDialogCancel>
+            <AlertDialogAction
+              className="bg-destructive text-white hover:bg-destructive/90"
+              disabled={deleteUserProfile.isPending}
+              onClick={(event) => {
+                event.preventDefault()
+                void handleDeleteProfile()
+              }}
+            >
+              {deleteUserProfile.isPending ? "删除中..." : "确认删除"}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>

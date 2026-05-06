@@ -20,14 +20,22 @@ export interface UserPortrait {
   tenantId: string
   tenantName: string
   tenantStatus: UserTenantStatus
+  serviceStatus?: string
   name: string
   sourceChannels: string[]
   platformAccounts: UserPlatformAccount[]
   tags: string[]
   preferredLanguage: UserPreferredLanguage
+  firstSeenAt?: string | null
   lastActiveAt: string
   totalInteractions: number
   notes: string
+  profileSummary?: string | null
+  preferences?: string[]
+  businessBackground?: string[]
+  decisionHistory?: string[]
+  lastReceptionAt?: string | null
+  lastUpdatedBy?: string | null
   interactionSummary: string
   lastLogin?: string
   email?: string
@@ -76,6 +84,15 @@ export interface UserTenantActionResponse {
   deletedTenantId?: string | null
 }
 
+export interface UserTenantServiceRegistrationCodeActionResponse {
+  ok: boolean
+  message: string
+  tenantId: string
+  registrationCode: string
+  status: string
+  issuedAt?: string | null
+}
+
 export interface UserActivityResponse {
   items: UserActivityItem[]
   total: number
@@ -85,6 +102,12 @@ export interface UserActionResponse {
   ok: boolean
   message: string
   profile: UserProfile
+}
+
+export interface UserDeleteActionResponse {
+  ok: boolean
+  message: string
+  deletedProfileId: string
 }
 
 export interface UpdateUserProfileRequest {

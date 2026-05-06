@@ -15,6 +15,9 @@
 - `dispatch`：任务下发与任务详情
 - `agent-config`：Agent 配置接入
 - `capability`：工具、Skill、外部连接能力
+- `knowledge`：知识仓、同步记录、检索日志管理
+- `executor-config`：执行器接入配置（CLI/HTTP执行器）
+- `intake`：接入层运营视图（接待 Agent 状态、准入执行态、接入事件流）
 - `organization`：租户与人员画像
 - `security`：安全运营与审计视图
 - `settings`：系统设置

@@ -8,6 +8,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/shared/ui/card"
 import { Checkbox } from "@/shared/ui/checkbox"
 import { Input } from "@/shared/ui/input"
 import { Label } from "@/shared/ui/label"
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/shared/ui/select"
 import { Switch } from "@/shared/ui/switch"
 import { Textarea } from "@/shared/ui/textarea"
 import { useAgentApiSettings, useUpdateAgentApiSettings } from "@/modules/settings/hooks/use-settings"
@@ -22,6 +23,7 @@ type ProviderDraft = {
   enabled: boolean
   baseUrl: string
   model: string
+  requestPath: string
   organizationId: string
   projectId: string
   groupId: string
@@ -31,9 +33,39 @@ type ProviderDraft = {
   clearApiKey: boolean
 }
 
+const REQUEST_PATH_OPTIONS = [
+  { value: "/responses", label: "Responses API (/responses)" },
+  { value: "/chat/completions", label: "Chat Completions (/chat/completions)" },
+  { value: "/messages", label: "Messages API (/messages)" },
+  { value: "/text/chatcompletion_v2", label: "MiniMax V2 (/text/chatcompletion_v2)" },
+  { value: "custom", label: "自定义 Endpoint Path" },
+] as const
+
+const PROVIDER_DISPLAY_NAMES: Record<string, string> = {
+  openai: "OpenAI",
+  codex: "OpenAI Codex",
+  claude: "Claude",
+  kimi: "Kimi",
+  minimax: "MiniMax",
+  gemini: "Gemini",
+  deepseek: "DeepSeek",
+  openapi: "OpenAPI Compatible",
+}
+
 function formatTimestamp(value?: string | null) {
   if (!value) return "--"
   return value.replace("T", " ").replace("Z", "").slice(0, 19)
+}
+
+function getProviderDisplayName(providerKey: string) {
+  const normalized = providerKey.trim().toLowerCase()
+  return PROVIDER_DISPLAY_NAMES[normalized] ?? providerKey
+}
+
+function resolveRequestPath(endpointPath: string) {
+  const normalized = endpointPath.trim()
+  const matched = REQUEST_PATH_OPTIONS.find((item) => item.value !== "custom" && item.value === normalized)
+  return matched ? matched.value : "custom"
 }
 
 function toDraftMap(settings?: AgentApiSettings): Record<string, ProviderDraft> {
@@ -45,6 +77,7 @@ function toDraftMap(settings?: AgentApiSettings): Record<string, ProviderDraft> 
         enabled: provider.enabled,
         baseUrl: provider.baseUrl,
         model: provider.model,
+        requestPath: resolveRequestPath(provider.endpointPath),
         organizationId: provider.organizationId,
         projectId: provider.projectId,
         groupId: provider.groupId,
@@ -59,6 +92,7 @@ function toDraftMap(settings?: AgentApiSettings): Record<string, ProviderDraft> 
 
 function buildProviderPayload(draft: ProviderDraft): UpdateAgentApiProviderSettingsRequest {
   const apiKey = draft.apiKey.trim()
+  const endpointPath = draft.requestPath === "custom" ? draft.endpointPath.trim() : draft.requestPath
 
   return {
     enabled: draft.enabled,
@@ -67,7 +101,7 @@ function buildProviderPayload(draft: ProviderDraft): UpdateAgentApiProviderSetti
     organizationId: draft.organizationId.trim(),
     projectId: draft.projectId.trim(),
     groupId: draft.groupId.trim(),
-    endpointPath: draft.endpointPath.trim(),
+    endpointPath,
     notes: draft.notes.trim(),
     apiKey: apiKey || undefined,
     clearApiKey: draft.clearApiKey || undefined,
@@ -79,6 +113,10 @@ function maskSummary(provider: AgentApiProviderSettings) {
   return provider.apiKeyMasked || "已配置"
 }
 
+function providerKeyStatus(provider: AgentApiProviderSettings) {
+  return provider.hasApiKey ? "已配置" : "未配置"
+}
+
 export default function AgentApiSettingsPage() {
   const settingsQuery = useAgentApiSettings()
   const updateMutation = useUpdateAgentApiSettings()
@@ -86,8 +124,33 @@ export default function AgentApiSettingsPage() {
   const [activeProviderKey, setActiveProviderKey] = useState<string>("")
 
   const settings = settingsQuery.data?.settings
-  const providerEntries = Object.entries(settings?.providers ?? {})
+  const providerEntries = useMemo(
+    () =>
+      Object.entries(settings?.providers ?? {}).sort(([leftKey, leftProvider], [rightKey, rightProvider]) => {
+        if (leftProvider.enabled !== rightProvider.enabled) {
+          return leftProvider.enabled ? -1 : 1
+        }
+        return leftKey.localeCompare(rightKey)
+      }),
+    [settings?.providers],
+  )
   const providerKeys = useMemo(() => providerEntries.map(([providerKey]) => providerKey), [providerEntries])
+  const providerDisplayNameMap = useMemo(() => {
+    const baseCount = new Map<string, number>()
+    providerEntries.forEach(([providerKey]) => {
+      const baseName = getProviderDisplayName(providerKey)
+      baseCount.set(baseName, (baseCount.get(baseName) ?? 0) + 1)
+    })
+
+    return Object.fromEntries(
+      providerEntries.map(([providerKey]) => {
+        const baseName = getProviderDisplayName(providerKey)
+        const hasDuplicateName = (baseCount.get(baseName) ?? 0) > 1
+        const displayName = hasDuplicateName ? `${baseName} (${providerKey})` : baseName
+        return [providerKey, displayName]
+      }),
+    ) as Record<string, string>
+  }, [providerEntries])
   const enabledCount = useMemo(
     () => providerEntries.filter(([, provider]) => provider.enabled).length,
     [providerEntries],
@@ -141,7 +204,7 @@ export default function AgentApiSettingsPage() {
 
       toast({
         title: "模型接入已保存",
-        description: `${activeProviderKey} 配置已更新。`,
+        description: `${providerDisplayNameMap[activeProviderKey] ?? activeProviderKey} 配置已更新。`,
       })
     } catch (error) {
       toast({
@@ -153,14 +216,20 @@ export default function AgentApiSettingsPage() {
   }
 
   return (
-    <div className="space-y-6 p-6">
+    <div className="flex h-full min-h-0 flex-col gap-4 p-6">
       <Card className="bg-card">
         <CardHeader className="pb-3">
-          <div className="flex flex-wrap items-start justify-between gap-3">
+          <div className="flex flex-wrap items-center justify-between gap-3">
             <div>
-              <CardTitle className="text-base font-medium">模型接入</CardTitle>
-              <div className="mt-1 text-sm text-muted-foreground">
-                统一管理 Provider、模型、Endpoint 和密钥状态，模型接入配置只保留当前这一处入口。
+              <div className="text-foreground">
+                <span className="text-xl font-semibold text-muted-foreground">Provider 总数：</span>
+                <span className="ml-2 text-base font-medium">{providerEntries.length}</span>
+                <span className="mx-2 text-base text-muted-foreground">/</span>
+                <span className="text-base font-medium text-green-600">{enabledCount}</span>
+                <span className="ml-1 text-base text-muted-foreground">已启用</span>
+              </div>
+              <div className="mt-1 text-xs text-muted-foreground">
+                最近更新时间：{formatTimestamp(settingsQuery.data?.updatedAt)}
               </div>
             </div>
             <div className="flex gap-2">
@@ -179,22 +248,6 @@ export default function AgentApiSettingsPage() {
             </div>
           </div>
         </CardHeader>
-        <CardContent className="grid gap-3 md:grid-cols-3">
-          <div className="rounded-xl border border-border bg-secondary/20 px-4 py-3">
-            <div className="text-xs text-muted-foreground">Provider 总数</div>
-            <div className="mt-1 text-2xl font-semibold text-foreground">{providerEntries.length}</div>
-          </div>
-          <div className="rounded-xl border border-border bg-secondary/20 px-4 py-3">
-            <div className="text-xs text-muted-foreground">已启用</div>
-            <div className="mt-1 text-2xl font-semibold text-foreground">{enabledCount}</div>
-          </div>
-          <div className="rounded-xl border border-border bg-secondary/20 px-4 py-3">
-            <div className="text-xs text-muted-foreground">最近更新时间</div>
-            <div className="mt-1 text-sm font-medium leading-6 text-foreground">
-              {formatTimestamp(settingsQuery.data?.updatedAt)}
-            </div>
-          </div>
-        </CardContent>
       </Card>
 
       {settingsQuery.error ? (
@@ -222,12 +275,12 @@ export default function AgentApiSettingsPage() {
       ) : null}
 
       {providerEntries.length > 0 ? (
-        <div className="grid gap-6 xl:grid-cols-[320px_minmax(0,1fr)]">
-          <Card className="bg-card">
+        <div className="grid min-h-0 flex-1 gap-6 xl:grid-cols-[320px_minmax(0,1fr)]">
+          <Card className="flex min-h-0 flex-col bg-card">
             <CardHeader className="pb-3">
               <CardTitle className="text-base font-medium">Provider 列表</CardTitle>
             </CardHeader>
-            <CardContent className="space-y-3">
+            <CardContent className="min-h-0 flex-1 space-y-3 overflow-y-auto pr-1">
               {providerEntries.map(([providerKey, provider]) => {
                 const isActive = providerKey === activeProviderKey
                 return (
@@ -243,7 +296,10 @@ export default function AgentApiSettingsPage() {
                   >
                     <div className="flex items-start justify-between gap-3">
                       <div>
-                        <div className="font-medium text-foreground">{providerKey}</div>
+                        <div className="font-medium text-foreground">
+                          {providerDisplayNameMap[providerKey] ?? providerKey}
+                        </div>
+                        <div className="mt-1 text-xs text-muted-foreground">key: {providerKey}</div>
                         <div className="mt-1 text-sm text-muted-foreground">{provider.model || "未配置默认模型"}</div>
                       </div>
                       <Badge variant="secondary" className={provider.enabled ? "bg-success/10 text-success" : ""}>
@@ -251,7 +307,7 @@ export default function AgentApiSettingsPage() {
                       </Badge>
                     </div>
                     <div className="mt-3 flex flex-wrap gap-2 text-xs text-muted-foreground">
-                      <span>密钥：{maskSummary(provider)}</span>
+                      <span>密钥：{providerKeyStatus(provider)}</span>
                       <span>Endpoint：{provider.endpointPath || "/"}</span>
                     </div>
                   </button>
@@ -260,11 +316,13 @@ export default function AgentApiSettingsPage() {
             </CardContent>
           </Card>
 
-          <Card className="bg-card">
+          <Card className="flex min-h-0 flex-col bg-card">
             <CardHeader className="pb-3">
               <div className="flex items-center justify-between gap-3">
                 <div>
-                  <CardTitle className="text-base font-medium">{activeProviderKey || "Provider 详情"}</CardTitle>
+                  <CardTitle className="text-base font-medium">
+                    {activeProviderKey ? (providerDisplayNameMap[activeProviderKey] ?? activeProviderKey) : "Provider 详情"}
+                  </CardTitle>
                   <div className="mt-1 text-sm text-muted-foreground">
                     调整模型接入参数后立即写回 `/api/settings/agent-api`。
                   </div>
@@ -276,7 +334,7 @@ export default function AgentApiSettingsPage() {
                 ) : null}
               </div>
             </CardHeader>
-            <CardContent className="space-y-6">
+            <CardContent className="min-h-0 flex-1 space-y-6 overflow-y-auto pr-1">
               {activeDraft && activeProvider ? (
                 <>
                   <div className="flex items-center justify-between rounded-xl border border-border bg-secondary/20 px-4 py-3">
@@ -316,9 +374,37 @@ export default function AgentApiSettingsPage() {
                       />
                     </div>
                     <div className="space-y-2">
-                      <Label htmlFor="provider-endpoint">Endpoint Path</Label>
+                      <Label>请求方式</Label>
+                      <Select
+                        value={activeDraft.requestPath}
+                        onValueChange={(value) =>
+                          updateDraft(activeProviderKey, (current) => ({
+                            ...current,
+                            requestPath: value,
+                            endpointPath: value === "custom" ? current.endpointPath : value,
+                          }))
+                        }
+                      >
+                        <SelectTrigger>
+                          <SelectValue placeholder="选择请求方式" />
+                        </SelectTrigger>
+                        <SelectContent>
+                          {REQUEST_PATH_OPTIONS.map((item) => (
+                            <SelectItem key={item.value} value={item.value}>
+                              {item.label}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    </div>
+                  </div>
+
+                  {activeDraft.requestPath === "custom" ? (
+                    <div className="space-y-2">
+                      <Label htmlFor="provider-endpoint">自定义 Endpoint Path</Label>
                       <Input
                         id="provider-endpoint"
+                        placeholder="/custom/path"
                         value={activeDraft.endpointPath}
                         onChange={(event) =>
                           updateDraft(activeProviderKey, (current) => ({
@@ -328,43 +414,7 @@ export default function AgentApiSettingsPage() {
                         }
                       />
                     </div>
-                    <div className="space-y-2">
-                      <Label htmlFor="provider-org-id">Organization ID</Label>
-                      <Input
-                        id="provider-org-id"
-                        value={activeDraft.organizationId}
-                        onChange={(event) =>
-                          updateDraft(activeProviderKey, (current) => ({
-                            ...current,
-                            organizationId: event.target.value,
-                          }))
-                        }
-                      />
-                    </div>
-                    <div className="space-y-2">
-                      <Label htmlFor="provider-project-id">Project ID</Label>
-                      <Input
-                        id="provider-project-id"
-                        value={activeDraft.projectId}
-                        onChange={(event) =>
-                          updateDraft(activeProviderKey, (current) => ({
-                            ...current,
-                            projectId: event.target.value,
-                          }))
-                        }
-                      />
-                    </div>
-                    <div className="space-y-2">
-                      <Label htmlFor="provider-group-id">Group ID</Label>
-                      <Input
-                        id="provider-group-id"
-                        value={activeDraft.groupId}
-                        onChange={(event) =>
-                          updateDraft(activeProviderKey, (current) => ({ ...current, groupId: event.target.value }))
-                        }
-                      />
-                    </div>
-                  </div>
+                  ) : null}
 
                   <div className="space-y-2">
                     <Label htmlFor="provider-api-key">API Key</Label>
@@ -405,8 +455,9 @@ export default function AgentApiSettingsPage() {
                       onChange={(event) =>
                         updateDraft(activeProviderKey, (current) => ({ ...current, notes: event.target.value }))
                       }
-                    />
-                  </div>
+                      />
+                    </div>
+
                 </>
               ) : (
                 <div className="rounded-xl border border-border bg-secondary/20 p-4 text-sm text-muted-foreground">

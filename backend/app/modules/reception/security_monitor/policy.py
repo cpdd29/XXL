@@ -62,6 +62,18 @@ PROMPT_BYPASS_HINTS = (
     "红队",
     "越狱",
 )
+XSS_PATTERNS = [
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"<\s*script\b",
+        r"javascript\s*:",
+        r"onerror\s*=",
+        r"onload\s*=",
+        r"<\s*iframe\b",
+        r"<\s*img\b[^>]*onerror\s*=",
+        r"<\s*svg\b[^>]*onload\s*=",
+    )
+]
 
 
 def assess_prompt_injection(text: str, *, policy: dict[str, object]) -> dict[str, object]:
@@ -147,3 +159,34 @@ def assess_prompt_injection(text: str, *, policy: dict[str, object]) -> dict[str
         "risk_level": risk_level,
         "matched_signals": list(dict.fromkeys(matched_signals)),
     }
+
+
+def assess_xss_risk(text: str) -> dict[str, object]:
+    matches: list[str] = []
+    for pattern in XSS_PATTERNS:
+        match = pattern.search(text or "")
+        if match is None:
+            continue
+        matches.append(match.group(0))
+
+    return {
+        "matched": bool(matches),
+        "matches": list(dict.fromkeys(matches)),
+        "verdict": "block" if matches else "allow",
+    }
+
+
+def match_keyword_blocklist_hits(
+    text: str,
+    *,
+    keywords: list[str],
+) -> list[str]:
+    lowered = str(text or "").lower()
+    hits: list[str] = []
+    for keyword in keywords:
+        normalized = str(keyword or "").strip()
+        if not normalized:
+            continue
+        if normalized.lower() in lowered:
+            hits.append(normalized)
+    return list(dict.fromkeys(hits))

@@ -1,25 +1,40 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+import logging
+from threading import Event, Lock
 from typing import Any
 
 from fastapi import HTTPException
 
 from app.modules.reception.channel_ingress.registry import channel_adapter_registry
-from app.modules.reception.application.coordinator_service import brain_coordinator_service
 from app.modules.reception.application.orchestration_service import orchestration_service
 from app.modules.reception.application.reception_service import reception_service
 from app.modules.dispatch.application.task_view_service import task_view_service
 from app.config import get_settings
 from app.modules.dispatch.execution_support.language_service import detect_language
+from app.modules.knowledge.application import (
+    knowledge_injection_service,
+    knowledge_retrieval_log_service,
+    knowledge_retrieval_service,
+)
+from app.modules.knowledge.schemas import KnowledgeRetrievalRequest
 from app.modules.organization.application.memory_service import memory_service
+from app.modules.organization.application import profile_service as organization_profile_service
 from app.modules.organization.application.tenancy_service import default_scope
+from app.modules.organization.customer_profile.writeback_service import customer_profile_writeback_service
 from app.modules.reception.schemas.messages import UnifiedMessage, channel_display_name, webhook_auth_scope
 from app.platform.observability.operational_log_service import append_realtime_event
 from app.platform.persistence.persistence_service import persistence_service
 from app.platform.config.settings_service import get_channel_integration_runtime_settings
 from app.modules.reception.security_monitor.security_gateway_service import security_gateway_service
+from app.modules.reception.agent_entry.hermes_reception_agent_service import hermes_reception_agent_service
+from app.modules.reception.outbound.channel_outbound_service import channel_outbound_service
+from app.modules.reception.customer_access import customer_access_service
+from app.modules.reception.shared_files import reception_shared_files_service
+from app.modules.reception.channel_ingress.wecom import encode_wecom_delivery_target
 from app.platform.persistence.runtime_store import store
+from app.modules.dispatch.requirement_dispatch_agent.service import dispatch_requirement_task
 from app.modules.dispatch.workflow_runtime.workflow_execution_service import (
     append_context_patch_to_run,
     create_workflow_run_for_task,
@@ -32,10 +47,17 @@ SECURITY_ATTACK_RESPONSE = "检测到输入包含攻击或注入风险，请重�
 CHAT_HANDOFF_RESPONSE = ""
 TASK_HANDOFF_RESPONSE = ""
 TASK_COMPLETED_RESPONSE = "任务已完成"
+HERMES_REPLY_BLOCKED_RESPONSE = "检测到回复内容存在风险，已被安全策略拦截"
+HERMES_REPLY_FALLBACK_RESPONSE = "当前接待智能体暂时不可用，请稍后再试"
+WEBHOOK_MESSAGE_DEDUP_TTL_SECONDS = 300
+WEBHOOK_MESSAGE_DEDUP_WAIT_SECONDS = 30.0
 
 ACTIVE_TASKS_BY_USER: dict[str, str] = {}
 LAST_MESSAGE_AT_BY_USER: dict[str, datetime] = {}
 AUTHORITATIVE_TASK_STEP_CACHE: set[str] = set()
+RECENT_WEBHOOK_RESULT_BY_MESSAGE: dict[str, dict[str, Any]] = {}
+INFLIGHT_WEBHOOK_MESSAGE_EVENTS: dict[str, Event] = {}
+WEBHOOK_MESSAGE_DEDUP_LOCK = Lock()
 MEMORY_CONTEXT_LIMIT_MIN = 5
 MEMORY_CONTEXT_LIMIT_MAX = 10
 DISPATCH_CONTEXT_MEMORY_LIMIT_MIN = 5
@@ -71,9 +93,97 @@ PROFILE_EMAIL_METADATA_KEYS = ("email", "mail")
 PROFILE_TENANT_ID_METADATA_KEYS = ("tenant_id", "tenantId")
 PROFILE_TENANT_NAME_METADATA_KEYS = ("tenant_name", "tenantName")
 ALLOWED_CONTROL_PLANE_ROLES = {"admin", "operator", "viewer"}
-INTERACTION_MODES = {"chat", "task", "workflow_or_direct"}
+INTERACTION_MODES = {"continuation", "chat", "task", "workflow_or_direct"}
 PROFESSIONAL_CONFIRM_TIMEOUT_SECONDS = 1800
 CONTEXT_PATCH_TASK_STATUSES = {"pending", "running", "completed"}
+
+logger = logging.getLogger(__name__)
+
+
+def _text(value: object) -> str:
+    return str(value or "").strip()
+
+
+def _webhook_message_dedup_key(message: UnifiedMessage) -> str | None:
+    message_id = str(message.message_id or "").strip()
+    if not message_id:
+        return None
+    return f"{message.channel.value}:{message_id}"
+
+
+def _prune_webhook_result_cache(now: datetime | None = None) -> None:
+    current = now or datetime.now(UTC)
+    expired_keys = [
+        key
+        for key, item in RECENT_WEBHOOK_RESULT_BY_MESSAGE.items()
+        if not isinstance(item, dict)
+        or not isinstance(item.get("expires_at"), datetime)
+        or item["expires_at"] <= current
+    ]
+    for key in expired_keys:
+        RECENT_WEBHOOK_RESULT_BY_MESSAGE.pop(key, None)
+
+
+def _ingest_webhook_message_once(
+    message: UnifiedMessage,
+    *,
+    channel: str,
+    entrypoint: str,
+    entrypoint_agent: str,
+) -> dict[str, Any]:
+    dedup_key = _webhook_message_dedup_key(message)
+    if not dedup_key:
+        return ingest_unified_message(
+            message,
+            auth_scope=webhook_auth_scope(channel),
+            entrypoint=entrypoint,
+            entrypoint_agent=entrypoint_agent,
+        )
+
+    owner = False
+    wait_event: Event | None = None
+    while True:
+        with WEBHOOK_MESSAGE_DEDUP_LOCK:
+            _prune_webhook_result_cache()
+            cached = RECENT_WEBHOOK_RESULT_BY_MESSAGE.get(dedup_key)
+            if isinstance(cached, dict) and isinstance(cached.get("result"), dict):
+                logger.info("Webhook duplicate skipped by cache: %s", dedup_key)
+                return store.clone(cached["result"])
+
+            wait_event = INFLIGHT_WEBHOOK_MESSAGE_EVENTS.get(dedup_key)
+            if wait_event is None:
+                wait_event = Event()
+                INFLIGHT_WEBHOOK_MESSAGE_EVENTS[dedup_key] = wait_event
+                owner = True
+                break
+
+        if wait_event.wait(timeout=WEBHOOK_MESSAGE_DEDUP_WAIT_SECONDS):
+            continue
+
+        logger.warning("Webhook duplicate wait timed out, retrying ownership: %s", dedup_key)
+
+    result: dict[str, Any] | None = None
+    try:
+        result = ingest_unified_message(
+            message,
+            auth_scope=webhook_auth_scope(channel),
+            entrypoint=entrypoint,
+            entrypoint_agent=entrypoint_agent,
+        )
+    finally:
+        with WEBHOOK_MESSAGE_DEDUP_LOCK:
+            event = INFLIGHT_WEBHOOK_MESSAGE_EVENTS.pop(dedup_key, None)
+            if owner and event is not None:
+                if isinstance(result, dict):
+                    RECENT_WEBHOOK_RESULT_BY_MESSAGE[dedup_key] = {
+                        "result": store.clone(result),
+                        "expires_at": datetime.now(UTC) + timedelta(seconds=WEBHOOK_MESSAGE_DEDUP_TTL_SECONDS),
+                    }
+                event.set()
+
+    if result is None:
+        raise RuntimeError("Webhook ingestion returned no result")
+    return result
 
 
 def _next_task_id() -> str:
@@ -312,14 +422,24 @@ def _resolved_message_tenant_binding(message: UnifiedMessage) -> tuple[str | Non
     metadata_tenant_id = _metadata_tenant_id(metadata)
     metadata_tenant_name = _metadata_tenant_name(metadata)
     if metadata_tenant_id:
-        return metadata_tenant_id, metadata_tenant_name or f"{metadata_tenant_id} 租户"
+        resolved_tenant_id, resolved_tenant_name = organization_profile_service.resolve_tenant_binding(
+            metadata_tenant_id,
+            metadata_tenant_name,
+        )
+        if not resolved_tenant_id:
+            return None, None
+        return resolved_tenant_id, resolved_tenant_name or f"{resolved_tenant_id} 租户"
 
     channel_tenant_id, channel_tenant_name = _channel_tenant_binding(
         str(message.channel.value or "").strip().lower()
     )
-    if not channel_tenant_id:
+    resolved_tenant_id, resolved_tenant_name = organization_profile_service.resolve_tenant_binding(
+        channel_tenant_id,
+        channel_tenant_name,
+    )
+    if not resolved_tenant_id:
         return None, None
-    return channel_tenant_id, channel_tenant_name or f"{channel_tenant_id} 租户"
+    return resolved_tenant_id, resolved_tenant_name or f"{resolved_tenant_id} 租户"
 
 
 def _memory_scope_for_message(*, tenant_id: str | None) -> dict[str, str]:
@@ -327,6 +447,25 @@ def _memory_scope_for_message(*, tenant_id: str | None) -> dict[str, str]:
     if tenant_id:
         scope["tenant_id"] = tenant_id
     return scope
+
+
+def _write_hermes_memory_writeback(
+    *,
+    message: UnifiedMessage,
+    hermes_result: dict[str, Any],
+) -> tuple[int, list[str]]:
+    results = _apply_hermes_memory_writeback(
+        hermes_result=hermes_result,
+        message=message,
+        trace_id="legacy",
+    )
+    saved_count = sum(1 for item in results if bool(item.get("applied")))
+    warnings = [
+        f"Hermes 回写第 {index} 项失败：{item.get('error')}"
+        for index, item in enumerate(results, start=1)
+        if str(item.get("error") or "").strip()
+    ]
+    return saved_count, warnings
 
 
 def _profile_preferred_language(profile: dict | None) -> str | None:
@@ -479,6 +618,211 @@ def _find_profile_by_platform_account(
         tenant_id=tenant_id,
     )
     return profile
+
+
+def _message_metadata(message: UnifiedMessage) -> dict[str, Any]:
+    return message.metadata if isinstance(message.metadata, dict) else {}
+
+
+def _resolve_intake_person_name(message: UnifiedMessage) -> str | None:
+    metadata = _message_metadata(message)
+    direct_name = _metadata_text(
+        metadata,
+        *PROFILE_NAME_METADATA_KEYS,
+        "contact_name",
+        "contactName",
+    )
+    if direct_name:
+        return direct_name
+
+    profile_id = _metadata_profile_id(metadata)
+    if profile_id:
+        profile = _load_user_profile(profile_id)
+        resolved = _metadata_text(
+            profile or {},
+            *PROFILE_NAME_METADATA_KEYS,
+            "contact_name",
+            "contactName",
+        )
+        if resolved:
+            return resolved
+
+    normalized_channel = str(message.channel.value or "").strip().lower()
+    platform_user_id = str(message.platform_user_id or "").strip()
+    if not normalized_channel or not platform_user_id:
+        return None
+
+    tenant_id, _ = _resolved_message_tenant_binding(message)
+    profile = _find_profile_by_platform_account(
+        platform=normalized_channel,
+        account_id=platform_user_id,
+        tenant_id=tenant_id,
+    )
+    return _metadata_text(
+        profile or {},
+        *PROFILE_NAME_METADATA_KEYS,
+        "contact_name",
+        "contactName",
+    )
+
+
+def _intake_event_metadata_base(message: UnifiedMessage) -> dict[str, Any]:
+    metadata = _message_metadata(message)
+    tenant_id, tenant_name = _resolved_message_tenant_binding(message)
+    return {
+        "domain": "intake",
+        "channel": str(message.channel.value or "").strip() or None,
+        "platform_user_id": str(message.platform_user_id or "").strip() or None,
+        "tenant_id": tenant_id,
+        "tenant_name": tenant_name,
+        "profile_id": _metadata_profile_id(metadata),
+        "customer_id": _metadata_text(metadata, "customer_id", "customerId"),
+        "service_code": _metadata_text(metadata, "service_code", "serviceCode"),
+        "session_id": str(message.session_id or "").strip() or None,
+        "message_id": str(message.message_id or "").strip() or None,
+        "person_name": _resolve_intake_person_name(message),
+    }
+
+
+def _safe_int(value: object) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _append_intake_admission_event(
+    *,
+    message: UnifiedMessage,
+    status: str,
+    agent: str,
+    text: str,
+    trace_id: str | None,
+    type_: str,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    payload = _intake_event_metadata_base(message)
+    payload.update(
+        {
+            "intake_event_kind": "admission",
+            "intake_status": status,
+        }
+    )
+    if isinstance(metadata, dict):
+        payload.update(store.clone(metadata))
+    append_realtime_event(
+        agent=agent,
+        message=text,
+        type_=type_,
+        source="message_ingestion",
+        trace_id=trace_id,
+        metadata=payload,
+    )
+
+
+def _append_reception_session_event(
+    *,
+    message: UnifiedMessage,
+    state: str,
+    text: str,
+    trace_id: str | None,
+    type_: str,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    payload = _intake_event_metadata_base(message)
+    payload.update(
+        {
+            "intake_event_kind": "session",
+            "agent_role": "hermes_reception",
+            "reception_session_state": state,
+        }
+    )
+    if isinstance(metadata, dict):
+        payload.update(store.clone(metadata))
+    append_realtime_event(
+        agent="Hermes Reception Agent",
+        message=text,
+        type_=type_,
+        source="message_ingestion",
+        trace_id=trace_id,
+        metadata=payload,
+    )
+
+
+def _knowledge_context_event_metadata(message: UnifiedMessage, *, preview_limit: int = 3) -> dict[str, Any]:
+    metadata = _message_metadata(message)
+    retrieval = metadata.get("knowledge_retrieval")
+    knowledge_hits = metadata.get("knowledge_hits") or metadata.get("knowledgeHits")
+    if not isinstance(retrieval, dict) and not isinstance(knowledge_hits, list):
+        return {}
+
+    preview_items: list[dict[str, Any]] = []
+    if isinstance(knowledge_hits, list):
+        for raw_item in knowledge_hits[:preview_limit]:
+            if not isinstance(raw_item, dict):
+                continue
+            preview_items.append(
+                {
+                    "title": str(raw_item.get("title") or "").strip() or "未命名知识片段",
+                    "source": str(raw_item.get("source") or "").strip() or None,
+                    "summary": str(raw_item.get("summary") or "").strip() or None,
+                    "scope": _metadata_text(
+                        raw_item.get("metadata") if isinstance(raw_item.get("metadata"), dict) else {},
+                        "scope",
+                    ),
+                    "score": (
+                        raw_item.get("metadata", {}).get("score")
+                        if isinstance(raw_item.get("metadata"), dict)
+                        else None
+                    ),
+                }
+            )
+
+    total = 0
+    tenant_hits = 0
+    shared_hits = 0
+    if isinstance(retrieval, dict):
+        total = _safe_int(retrieval.get("total"))
+        tenant_hits = _safe_int(retrieval.get("tenant_hits") or retrieval.get("tenantHits"))
+        shared_hits = _safe_int(retrieval.get("shared_hits") or retrieval.get("sharedHits"))
+
+    if total <= 0 and preview_items:
+        total = len(preview_items)
+
+    if total <= 0:
+        return {}
+
+    return {
+        "knowledge_hit_count": total,
+        "knowledge_tenant_hits": tenant_hits,
+        "knowledge_shared_hits": shared_hits,
+        "knowledge_hits_preview": preview_items,
+    }
+
+
+def _active_task_context_event_metadata(message: UnifiedMessage) -> dict[str, Any]:
+    metadata = _message_metadata(message)
+    task_context = metadata.get("active_task_context") or metadata.get("activeTaskContext")
+    if not isinstance(task_context, dict):
+        task_id = _text(metadata.get("task_id") or metadata.get("taskId"))
+        if not task_id:
+            return {}
+        return {"active_task_id": task_id}
+
+    task_id = _text(task_context.get("task_id") or task_context.get("taskId"))
+    if not task_id:
+        return {}
+
+    return {
+        "active_task_id": task_id,
+        "active_task_context": {
+            "task_id": task_id,
+            "title": _text(task_context.get("title")) or None,
+            "status": _text(task_context.get("status")) or None,
+            "summary": _text(task_context.get("summary")) or None,
+            "updated_at": _text(task_context.get("updated_at") or task_context.get("updatedAt")) or None,
+        },
+    }
 
 
 def _user_profile_preferred_language(message: UnifiedMessage) -> str | None:
@@ -794,6 +1138,84 @@ def _sync_message_user_profile(
     persistence_service.persist_user_state(user=updated_user, profile=updated_profile)
 
 
+def _attach_reception_knowledge_context(
+    message: UnifiedMessage,
+    *,
+    trace_id: str,
+) -> tuple[int, str | None]:
+    tenant_id, _ = _resolved_message_tenant_binding(message)
+    query = str(message.text or "").strip()
+    if not tenant_id or not query:
+        return 0, None
+
+    metadata = message.metadata if isinstance(message.metadata, dict) else {}
+    try:
+        request = KnowledgeRetrievalRequest(
+            tenant_id=tenant_id,
+            query=query,
+            scene="reception",
+            metadata={
+                **dict(metadata),
+                "trace_id": trace_id,
+                "channel": message.channel.value,
+                "user_key": message.user_key,
+                "request_source": "reception.message_ingestion",
+            },
+        )
+        retrieval = knowledge_retrieval_service.retrieve(request)
+        injected_metadata = knowledge_injection_service.inject_hits_into_metadata(
+            metadata=metadata,
+            retrieval=retrieval,
+        )
+        message.metadata = injected_metadata
+        retrieval_log = knowledge_retrieval_log_service.build_log(
+            request=request,
+            response=retrieval,
+            request_source="reception.message_ingestion",
+            trace_id=trace_id,
+            metadata={
+                "channel": message.channel.value,
+                "user_key": message.user_key,
+            },
+        )
+        knowledge_retrieval_log_service.append_log(retrieval_log)
+    except Exception as exc:
+        append_realtime_event(
+            agent="Knowledge Retrieval",
+            message=f"接待前知识检索失败：{exc}",
+            type_="warning",
+            source="message_ingestion",
+            trace_id=trace_id,
+            metadata={
+                "event": "knowledge_retrieval_failed",
+                "tenant_id": tenant_id,
+                "channel": message.channel.value,
+                "user_key": message.user_key,
+                "reason": str(exc),
+            },
+        )
+        return 0, str(exc)
+
+    if retrieval.total > 0:
+        append_realtime_event(
+            agent="Knowledge Retrieval",
+            message=f"接待前命中 {retrieval.total} 条知识片段",
+            type_="success",
+            source="message_ingestion",
+            trace_id=trace_id,
+            metadata={
+                "event": "knowledge_retrieval_attached",
+                "tenant_id": tenant_id,
+                "channel": message.channel.value,
+                "user_key": message.user_key,
+                "tenant_hits": retrieval.tenant_hits,
+                "shared_hits": retrieval.shared_hits,
+                **_knowledge_context_event_metadata(message),
+            },
+        )
+    return retrieval.total, None
+
+
 def _memory_context_lines(memory_items: list[dict]) -> list[str]:
     filtered_items, _ = _filter_memory_items_for_injection(memory_items)
     limit = _dynamic_memory_window(
@@ -956,6 +1378,27 @@ def _build_channel_delivery_binding(message: UnifiedMessage) -> dict | None:
             "session_id": str(message.session_id or "").strip() or None,
         }
 
+    if channel == "wecom":
+        tenant_id = str(metadata.get("tenant_id") or metadata.get("tenantId") or "").strip()
+        context_token = str(metadata.get("context_token") or metadata.get("contextToken") or "").strip()
+        platform_user_id = str(message.platform_user_id or "").strip()
+        if tenant_id and context_token and platform_user_id:
+            target_id = encode_wecom_delivery_target(
+                {
+                    "tenant_id": tenant_id,
+                    "user_id": platform_user_id,
+                    "context_token": context_token,
+                }
+            )
+            return {
+                "channel": channel,
+                "target_id": target_id,
+                "target_type": "ilink_context",
+                "platform_user_id": platform_user_id,
+                "tenant_id": tenant_id,
+                "session_id": str(message.session_id or "").strip() or None,
+            }
+
     if chat_id:
         return {
             "channel": channel,
@@ -974,6 +1417,179 @@ def _build_session_id(message: UnifiedMessage) -> str:
     if isinstance(metadata_session_id, str) and metadata_session_id.strip():
         return metadata_session_id
     return f"{message.channel.value}:{message.chat_id}"
+
+
+def _should_handoff_to_reception_agent(
+    *,
+    interaction_mode: str | None,
+    manager_packet: dict[str, Any] | None,
+) -> bool:
+    normalized_interaction_mode = str(interaction_mode or "").strip().lower()
+    manager_action = str((manager_packet or {}).get("manager_action") or "").strip().lower()
+    return normalized_interaction_mode == "chat" or manager_action in {"clarify_request", "reception_reply"}
+
+
+def _finalize_reception_reply_text(
+    *,
+    text: str,
+    user_key: str,
+    auth_scope: str,
+) -> str:
+    outbound_result = security_gateway_service.inspect_text_entrypoint_snapshot(
+        text=text,
+        user_key=f"outbound:{user_key}",
+        auth_scope=auth_scope,
+        direction="output",
+    )
+    if not bool(outbound_result.get("allowed")):
+        return HERMES_REPLY_BLOCKED_RESPONSE
+    return str(outbound_result.get("sanitized_text") or text).strip() or HERMES_REPLY_BLOCKED_RESPONSE
+
+
+def _resolve_hermes_writeback_subject(
+    *,
+    scope: str,
+    tenant_id: str | None,
+    customer_id: str | None,
+    task_id: str | None,
+    explicit_subject_id: str | None,
+) -> tuple[str | None, str | None]:
+    normalized_scope = str(scope or "").strip().lower()
+    normalized_subject_id = str(explicit_subject_id or "").strip() or None
+    if normalized_scope == "tenant":
+        return "tenant", normalized_subject_id or tenant_id
+    if normalized_scope == "task_summary":
+        return "task_summary", normalized_subject_id or task_id
+    if normalized_scope == "customer":
+        return "customer", normalized_subject_id or customer_id
+    return None, None
+
+
+def _apply_hermes_memory_writeback(
+    *,
+    hermes_result: dict[str, Any],
+    message: UnifiedMessage,
+    trace_id: str,
+) -> list[dict[str, Any]]:
+    distillation_memory_types = {
+        "session_summary",
+        "user_preference",
+        "agent_decision",
+        "task_result",
+        "event_digest",
+    }
+    raw_items = hermes_result.get("memory_writeback")
+    if not isinstance(raw_items, list):
+        return []
+
+    metadata = message.metadata if isinstance(message.metadata, dict) else {}
+    tenant_id = _metadata_tenant_id(metadata)
+    customer_id = str(metadata.get("customer_id") or message.platform_user_id or "").strip() or None
+    task_id = str(metadata.get("task_id") or metadata.get("taskId") or "").strip() or None
+    memory_scope = _memory_scope_for_message(tenant_id=tenant_id)
+    results: list[dict[str, Any]] = []
+
+    for raw_item in raw_items:
+        if not isinstance(raw_item, dict):
+            continue
+        scope = str(raw_item.get("scope") or "").strip().lower() or "customer"
+        memory_type = str(raw_item.get("memory_type") or raw_item.get("memoryType") or "").strip() or "business_fact"
+        summary = str(raw_item.get("summary") or "").strip()
+        title = str(raw_item.get("title") or "").strip() or None
+        explicit_subject_id = str(raw_item.get("subject_id") or raw_item.get("subjectId") or "").strip() or None
+        result_entry = {
+            "scope": scope,
+            "memory_type": memory_type,
+            "subject_id": explicit_subject_id,
+            "title": title,
+            "summary": summary,
+            "applied": False,
+            "memory_id": None,
+            "error": None,
+        }
+        if not summary:
+            result_entry["error"] = "summary is required"
+            results.append(result_entry)
+            continue
+
+        subject_type, resolved_subject_id = _resolve_hermes_writeback_subject(
+            scope=scope,
+            tenant_id=tenant_id,
+            customer_id=customer_id,
+            task_id=task_id,
+            explicit_subject_id=explicit_subject_id,
+        )
+        result_entry["subject_id"] = resolved_subject_id
+        if subject_type is None or resolved_subject_id is None:
+            result_entry["error"] = "unable to resolve writeback subject"
+            results.append(result_entry)
+            continue
+
+        try:
+            write_result = memory_service.write_long_term_memory(
+                memory_type=memory_type,
+                content=summary,
+                summary=summary,
+                title=title,
+                scope=memory_scope,
+                subject_type=subject_type,
+                subject_id=resolved_subject_id,
+                importance=raw_item.get("importance"),
+                source="hermes_protocol_writeback",
+                write_source="distillation" if memory_type in distillation_memory_types else "brain_internal",
+                memory_scope="tenant",
+            )
+        except Exception as exc:
+            logger.warning(
+                "Hermes memory_writeback skipped: trace_id=%s scope=%s memory_type=%s error=%s",
+                trace_id,
+                scope,
+                memory_type,
+                exc,
+            )
+            result_entry["error"] = str(exc)
+            results.append(result_entry)
+            continue
+
+        result_entry["applied"] = True
+        result_entry["memory_id"] = str(write_result.get("memory_id") or "").strip() or None
+        results.append(result_entry)
+
+    return results
+
+
+def _build_hermes_protocol_summary(
+    *,
+    hermes_result: dict[str, Any],
+    writeback_results: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    protocol_mode = str(hermes_result.get("protocol_mode") or "").strip() or None
+    interaction_mode = str(hermes_result.get("interaction_mode") or "").strip() or None
+    task_signal = _normalized_hermes_task_signal(hermes_result) or None
+    request_id = str(hermes_result.get("request_id") or "").strip() or None
+    binding_id = str(hermes_result.get("binding_id") or "").strip() or None
+    safety_signal = str(hermes_result.get("safety_signal") or "").strip() or None
+    confidence = hermes_result.get("confidence")
+    requirement_payload = (
+        store.clone(hermes_result.get("requirement_payload"))
+        if isinstance(hermes_result.get("requirement_payload"), dict)
+        else None
+    )
+    attachments = _hermes_attachments(hermes_result)
+    if not any((protocol_mode, interaction_mode, task_signal, request_id, binding_id, safety_signal, writeback_results, requirement_payload, attachments)):
+        return None
+    return {
+        "request_id": request_id,
+        "binding_id": binding_id,
+        "protocol_mode": protocol_mode,
+        "interaction_mode": interaction_mode,
+        "task_signal": task_signal,
+        "safety_signal": safety_signal,
+        "confidence": confidence,
+        "requirement_payload": requirement_payload,
+        "memory_writeback": store.clone(writeback_results),
+        "attachments": store.clone(attachments),
+    }
 
 
 def _persist_execution_state(
@@ -1114,6 +1730,450 @@ def _route_decision_bool(route_decision: dict | None, *keys: str) -> bool:
         if isinstance(value, bool):
             return value
     return False
+
+
+def _active_task_context_payload(task_id: str | None) -> dict[str, Any] | None:
+    normalized_task_id = str(task_id or "").strip()
+    if not normalized_task_id:
+        return None
+
+    task = _find_task(normalized_task_id)
+    if task is None:
+        return None
+
+    summary = _truncate_text(
+        str(task.get("description") or task.get("result") or task.get("title") or "").strip(),
+        240,
+    )
+    updated_at = _latest_message_at_for_task(task).isoformat()
+    return {
+        "task_id": normalized_task_id,
+        "title": str(task.get("title") or "").strip() or None,
+        "status": str(task.get("status") or "").strip() or None,
+        "summary": summary or None,
+        "updated_at": updated_at,
+    }
+
+
+def _attach_active_task_context(message: UnifiedMessage) -> str | None:
+    if not isinstance(message.metadata, dict):
+        message.metadata = {}
+
+    existing_task_id = _text(message.metadata.get("task_id") or message.metadata.get("taskId"))
+    if existing_task_id:
+        task_context = _active_task_context_payload(existing_task_id)
+        if task_context is not None:
+            message.metadata["active_task_context"] = task_context
+        return existing_task_id or None
+
+    active_task = _resolve_active_task_for_user(message.user_key or "")
+    if active_task is None:
+        return None
+
+    task_id, _last_message_at = active_task
+    task_context = _active_task_context_payload(task_id)
+    if task_context is None:
+        return None
+
+    message.metadata["task_id"] = task_id
+    message.metadata["taskId"] = task_id
+    message.metadata["active_task_context"] = task_context
+    return task_id
+
+
+def _hermes_interaction_mode(hermes_result: dict[str, Any]) -> str:
+    normalized = str(hermes_result.get("interaction_mode") or "").strip().lower()
+    if normalized in {"continuation", "chat", "task"}:
+        return normalized
+
+    task_signal = str(hermes_result.get("task_signal") or "").strip().lower()
+    if task_signal in {"dispatch_task", "handoff_human"}:
+        return "task"
+    return "chat"
+
+
+def _normalized_hermes_task_signal(hermes_result: dict[str, Any]) -> str:
+    task_signal = str(hermes_result.get("task_signal") or "").strip().lower()
+    interaction_mode = str(hermes_result.get("interaction_mode") or "").strip().lower()
+    if task_signal == "handoff_human":
+        return "dispatch_task"
+    if task_signal == "dispatch_task":
+        return "dispatch_task"
+    if interaction_mode == "task":
+        return "dispatch_task"
+    if task_signal == "stay_in_reception":
+        return "stay_in_reception"
+    return ""
+
+
+def _hermes_requirement_payload(hermes_result: dict[str, Any]) -> dict[str, Any] | None:
+    payload = hermes_result.get("requirement_payload")
+    if isinstance(payload, dict):
+        return store.clone(payload)
+    payload = hermes_result.get("requirementPayload")
+    if isinstance(payload, dict):
+        return store.clone(payload)
+    return None
+
+
+def _hermes_requirement_summary(hermes_result: dict[str, Any]) -> str:
+    payload = _hermes_requirement_payload(hermes_result)
+    if isinstance(payload, dict):
+        for key in ("summary", "details", "category", "urgency"):
+            value = str(payload.get(key) or "").strip()
+            if value:
+                return value
+    return str(hermes_result.get("reply_text") or "").strip()
+
+
+def _hermes_requirement_description(hermes_result: dict[str, Any]) -> str:
+    payload = _hermes_requirement_payload(hermes_result)
+    if isinstance(payload, dict):
+        summary = str(payload.get("summary") or "").strip()
+        details = str(payload.get("details") or "").strip()
+        if summary and details and details != summary:
+            return f"{summary}\n\n{details}"
+        if summary:
+            return summary
+        if details:
+            return details
+    return _hermes_requirement_summary(hermes_result)
+
+
+def _hermes_attachments(hermes_result: dict[str, Any]) -> list[dict[str, Any]]:
+    raw_items = hermes_result.get("attachments") or hermes_result.get("artifacts")
+    if not isinstance(raw_items, list):
+        return []
+    items: list[dict[str, Any]] = []
+    for raw_item in raw_items:
+        if not isinstance(raw_item, dict):
+            continue
+        file_path = str(raw_item.get("file_path") or raw_item.get("filePath") or "").strip()
+        file_name = str(raw_item.get("file_name") or raw_item.get("fileName") or "").strip()
+        if not file_path or not file_name:
+            continue
+        items.append(
+            {
+                "title": str(raw_item.get("title") or file_name).strip() or file_name,
+                "file_name": file_name,
+                "file_path": file_path,
+                "mime_type": str(raw_item.get("mime_type") or raw_item.get("mimeType") or "").strip() or "application/octet-stream",
+                "kind": str(raw_item.get("kind") or "").strip() or None,
+                "format": str(raw_item.get("format") or "").strip() or None,
+                "size_bytes": raw_item.get("size_bytes") if isinstance(raw_item.get("size_bytes"), int) else raw_item.get("sizeBytes"),
+            }
+        )
+    return items
+
+
+def _request_base_url_from_message(message: UnifiedMessage) -> str | None:
+    metadata = message.metadata if isinstance(message.metadata, dict) else {}
+    return _metadata_text(metadata, "request_base_url", "requestBaseUrl")
+
+
+def _append_attachment_links(reply_text: str, attachments: list[dict[str, Any]]) -> str:
+    if not attachments:
+        return reply_text
+    lines = [str(reply_text or "").strip(), "", "附件下载："]
+    for index, item in enumerate(attachments, start=1):
+        title = str(item.get("title") or item.get("file_name") or f"附件{index}").strip()
+        download_url = str(item.get("download_url") or item.get("downloadUrl") or item.get("download_path") or "").strip()
+        if not download_url:
+            continue
+        lines.append(f"{index}. {title}: {download_url}")
+    return "\n".join(lines).strip()
+
+
+def _register_hermes_attachments(
+    *,
+    message: UnifiedMessage,
+    hermes_result: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    attachments = _hermes_attachments(hermes_result)
+    if not attachments:
+        return [], []
+    metadata = message.metadata if isinstance(message.metadata, dict) else {}
+    tenant_id = _metadata_text(metadata, "tenant_id", "tenantId")
+    customer_id = _metadata_text(metadata, "customer_id", "customerId") or str(message.platform_user_id or "").strip() or None
+    request_base_url = _request_base_url_from_message(message)
+    return reception_shared_files_service.register_attachments(
+        attachments=attachments,
+        tenant_id=tenant_id,
+        customer_id=customer_id,
+        request_base_url=request_base_url,
+    )
+
+
+def _inspect_hermes_result_payload(
+    *,
+    message: UnifiedMessage,
+    hermes_result: dict[str, Any],
+    auth_scope: str,
+    parent_trace_id: str | None,
+) -> tuple[bool, dict[str, Any], dict[str, Any] | None]:
+    sanitized_result = store.clone(hermes_result)
+
+    def _inspect_text(value: str, *, suffix: str, trace_id: str | None) -> tuple[bool, dict[str, Any] | str]:
+        try:
+            inspection = security_gateway_service.inspect_text_entrypoint_snapshot(
+                text=value,
+                user_key=f"hermes:{message.user_key}:{suffix}",
+                auth_scope=auth_scope,
+                direction="output",
+                trace_id=trace_id,
+            )
+        except TypeError:
+            inspection = security_gateway_service.inspect_text_entrypoint_snapshot(
+                text=value,
+                user_key=f"hermes:{message.user_key}:{suffix}",
+                auth_scope=auth_scope,
+                direction="output",
+            )
+        if not bool(inspection.get("allowed")):
+            detail = str(inspection.get("detail") or "Security policy blocked Hermes result").strip()
+            security_verdict = inspection.get("security_verdict")
+            verdict_payload = security_verdict if isinstance(security_verdict, dict) else {}
+            return False, {
+                "detail": detail,
+                "trace_id": str(inspection.get("trace_id") or "").strip() or None,
+                "status_code": int(inspection.get("status_code") or 403),
+                "security_layer": _metadata_text(verdict_payload, "layer"),
+                "security_rule_name": _metadata_text(verdict_payload, "rule_name", "ruleName"),
+            }
+        return True, str(inspection.get("sanitized_text") or value).strip()
+
+    reply_text = str(sanitized_result.get("reply_text") or "").strip()
+    if reply_text:
+        allowed, reply_or_detail = _inspect_text(
+            reply_text,
+            suffix="reply_text",
+            trace_id=parent_trace_id,
+        )
+        if not allowed:
+            block_payload = reply_or_detail if isinstance(reply_or_detail, dict) else {}
+            detail = str(block_payload.get("detail") or "Security policy blocked Hermes result").strip()
+            return False, sanitized_result, {
+                **block_payload,
+                "detail": f"reply_text: {detail}",
+            }
+        sanitized_result["reply_text"] = reply_or_detail
+
+    requirement_payload = _hermes_requirement_payload(sanitized_result)
+    if isinstance(requirement_payload, dict):
+        sanitized_requirement = store.clone(requirement_payload)
+        for field in ("summary", "details"):
+            raw_value = str(sanitized_requirement.get(field) or "").strip()
+            if not raw_value:
+                continue
+            allowed, sanitized_or_detail = _inspect_text(
+                raw_value,
+                suffix=f"requirement_{field}",
+                trace_id=parent_trace_id,
+            )
+            if not allowed:
+                block_payload = sanitized_or_detail if isinstance(sanitized_or_detail, dict) else {}
+                detail = str(block_payload.get("detail") or "Security policy blocked Hermes result").strip()
+                return False, sanitized_result, {
+                    **block_payload,
+                    "detail": f"requirement_payload.{field}: {detail}",
+                }
+            sanitized_requirement[field] = sanitized_or_detail
+        sanitized_result["requirement_payload"] = sanitized_requirement
+
+    return True, sanitized_result, None
+
+
+def _build_hermes_task_dispatch_metadata(
+    *,
+    hermes_result: dict[str, Any],
+    clone: Any,
+) -> Any:
+    interaction_mode = "task"
+    task_signal = _normalized_hermes_task_signal(hermes_result) or "dispatch_task"
+    intent = str(hermes_result.get("intent") or "reception_task").strip() or "reception_task"
+    summary = _hermes_requirement_summary(hermes_result)
+    route_decision = {
+        "intent": intent,
+        "interaction_mode": interaction_mode,
+        "interactionMode": interaction_mode,
+        "reception_mode": "task_handoff",
+        "receptionMode": "task_handoff",
+        "workflow_mode": "task_handoff",
+        "workflowMode": "task_handoff",
+        "execution_scope": "pending_dispatch",
+        "executionScope": "pending_dispatch",
+        "routing_strategy": "hermes_reception_result",
+        "routingStrategy": "hermes_reception_result",
+        "hermes_task_signal": task_signal,
+        "hermesTaskSignal": task_signal,
+        "route_rationale": {
+            "route_reason_summary": summary or "Hermes 将当前会话识别为需求任务。",
+        },
+    }
+    manager_packet = {
+        "manager_role": "reception_manager",
+        "manager_action": "handoff_to_dispatch_queue",
+        "next_owner": "需求分发 Agent",
+        "delivery_mode": "pending_dispatch",
+        "response_contract": "task_intake_record",
+        "clarify_required": False,
+        "clarify_question": str(hermes_result.get("clarify_question") or "").strip() or None,
+        "handoff_summary": summary or None,
+        "session_state": "pending_dispatch",
+        "state_label": "待分发",
+    }
+    brain_dispatch_summary = {
+        "intent": intent,
+        "dispatch_mode": "pending_dispatch",
+        "dispatch_type": "hermes_task_intake",
+        "workflow_mode": "task_handoff",
+        "interaction_mode": interaction_mode,
+        "reception_mode": "task_handoff",
+        "execution_agent": "需求分发 Agent",
+        "manager_action": manager_packet["manager_action"],
+        "next_owner": manager_packet["next_owner"],
+        "delivery_mode": manager_packet["delivery_mode"],
+        "response_contract": manager_packet["response_contract"],
+        "summary_line": summary or "Hermes 已识别需求并交还平台建任务。",
+        "session_state": manager_packet["session_state"],
+        "state_label": manager_packet["state_label"],
+    }
+    return orchestration_service.prepare_message_dispatch_metadata(
+        route_decision=route_decision,
+        manager_packet=manager_packet,
+        brain_dispatch_summary=brain_dispatch_summary,
+        interaction_mode=interaction_mode,
+        approval_required=False,
+        confirmation_status=None,
+        confirmation_required=False,
+        clone=clone,
+    )
+
+
+def _create_task_from_hermes_result(
+    *,
+    message: UnifiedMessage,
+    hermes_result: dict[str, Any],
+    entrypoint: str,
+    entrypoint_agent: str,
+    trace_id: str,
+    preferred_language: str | None,
+    memory_matches: dict[str, Any],
+    security_result: dict[str, Any],
+    message_tenant_id: str | None,
+    message_tenant_name: str | None,
+    security_context: dict[str, Any],
+) -> dict[str, Any]:
+    task_id = _next_task_id()
+    memory_items = memory_matches["items"]
+    memory_injection_summary = _memory_injection_summary(memory_items)
+    metadata = _build_hermes_task_dispatch_metadata(
+        hermes_result=hermes_result,
+        clone=store.clone,
+    )
+    requirement_summary = _hermes_requirement_summary(hermes_result)
+    requirement_description = _hermes_requirement_description(hermes_result)
+    execution_agent_name = "需求分发 Agent"
+    artifacts = orchestration_service.build_message_task_artifacts(
+        task_id=task_id,
+        message=message,
+        entrypoint=entrypoint,
+        entrypoint_agent=entrypoint_agent,
+        trace_id=trace_id,
+        preferred_language=preferred_language,
+        memory_hits=memory_matches["total"],
+        memory_items=memory_items,
+        memory_injection_summary=memory_injection_summary,
+        metadata=metadata,
+        intent=str(hermes_result.get("intent") or "reception_task").strip() or "reception_task",
+        route_message=requirement_summary,
+        execution_agent_name=execution_agent_name,
+        agent_dispatch=False,
+        state_machine_version=FACT_LAYER_STATE_MACHINE_VERSION,
+        warnings=list(security_result["warnings"]),
+        truncate_text=_truncate_text,
+        dispatch_context_memory_items=_dispatch_context_memory_items,
+        build_channel_delivery_binding=_build_channel_delivery_binding,
+        preview_limit=DISPATCH_CONTEXT_TEXT_PREVIEW_LIMIT,
+        now_string=store.now_string,
+        clone=store.clone,
+        memory_context_lines=_memory_context_lines,
+        memory_step_message=_memory_step_message,
+        tenant_id=message_tenant_id,
+        tenant_name=message_tenant_name,
+        security_context=security_context,
+    )
+    task = artifacts.task
+    route_decision = artifacts.route_decision
+    manager_packet = artifacts.manager_packet
+    task["title"] = _truncate_text(requirement_summary or "接待需求登记", 80)
+    task["description"] = requirement_description or str(task.get("description") or "")
+    task["workflow_run_id"] = None
+    task["workflowRunId"] = None
+    task["requirement_payload"] = _hermes_requirement_payload(hermes_result)
+    task["status"] = "pending"
+    state_machine = task.get("state_machine")
+    if isinstance(state_machine, dict):
+        state_machine["task_status"] = "pending"
+        state_machine["session_state"] = str(manager_packet.get("session_state") or "pending_dispatch")
+
+    store.tasks.append(task)
+    store.task_steps[task_id] = list(artifacts.task_steps)
+    AUTHORITATIVE_TASK_STEP_CACHE.add(task_id)
+    mark_task_steps_authoritative(task_id)
+    _persist_execution_state(task=task, steps=artifacts.task_steps)
+    try:
+        dispatch_result = dispatch_requirement_task(task_id, trigger="hermes_task_created")
+        dispatched_task = dispatch_result.get("task")
+        if isinstance(dispatched_task, dict):
+            task = dispatched_task
+    except Exception as exc:  # pragma: no cover - defensive runtime path
+        logger.warning("Requirement dispatch failed for task %s: %s", task_id, exc)
+        append_realtime_event(
+            agent="需求分发 Agent",
+            message=f"任务 {task_id} 已创建，但需求下发暂未完成",
+            type_="warning",
+            source="message_ingestion",
+            trace_id=trace_id,
+            task_id=task_id,
+            metadata={
+                "event": "requirement_dispatch_failed",
+                "error": str(exc),
+            },
+        )
+
+    append_realtime_event(
+        agent="Dispatcher Agent",
+        message=f"已根据 Hermes 结果创建任务 {task_id}",
+        type_="success",
+        source="message_ingestion",
+        trace_id=trace_id,
+        task_id=task_id,
+        metadata={
+            "event": "task_created_from_hermes",
+            "user_key": message.user_key,
+            "interaction_mode": "task",
+            "task_signal": _normalized_hermes_task_signal(hermes_result) or None,
+            "manager_action": str(manager_packet.get("manager_action") or "").strip() or None,
+            "summary": requirement_summary or None,
+        },
+    )
+    ACTIVE_TASKS_BY_USER[message.user_key] = task_id
+    return task_view_service.build_task_event_response(
+        result_message=str(hermes_result.get("reply_text") or ""),
+        entrypoint=entrypoint,
+        task=task,
+        unified_message=message.model_dump(),
+        run_id=None,
+        intent=str(hermes_result.get("intent") or "reception_task").strip() or "reception_task",
+        trace_id=trace_id,
+        detected_lang=message.detected_lang,
+        memory_hits=memory_matches["total"],
+        warnings=list(security_result["warnings"]),
+        merged_into_task_id=None,
+        interaction_mode="task",
+        reception_mode="task_handoff",
+    )
 
 
 def _is_professional_confirmation_pending(task: dict) -> bool:
@@ -1367,13 +2427,117 @@ def ingest_unified_message(
     entrypoint_agent: str = "Unified Message API",
 ) -> dict:
     settings = get_settings()
-    try:
-        security_result = security_gateway_service.inspect(message, auth_scope=auth_scope)
-    except HTTPException as exc:
-        raise exc
-    message.text = str(security_result["sanitized_text"])
+    security_result = security_gateway_service.inspect_text_entrypoint_snapshot(
+        text=message.text,
+        user_key=f"{message.channel.value}:{message.platform_user_id}",
+        auth_scope=auth_scope,
+        direction="input",
+    )
     message.user_key = str(security_result["user_key"])
     message.session_id = _build_session_id(message)
+    if not bool(security_result.get("allowed")):
+        trace_id = str(security_result.get("trace_id") or "").strip() or None
+        _append_intake_admission_event(
+            message=message,
+            status="security_blocked",
+            agent="安全监听层",
+            text="渠道消息被安全监听阻断",
+            trace_id=trace_id,
+            type_="error",
+            metadata={
+                "reason": str(security_result.get("detail") or "").strip() or None,
+                "security_layer": _metadata_text(
+                    security_result.get("security_verdict") or {},
+                    "layer",
+                ),
+                "status_code": int(security_result.get("status_code") or 403),
+            },
+        )
+        raise HTTPException(
+            status_code=int(security_result.get("status_code") or 403),
+            detail=str(security_result.get("detail") or "Security policy blocked this request"),
+        )
+    original_message_text = str(message.text)
+    sanitized_message_text = str(security_result["sanitized_text"])
+    try:
+        # 客户准入需要读取原始身份字段，避免手机号等关键字段被安全脱敏后无法完成绑定。
+        message.text = original_message_text
+        admission_result = customer_access_service.admit_message(message)
+    finally:
+        message.text = sanitized_message_text
+    if admission_result.status != "bound":
+        reply_text = str(admission_result.reply_message or "").strip() or "当前无法接入平台接待。"
+        _append_intake_admission_event(
+            message=message,
+            status=admission_result.status,
+            agent="客户准入层",
+            text=(
+                "客户准入待补充"
+                if admission_result.status == "pending_verification"
+                else "客户准入已拒绝"
+            ),
+            trace_id=str(security_result["trace_id"]),
+            type_="warning" if admission_result.status == "pending_verification" else "error",
+            metadata={
+                "missing_fields": list(admission_result.missing_fields),
+                "reason": reply_text,
+            },
+        )
+        if auth_scope.startswith("webhook:"):
+            channel_outbound_service.deliver_reception_reply(
+                message=message,
+                text=reply_text,
+                trace_id=str(security_result["trace_id"]),
+                channel_delivery_binding=_build_channel_delivery_binding(message),
+            )
+        return task_view_service.build_ingest_response(
+            result_message=reply_text,
+            entrypoint="master_bot.customer_access",
+            unified_message=message.model_dump(),
+            ok=admission_result.status != "rejected",
+            trace_id=str(security_result["trace_id"]),
+            detected_lang=message.detected_lang,
+            memory_hits=0,
+            warnings=list(security_result["warnings"]),
+            interaction_mode="chat",
+            reception_mode="customer_access",
+        )
+    _append_intake_admission_event(
+        message=message,
+        status="passed",
+        agent="客户准入层",
+        text="客户准入通过，已完成服务绑定" if _text(admission_result.reply_message) else "客户准入通过，已进入 Hermes 接待",
+        trace_id=str(security_result["trace_id"]),
+        type_="success",
+        metadata={
+            "profile_id": admission_result.profile_id,
+            "customer_id": admission_result.customer_id,
+            "service_code": admission_result.service_code,
+            "reply_message": _truncate_text(_text(admission_result.reply_message), 120) or None,
+        },
+    )
+    bound_reply_text = str(admission_result.reply_message or "").strip()
+    if bound_reply_text:
+        if auth_scope.startswith("webhook:"):
+            channel_outbound_service.deliver_reception_reply(
+                message=message,
+                text=bound_reply_text,
+                trace_id=str(security_result["trace_id"]),
+                channel_delivery_binding=_build_channel_delivery_binding(message),
+            )
+        LAST_MESSAGE_AT_BY_USER[message.user_key] = _parse_datetime(message.received_at)
+        return task_view_service.build_ingest_response(
+            result_message=bound_reply_text,
+            entrypoint="master_bot.customer_access",
+            unified_message=message.model_dump(),
+            ok=True,
+            trace_id=str(security_result["trace_id"]),
+            detected_lang=message.detected_lang,
+            memory_hits=0,
+            warnings=list(security_result["warnings"]),
+            interaction_mode="chat",
+            reception_mode="customer_access",
+        )
     preferred_language = _resolved_preferred_language(message)
     message.detected_lang = detect_language(
         message.text,
@@ -1433,196 +2597,312 @@ def ingest_unified_message(
     )
     if confirmation_result is not None:
         return confirmation_result
-    context_patch_task_id = _should_context_patch(message.user_key, received_at, message.text)
-    if context_patch_task_id:
-        _append_context_patch(context_patch_task_id, message, str(security_result["trace_id"]))
+    active_task_id = _attach_active_task_context(message)
+    _, knowledge_warning = _attach_reception_knowledge_context(
+        message,
+        trace_id=str(security_result["trace_id"]),
+    )
+    if knowledge_warning:
+        security_result["warnings"].append(f"Knowledge retrieval failed: {knowledge_warning}")
+    hermes_result: dict[str, Any] | None = None
+    hermes_protocol_summary: dict[str, Any] | None = None
+    interaction_mode = "chat"
+    reception_mode = "chat"
+    reply_text = ""
+    route_decision: dict[str, Any] | None = None
+
+    _append_reception_session_event(
+        message=message,
+        state="serving",
+        text="Hermes 正在接待当前客户",
+        trace_id=str(security_result["trace_id"]),
+        type_="info",
+        metadata={
+            **({"active_task_id": active_task_id} if active_task_id else {}),
+            **_active_task_context_event_metadata(message),
+            **_knowledge_context_event_metadata(message),
+        },
+    )
+    try:
+        hermes_result = hermes_reception_agent_service.reply(
+            message=message,
+        )
+    except Exception as exc:
+        logger.exception(
+            "Hermes reception failed during message ingestion: user_key=%s channel=%s",
+            message.user_key,
+            message.channel.value,
+        )
+        _append_reception_session_event(
+            message=message,
+            state="failed",
+            text=f"Hermes 接待调用失败：{exc}",
+            trace_id=str(security_result["trace_id"]),
+            type_="warning",
+            metadata={
+                "event": "hermes_reception_failed",
+                "user_key": message.user_key,
+                "reason": str(exc),
+                **_active_task_context_event_metadata(message),
+                **_knowledge_context_event_metadata(message),
+            },
+        )
+        reply_text = HERMES_REPLY_FALLBACK_RESPONSE
+        hermes_result = None
+
+    if hermes_result is None:
+        if auth_scope.startswith("webhook:") and reply_text:
+            channel_outbound_service.deliver_reception_reply(
+                message=message,
+                text=reply_text,
+                trace_id=str(security_result["trace_id"]),
+                channel_delivery_binding=_build_channel_delivery_binding(message),
+            )
         LAST_MESSAGE_AT_BY_USER[message.user_key] = received_at
-        context_patch_task = _find_task(context_patch_task_id)
-        return task_view_service.build_context_patch_response(
-            result_message="Message merged into active task context",
-            entrypoint="master_bot.context_patch",
-            task=context_patch_task,
-            task_id=context_patch_task_id,
-            intent=reception_service.infer_message_intent(message.text),
+        return task_view_service.build_ingest_response(
+            result_message=reply_text,
+            entrypoint="master_bot.reception",
             unified_message=message.model_dump(),
             trace_id=str(security_result["trace_id"]),
             detected_lang=message.detected_lang,
             memory_hits=memory_matches["total"],
             warnings=list(security_result["warnings"]),
             interaction_mode="chat",
-            reception_mode="continuation",
+            reception_mode="chat",
         )
 
-    dispatch_plan = brain_coordinator_service.build_dispatch_plan(
-        {
-            "text": message.text,
-            "language": message.detected_lang,
-            "channel": message.channel.value,
-            "user_id": message.user_key,
-            "session_id": message.session_id,
-            "metadata": message.metadata,
-        }
-    )
-    intent = dispatch_plan.intent
-    workflow = dispatch_plan.workflow
-    route_message = dispatch_plan.route_message
-    route_decision = dispatch_plan.route_decision
-    interaction_mode = dispatch_plan.interaction_mode
-    reception_mode = dispatch_plan.reception_mode
-    agent_dispatch = dispatch_plan.agent_dispatch
-    if agent_dispatch:
-        raise ValueError("Message ingress no longer accepts agent_dispatch dispatch plans")
-
-    normalized_interaction_mode = str(interaction_mode or "").strip().lower()
-    normalized_reception_mode = str(reception_mode or "").strip().lower()
-    if normalized_interaction_mode == "chat":
-        route_decision = route_decision or {}
-        workflow_mode = (
-            _route_decision_field(route_decision, "workflow_mode", "workflowMode") or "dialogue_workflow"
-        )
-        route_decision["workflow_mode"] = workflow_mode
-        route_decision["workflowMode"] = workflow_mode
-        route_decision["interaction_mode"] = "chat"
-        route_decision["interactionMode"] = "chat"
-        reception_value = (
-            normalized_reception_mode
-            or _route_decision_field(route_decision, "reception_mode", "receptionMode")
-            or "small_talk"
-        )
-        route_decision["reception_mode"] = reception_value
-        route_decision["receptionMode"] = reception_value
-
-    metadata = orchestration_service.prepare_message_dispatch_metadata(
-        route_decision=route_decision,
-        manager_packet=dispatch_plan.manager_packet,
-        brain_dispatch_summary=dispatch_plan.brain_dispatch_summary,
-        interaction_mode=interaction_mode,
-        approval_required=_route_decision_bool(route_decision, "approval_required", "approvalRequired"),
-        confirmation_status=_route_decision_field(route_decision, "confirmation_status", "confirmationStatus"),
-        confirmation_required=_route_decision_bool(route_decision, "confirmation_required", "confirmationRequired"),
-        clone=store.clone,
-    )
-    task_id = _next_task_id()
-    memory_items = memory_matches["items"]
-    memory_injection_summary = _memory_injection_summary(memory_items)
-    execution_agent_name = dispatch_plan.execution_agent_name
-    artifacts = orchestration_service.build_message_task_artifacts(
-        task_id=task_id,
+    allowed_result, hermes_result, blocked_reason = _inspect_hermes_result_payload(
         message=message,
-        entrypoint=entrypoint,
-        entrypoint_agent=entrypoint_agent,
-        trace_id=str(security_result["trace_id"]),
-        preferred_language=preferred_language,
-        memory_hits=memory_matches["total"],
-        memory_items=memory_items,
-        memory_injection_summary=memory_injection_summary,
-        metadata=metadata,
-        intent=intent,
-        route_message=route_message,
-        execution_agent_name=execution_agent_name,
-        agent_dispatch=agent_dispatch,
-        state_machine_version=FACT_LAYER_STATE_MACHINE_VERSION,
-        warnings=list(security_result["warnings"]),
-        truncate_text=_truncate_text,
-        dispatch_context_memory_items=_dispatch_context_memory_items,
-        build_channel_delivery_binding=_build_channel_delivery_binding,
-        preview_limit=DISPATCH_CONTEXT_TEXT_PREVIEW_LIMIT,
-        now_string=store.now_string,
-        clone=store.clone,
-        memory_context_lines=_memory_context_lines,
-        memory_step_message=_memory_step_message,
-        tenant_id=message_tenant_id,
-        tenant_name=message_tenant_name,
-        security_context=security_context,
+        hermes_result=hermes_result,
+        auth_scope=auth_scope,
+        parent_trace_id=str(security_result["trace_id"]),
     )
-    route_decision = artifacts.route_decision
-    manager_packet = artifacts.manager_packet
-    brain_dispatch_summary = artifacts.brain_dispatch_summary
-    task = artifacts.task
-    dispatch_context = artifacts.dispatch_context
-    store.tasks.append(task)
-    store.task_steps[task_id] = list(artifacts.task_steps)
-    AUTHORITATIVE_TASK_STEP_CACHE.add(task_id)
-    mark_task_steps_authoritative(task_id)
-    append_realtime_event(
-        agent="Dispatcher Agent",
-        message=TASK_HANDOFF_RESPONSE,
-        type_="info",
-        source="message_ingestion",
-        trace_id=str(security_result["trace_id"]),
-        task_id=task_id,
-        metadata={
-            "event": "task_started",
-            "user_key": message.user_key,
-            "intent": intent,
-            "entrypoint": entrypoint,
-        },
-    )
-    run = _launch_message_run(
-        task=task,
-        intent=intent,
-        entrypoint=entrypoint,
-        memory_hits=memory_matches["total"],
-        warnings=list(security_result["warnings"]),
-        dispatch_context=dispatch_context,
-        launch_plan=orchestration_service.build_message_run_launch_plan(
-            agent_dispatch=agent_dispatch,
-            confirmation_pending=artifacts.confirmation_pending,
-            workflow_id=str((workflow or {}).get("id") or ""),
-            route_decision=route_decision,
-        ),
-    )
-    ACTIVE_TASKS_BY_USER[message.user_key] = task_id
-    LAST_MESSAGE_AT_BY_USER[message.user_key] = received_at
-    append_realtime_event(
-        agent="Dispatcher Agent",
-        message=f"已为 {message.user_key} 创建任务 {task_id}",
-        type_="success",
-        source="message_ingestion",
-        trace_id=str(security_result["trace_id"]),
-        task_id=task_id,
-        workflow_run_id=str(run.get("id") or "").strip() or None,
-        metadata={
-            "event": "task_created",
-            "user_key": message.user_key,
-            "intent": intent,
-            "entrypoint": entrypoint,
-            "manager_action": str(manager_packet.get("manager_action") or "").strip() or None,
-            "session_state": str(manager_packet.get("session_state") or "").strip() or None,
-            "response_contract": str(manager_packet.get("response_contract") or "").strip() or None,
-        },
-    )
+    if not allowed_result:
+        blocked_reason = blocked_reason if isinstance(blocked_reason, dict) else {}
+        blocked_detail = str(blocked_reason.get("detail") or "").strip() or "Hermes result blocked by security policy"
+        security_result["warnings"].append(f"Hermes result blocked: {blocked_detail}")
+        _append_intake_admission_event(
+            message=message,
+            status="security_blocked",
+            agent="Hermes 回传安全监听",
+            text="Hermes 回传结果被安全监听阻断",
+            trace_id=str(security_result["trace_id"]),
+            type_="error",
+            metadata={
+                "reason": blocked_detail,
+                "security_layer": _metadata_text(blocked_reason, "security_layer"),
+                "security_rule_name": _metadata_text(blocked_reason, "security_rule_name", "securityRuleName"),
+                "status_code": _safe_int(blocked_reason.get("status_code")) or 403,
+            },
+        )
+        _append_reception_session_event(
+            message=message,
+            state="failed",
+            text="Hermes 回传结果被安全监听阻断",
+            trace_id=str(security_result["trace_id"]),
+            type_="warning",
+            metadata={
+                "event": "hermes_result_blocked",
+                "reason": blocked_detail,
+                "security_layer": _metadata_text(blocked_reason, "security_layer"),
+                "security_rule_name": _metadata_text(blocked_reason, "security_rule_name", "securityRuleName"),
+                "status_code": _safe_int(blocked_reason.get("status_code")) or 403,
+                **_active_task_context_event_metadata(message),
+                **_knowledge_context_event_metadata(message),
+            },
+        )
+        LAST_MESSAGE_AT_BY_USER[message.user_key] = received_at
+        return task_view_service.build_ingest_response(
+            result_message="",
+            entrypoint="master_bot.reception",
+            unified_message=message.model_dump(),
+            trace_id=str(security_result["trace_id"]),
+            detected_lang=message.detected_lang,
+            memory_hits=memory_matches["total"],
+            warnings=list(security_result["warnings"]),
+            interaction_mode="chat",
+            reception_mode="blocked",
+        )
 
-    return task_view_service.build_task_event_response(
-        result_message=TASK_HANDOFF_RESPONSE,
-        entrypoint=entrypoint,
-        task=task,
+    interaction_mode = _hermes_interaction_mode(hermes_result)
+    reply_text = str(hermes_result.get("reply_text") or "").strip()
+    registered_attachments, attachment_errors = _register_hermes_attachments(
+        message=message,
+        hermes_result=hermes_result,
+    )
+    if attachment_errors:
+        for error in attachment_errors:
+            security_result["warnings"].append(f"Hermes attachment skipped: {error}")
+    if registered_attachments:
+        hermes_result["attachments"] = store.clone(registered_attachments)
+        reply_text = _append_attachment_links(reply_text, registered_attachments)
+        hermes_result["reply_text"] = reply_text
+        security_result["warnings"].append(f"Hermes attachments linked: {len(registered_attachments)}")
+    if interaction_mode == "continuation":
+        reception_mode = "continuation"
+    elif interaction_mode == "task":
+        reception_mode = "task_handoff"
+    else:
+        reception_mode = "chat"
+
+    if hermes_result.get("memory_writeback"):
+        security_result["warnings"].append(
+            "Platform-managed memory mode: Hermes memory_writeback disabled by design"
+        )
+
+    hermes_protocol_summary = _build_hermes_protocol_summary(
+        hermes_result=hermes_result,
+        writeback_results=[],
+    )
+    task_signal = _normalized_hermes_task_signal(hermes_result)
+    if task_signal:
+        security_result["warnings"].append(f"Hermes task_signal={task_signal}")
+    clarify_question = str(hermes_result.get("clarify_question") or "").strip()
+    route_decision = {
+        "interaction_mode": interaction_mode,
+        "interactionMode": interaction_mode,
+        "reception_mode": reception_mode,
+        "receptionMode": reception_mode,
+        "hermes_task_signal": task_signal or None,
+        "hermesTaskSignal": task_signal or None,
+        "hermes_clarify_question": clarify_question or None,
+        "hermesClarifyQuestion": clarify_question or None,
+    }
+    _append_reception_session_event(
+        message=message,
+        state="replied",
+        text=f"Hermes 已生成回复：{_truncate_text(reply_text, 40)}",
+        trace_id=str(security_result["trace_id"]),
+        type_="success",
+        metadata={
+            **_active_task_context_event_metadata(message),
+            "interaction_mode": interaction_mode,
+            "task_signal": task_signal or None,
+            "attachment_count": len(registered_attachments),
+            "protocol_mode": str(hermes_result.get("protocol_mode") or "").strip() or None,
+            "reply_preview": _truncate_text(reply_text, 120),
+            **_knowledge_context_event_metadata(message),
+        },
+    )
+    try:
+        writeback_result = customer_profile_writeback_service.apply_reception_writeback(
+            message=message,
+            hermes_result=hermes_result,
+            interaction_mode=interaction_mode,
+        )
+        if writeback_result is not None and writeback_result.updated_fields:
+            security_result["warnings"].append(
+                "Profile writeback updated: " + ", ".join(writeback_result.updated_fields)
+            )
+    except Exception as exc:
+        logger.warning(
+            "Customer profile writeback skipped: profile_id=%s trace_id=%s error=%s",
+            _metadata_text(message.metadata if isinstance(message.metadata, dict) else {}, *PROFILE_ID_METADATA_KEYS),
+            str(security_result["trace_id"]),
+            exc,
+        )
+        security_result["warnings"].append("Customer profile writeback skipped")
+
+    if interaction_mode == "continuation" and active_task_id:
+        _append_context_patch(active_task_id, message, str(security_result["trace_id"]))
+        if auth_scope.startswith("webhook:") and reply_text:
+            channel_outbound_service.deliver_reception_reply(
+                message=message,
+                text=reply_text,
+                trace_id=str(security_result["trace_id"]),
+                channel_delivery_binding=_build_channel_delivery_binding(message),
+            )
+        LAST_MESSAGE_AT_BY_USER[message.user_key] = received_at
+        context_patch_task = _find_task(active_task_id)
+        if context_patch_task is not None:
+            return task_view_service.build_task_event_response(
+                result_message=reply_text,
+                entrypoint="master_bot.reception",
+                task=context_patch_task,
+                unified_message=message.model_dump(),
+                run_id=str(context_patch_task.get("workflow_run_id") or context_patch_task.get("workflowRunId") or "").strip() or None,
+                intent=str(hermes_result.get("intent") or "").strip() or None,
+                trace_id=str(security_result["trace_id"]),
+                detected_lang=message.detected_lang,
+                memory_hits=memory_matches["total"],
+                warnings=list(security_result["warnings"]),
+                merged_into_task_id=active_task_id,
+                interaction_mode="continuation",
+                reception_mode="continuation",
+                include_task_route_decision=False,
+            )
+
+    if interaction_mode == "task":
+        if auth_scope.startswith("webhook:") and reply_text:
+            channel_outbound_service.deliver_reception_reply(
+                message=message,
+                text=reply_text,
+                trace_id=str(security_result["trace_id"]),
+                channel_delivery_binding=_build_channel_delivery_binding(message),
+            )
+        LAST_MESSAGE_AT_BY_USER[message.user_key] = received_at
+        return _create_task_from_hermes_result(
+            message=message,
+            hermes_result=hermes_result,
+            entrypoint="master_bot.reception",
+            entrypoint_agent=entrypoint_agent,
+            trace_id=str(security_result["trace_id"]),
+            preferred_language=preferred_language,
+            memory_matches=memory_matches,
+            security_result=security_result,
+            message_tenant_id=message_tenant_id,
+            message_tenant_name=message_tenant_name,
+            security_context=security_context,
+        )
+
+    if interaction_mode == "continuation" and not active_task_id:
+        security_result["warnings"].append("Hermes requested continuation but no active task was resolved")
+
+    if auth_scope.startswith("webhook:") and reply_text:
+        channel_outbound_service.deliver_reception_reply(
+            message=message,
+            text=reply_text,
+            trace_id=str(security_result["trace_id"]),
+            channel_delivery_binding=_build_channel_delivery_binding(message),
+        )
+
+    LAST_MESSAGE_AT_BY_USER[message.user_key] = received_at
+    return task_view_service.build_ingest_response(
+        result_message=reply_text,
+        entrypoint="master_bot.reception",
         unified_message=message.model_dump(),
-        run_id=str(run.get("id") or "").strip() or None,
-        intent=intent,
         trace_id=str(security_result["trace_id"]),
         detected_lang=message.detected_lang,
         memory_hits=memory_matches["total"],
         warnings=list(security_result["warnings"]),
-        merged_into_task_id=None,
+        intent=str(hermes_result.get("intent") or "").strip() or None,
         interaction_mode=interaction_mode,
         reception_mode=reception_mode,
+        route_decision=route_decision,
+        hermes_protocol=hermes_protocol_summary,
     )
 
 
-def ingest_channel_webhook(channel: str, payload: dict) -> dict:
+def ingest_channel_webhook(channel: str, payload: dict, *, request_base_url: str | None = None) -> dict:
     adapter = channel_adapter_registry.get(channel)
     message = adapter.parse(payload)
-    return ingest_unified_message(
+    if not isinstance(message.metadata, dict):
+        message.metadata = {}
+    if request_base_url:
+        normalized_base = str(request_base_url).strip().rstrip("/")
+        if normalized_base:
+            message.metadata["request_base_url"] = normalized_base
+            message.metadata["requestBaseUrl"] = normalized_base
+    return _ingest_webhook_message_once(
         message,
-        auth_scope=webhook_auth_scope(channel),
+        channel=channel,
         entrypoint="master_bot.dispatch",
         entrypoint_agent=f"{channel_display_name(channel)} Adapter",
     )
 
 
-def ingest_telegram_webhook(payload: dict) -> dict:
-    return ingest_channel_webhook("telegram", payload)
+def ingest_telegram_webhook(payload: dict, *, request_base_url: str | None = None) -> dict:
+    return ingest_channel_webhook("telegram", payload, request_base_url=request_base_url)
 
 
 def bootstrap_message_ingestion_state() -> dict[str, int]:
@@ -1659,3 +2939,7 @@ def reset_message_ingestion_state() -> None:
     ACTIVE_TASKS_BY_USER.clear()
     LAST_MESSAGE_AT_BY_USER.clear()
     AUTHORITATIVE_TASK_STEP_CACHE.clear()
+    RECENT_WEBHOOK_RESULT_BY_MESSAGE.clear()
+    for event in INFLIGHT_WEBHOOK_MESSAGE_EVENTS.values():
+        event.set()
+    INFLIGHT_WEBHOOK_MESSAGE_EVENTS.clear()

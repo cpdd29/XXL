@@ -41,6 +41,8 @@ class ToolSourceToolItem(APIModel):
     name: str
     type: str
     provider: str
+    scope: str = "shared"
+    owner_tenant_id: str | None = None
     source_kind: str | None = None
     bridge_mode: str | None = None
     enabled: bool
@@ -78,6 +80,8 @@ class ToolSourceSkillRegistrationRequest(APIModel):
     timeout_seconds: float = 8.0
     tags: list[str] = Field(default_factory=list)
     capabilities: list[str] = Field(default_factory=list)
+    scope: str = "shared"
+    owner_tenant_id: str | None = None
     source_id: str | None = None
     source_name: str | None = None
 
@@ -97,6 +101,8 @@ class ToolSourceMcpRegistrationRequest(APIModel):
     tags: list[str] = Field(default_factory=list)
     scopes: list[str] = Field(default_factory=lambda: ["agents:read"])
     roles: list[str] = Field(default_factory=lambda: ["admin", "operator", "power_user", "viewer"])
+    scope: str = "shared"
+    owner_tenant_id: str | None = None
     source_id: str | None = None
     source_name: str | None = None
 

@@ -3,13 +3,20 @@ from __future__ import annotations
 
 def normalized_security_policy_settings(policy: dict[str, object]) -> dict[str, int | bool]:
     return {
+        "input_monitor_enabled": bool(policy.get("input_monitor_enabled", True)),
+        "output_monitor_enabled": bool(policy.get("output_monitor_enabled", True)),
         "incident_window_seconds": max(int(policy.get("security_incident_window_seconds") or 1), 1),
         "ban_threshold": max(int(policy.get("message_rate_limit_ban_threshold") or 1), 1),
         "cooldown_seconds": max(int(policy.get("message_rate_limit_cooldown_seconds") or 1), 1),
         "ban_seconds": max(int(policy.get("message_rate_limit_ban_seconds") or 1), 1),
         "rate_limit_per_minute": max(int(policy.get("message_rate_limit_per_minute") or 1), 1),
+        "dos_protection_enabled": bool(policy.get("dos_protection_enabled", True)),
         "prompt_injection_enabled": bool(policy.get("prompt_injection_enabled", True)),
+        "xss_enabled": bool(policy.get("xss_enabled", True)),
+        "keyword_blocklist_enabled": bool(policy.get("keyword_blocklist_enabled", False)),
+        "keyword_block_threshold": max(int(policy.get("keyword_block_threshold") or 1), 1),
         "content_redaction_enabled": bool(policy.get("content_redaction_enabled", True)),
+        "audit_enabled": True,
     }
 
 
@@ -138,14 +145,22 @@ def build_block_realtime_metadata(
     layer: str,
     user_key: str,
     status_code: int,
+    detail: str | None = None,
+    rule_name: str | None = None,
 ) -> dict[str, object]:
-    return {
+    payload: dict[str, object] = {
         "event": "message_blocked",
         "layer": layer,
         "user_key": user_key,
         "status_code": status_code,
     }
-
+    normalized_detail = str(detail or "").strip()
+    if normalized_detail:
+        payload["detail"] = normalized_detail
+    normalized_rule_name = str(rule_name or "").strip()
+    if normalized_rule_name:
+        payload["rule_name"] = normalized_rule_name
+    return payload
 
 def build_security_allow_result(
     *,

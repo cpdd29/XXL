@@ -9,4 +9,6 @@
 - `reception`：渠道接入、实时安全监听、接待 Agent 接入、消息回传
 - `dispatch`：任务下发、需求分发、单/多 Agent 执行与 workflow 运行内核
 - `agent_config`：Agent / Skill / MCP / Tool Source 接入与节点绑定配置
+- `executor_config`：内部执行器接入（注册、校验、健康观测）
 - `organization`：租户、用户、画像等组织侧数据
+- `knowledge`：平台知识库注册、同步、切片、检索与 `knowledge_hits` 注入

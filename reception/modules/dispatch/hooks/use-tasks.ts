@@ -13,7 +13,25 @@ interface UseTasksParams {
   channel?: string
 }
 
-export function useTasks(params?: UseTasksParams) {
+interface UseTaskQueryOptions {
+  live?: boolean
+  refetchIntervalMs?: number
+}
+
+interface UseTaskListQueryOptions {
+  live?: boolean
+  refetchIntervalMs?: number
+}
+
+const DEFAULT_TASK_DETAIL_REFETCH_INTERVAL_MS = 3_000
+const DEFAULT_TASK_LIST_REFETCH_INTERVAL_MS = 3_000
+
+function isActiveTaskStatus(status?: string | null) {
+  const normalized = String(status ?? '').trim().toLowerCase()
+  return normalized === 'pending' || normalized === 'running'
+}
+
+export function useTasks(params?: UseTasksParams, options?: UseTaskListQueryOptions) {
   const searchParams = new URLSearchParams()
   if (params?.status && params.status !== 'all') {
     searchParams.set('status', params.status)
@@ -31,6 +49,8 @@ export function useTasks(params?: UseTasksParams) {
     searchParams.set('channel', params.channel)
   }
   const suffix = searchParams.toString() ? `?${searchParams.toString()}` : ''
+  const live = options?.live === true
+  const refetchIntervalMs = options?.refetchIntervalMs ?? DEFAULT_TASK_LIST_REFETCH_INTERVAL_MS
 
   return useQuery({
     queryKey: [
@@ -42,22 +62,40 @@ export function useTasks(params?: UseTasksParams) {
       params?.channel ?? 'all',
     ] as const,
     queryFn: () => apiRequest<TaskListResponse>(`/api/tasks${suffix}`),
+    refetchInterval: live ? refetchIntervalMs : false,
+    refetchIntervalInBackground: true,
   })
 }
 
-export function useTaskDetail(taskId: string) {
+export function useTaskDetail(taskId: string, options?: UseTaskQueryOptions) {
+  const live = options?.live !== false
+  const refetchIntervalMs = options?.refetchIntervalMs ?? DEFAULT_TASK_DETAIL_REFETCH_INTERVAL_MS
+
   return useQuery({
     queryKey: queryKeys.tasks.detail(taskId),
     queryFn: () => apiRequest<Task>(`/api/tasks/${encodeURIComponent(taskId)}`),
     enabled: Boolean(taskId),
+    refetchInterval: (query) => {
+      if (!live) {
+        return false
+      }
+      const task = query.state.data as Task | undefined
+      return isActiveTaskStatus(task?.status) ? refetchIntervalMs : false
+    },
+    refetchIntervalInBackground: true,
   })
 }
 
-export function useTaskSteps(taskId: string) {
+export function useTaskSteps(taskId: string, options?: UseTaskQueryOptions & { taskStatus?: string | null }) {
+  const live = options?.live !== false
+  const refetchIntervalMs = options?.refetchIntervalMs ?? DEFAULT_TASK_DETAIL_REFETCH_INTERVAL_MS
+
   return useQuery({
     queryKey: queryKeys.tasks.steps(taskId),
     queryFn: () => apiRequest<TaskStepsResponse>(`/api/tasks/${encodeURIComponent(taskId)}/steps`),
     enabled: Boolean(taskId),
+    refetchInterval: live && isActiveTaskStatus(options?.taskStatus) ? refetchIntervalMs : false,
+    refetchIntervalInBackground: true,
   })
 }
 

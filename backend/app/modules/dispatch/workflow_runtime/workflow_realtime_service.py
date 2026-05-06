@@ -32,6 +32,7 @@ BRAIN_WORKFLOW_RUN_SUBJECT_PATTERN = "brain.workflow.run.*"
 class WorkflowRealtimeService:
     def __init__(self, *, event_bus=None) -> None:
         self._subscribers: dict[str, list[Queue]] = defaultdict(list)
+        self._global_subscribers: list[Queue] = []
         self._lock = Lock()
         self._instance_id = uuid4().hex
         self._event_bus = event_bus or nats_event_bus
@@ -95,8 +96,11 @@ class WorkflowRealtimeService:
     def _broadcast(self, workflow_id: str, payload: dict) -> None:
         with self._lock:
             subscribers = list(self._subscribers.get(workflow_id, []))
+            global_subscribers = list(self._global_subscribers)
 
         for subscriber in subscribers:
+            subscriber.put(payload)
+        for subscriber in global_subscribers:
             subscriber.put(payload)
 
     def _handle_event_bus_message(self, subject: str, payload: dict) -> None:
@@ -148,6 +152,18 @@ class WorkflowRealtimeService:
             if not self._subscribers[workflow_id]:
                 self._subscribers.pop(workflow_id, None)
 
+    def _subscribe_all(self) -> Queue:
+        queue: Queue = Queue()
+        with self._lock:
+            self._global_subscribers.append(queue)
+        return queue
+
+    def _unsubscribe_all(self, queue: Queue) -> None:
+        with self._lock:
+            self._global_subscribers = [
+                subscriber for subscriber in self._global_subscribers if subscriber is not queue
+            ]
+
     async def stream(self, websocket: WebSocket, workflow_id: str) -> None:
         await websocket.accept()
         subscriber = self._subscribe(workflow_id)
@@ -176,3 +192,4 @@ workflow_realtime_service = WorkflowRealtimeService()
 def reset_workflow_realtime_state() -> None:
     with workflow_realtime_service._lock:
         workflow_realtime_service._subscribers.clear()
+        workflow_realtime_service._global_subscribers.clear()

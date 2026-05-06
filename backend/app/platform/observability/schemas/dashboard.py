@@ -174,11 +174,15 @@ class AuditLog(APIModel):
     environment: str | None = None
     timestamp: str
     action: str
+    action_label: str | None = None
     user: str
     resource: str
+    resource_label: str | None = None
+    module_label: str | None = None
     status: str
     ip: str
     details: str
+    operator_summary: str | None = None
     metadata: dict[str, Any] | None = None
 
 

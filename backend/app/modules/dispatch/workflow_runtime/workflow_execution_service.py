@@ -20,10 +20,6 @@ from app.platform.messaging.nats_event_bus import nats_event_bus
 from app.config import get_settings
 from app.modules.dispatch.single_agent_runtime.agent_execution_service import agent_execution_service
 from app.modules.agent_config.registries.external_agent_registry_service import external_agent_registry_service
-from app.modules.agent_config.registries.mandatory_agent_registry_service import (
-    get_mandatory_agent_projection,
-    list_mandatory_agent_projections,
-)
 from app.modules.organization.application.tenancy_service import attach_scope, matches_scope
 from app.modules.agent_config.registries.agent_service import is_agent_routable, routing_priority
 from app.modules.reception.outbound.channel_outbound_service import channel_outbound_service
@@ -962,12 +958,6 @@ def _load_agents_for_execution() -> list[dict]:
         if not agent_id or agent_id in merged:
             continue
         merged[agent_id] = store.clone(external_agent)
-    if getattr(persistence_service, "enabled", False):
-        for projection in list_mandatory_agent_projections(existing_agents=list(merged.values())):
-            agent_id = str(projection.get("id") or "").strip()
-            if not agent_id or agent_id in merged:
-                continue
-            merged[agent_id] = store.clone(projection)
 
     store.agents = [store.clone(agent) for agent in merged.values()]
     return store.agents
@@ -999,32 +989,7 @@ def _find_agent_mutable(agent_id: str) -> dict | None:
     database_agent, database_authoritative = _load_database_agent(normalized_agent_id)
     if database_authoritative:
         if database_agent is None:
-            projection = None
-            if getattr(persistence_service, "enabled", False):
-                existing = next(
-                    (
-                        agent
-                        for agent in store.agents
-                        if str(agent.get("id") or "").strip() == normalized_agent_id
-                    ),
-                    None,
-                )
-                projection = get_mandatory_agent_projection(
-                    normalized_agent_id,
-                    existing=existing,
-                )
-            if projection is None:
-                return None
-            payload = store.clone(projection)
-            for agent in store.agents:
-                if str(agent.get("id") or "") != normalized_agent_id:
-                    continue
-                agent.clear()
-                agent.update(payload)
-                return agent
-
-            store.agents.append(payload)
-            return payload
+            return None
         payload = store.clone(database_agent)
         for agent in store.agents:
             if str(agent.get("id") or "") != normalized_agent_id:

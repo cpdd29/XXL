@@ -3,6 +3,7 @@ from __future__ import annotations
 from copy import deepcopy
 from datetime import UTC, datetime
 import logging
+from pathlib import Path
 from typing import Any
 
 from app.modules.agent_config.registries.agent_config_service import agent_config_service, build_agent_config_summary
@@ -27,6 +28,20 @@ from app.platform.persistence.runtime_store import LEGACY_AGENT_IDS, LEGACY_WORK
 logger = logging.getLogger(__name__)
 DEFAULT_AGENT_WORKFLOW_CONTRACT_VERSION = "agent-workflow-contract-v1"
 MANDATORY_AGENT_SUPPRESSION_SETTING_KEY = "mandatory_agent_registry.suppressed_agent_ids"
+REQUIREMENT_DISPATCHER_SOUL_PATH = (
+    Path(__file__).resolve().parents[2] / "dispatch" / "requirement_dispatch_agent" / "soul.md"
+)
+
+
+def _load_optional_markdown(path: Path) -> str | None:
+    try:
+        content = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return content or None
+
+
+REQUIREMENT_DISPATCHER_SOUL = _load_optional_markdown(REQUIREMENT_DISPATCHER_SOUL_PATH)
 
 MANDATORY_AGENT_SPECS: tuple[dict[str, Any], ...] = (
     {
@@ -58,6 +73,20 @@ MANDATORY_AGENT_SPECS: tuple[dict[str, Any], ...] = (
         "name": "需求分析任务分发 Agent",
         "description": "负责整理需求、判断执行路径并把任务分发到外接触手执行层。",
         "type": "task_dispatcher",
+        "builtin_config": {
+            "version": "builtin-requirement-dispatch-v1",
+            "trigger_intents": ["reception_task", "dispatch_task"],
+            "capabilities": [
+                "requirement_intake",
+                "workload_estimation",
+                "single_multi_agent_planning",
+                "development_group_provisioning",
+                "acceptance_agent_provisioning",
+                "nats_group_coordination",
+            ],
+            "soul": REQUIREMENT_DISPATCHER_SOUL,
+            "warnings": ["未找到独立 Agent 目录，已使用 mandatory registry 内置的需求分发配置。"],
+        },
     },
     {
         "id": "security",
@@ -464,13 +493,15 @@ def _build_builtin_config_snapshot(
 ) -> dict[str, Any]:
     builtin_config = spec.get("builtin_config")
     assert isinstance(builtin_config, dict)
+    builtin_soul = str(builtin_config.get("soul") or "").strip() or None
+    files_loaded = ["soul.md"] if builtin_soul else []
     snapshot = {
         "agent_id": spec["id"],
         "status": "builtin",
         "directory": None,
         "version": str(builtin_config.get("version") or "builtin-v1"),
         "loaded_at": _now_iso(),
-        "files_loaded": [],
+        "files_loaded": files_loaded,
         "warnings": list(builtin_config.get("warnings") or ["已使用 mandatory registry 内置配置。"]),
         "agent": {
             "agent_id": spec["id"],
@@ -480,7 +511,7 @@ def _build_builtin_config_snapshot(
             "trigger_intents": list(builtin_config.get("trigger_intents") or []),
             "capabilities": list(builtin_config.get("capabilities") or []),
         },
-        "soul": None,
+        "soul": builtin_soul,
         "tools": {"tools": list(builtin_config.get("tools") or [])},
         "memory_rules": None,
         "examples": [],
@@ -622,30 +653,61 @@ def _build_agent_payload(
 
 def ensure_mandatory_agents_registered() -> dict[str, Any]:
     _purge_legacy_agents()
-    purge_removed_workflow_agent_bindings()
+    projections = list_mandatory_agent_projections(
+        existing_agents=(persistence_service.list_agents() or []) + list(getattr(store, "agents", [])),
+    )
+    persist_agent_state = getattr(persistence_service, "persist_agent_state", None)
+    registered_agent_ids: list[str] = []
+    for payload in projections:
+        runtime_agent = _upsert_runtime_agent(payload)
+        if callable(persist_agent_state):
+            persist_agent_state(agent=runtime_agent)
+        registered_agent_ids.append(str(payload.get("id") or "").strip())
 
-    created: list[str] = []
-    updated: list[str] = []
-    items: list[dict[str, Any]] = []
-
-    for spec in _active_mandatory_agent_specs():
-        agent_id = spec["id"]
-        existing = _find_runtime_agent(agent_id)
-        payload = _build_agent_payload(spec, existing=existing)
-        persisted = _upsert_runtime_agent(payload)
-        if existing is None:
-            created.append(agent_id)
-            logger.info("Registered mandatory agent %s", agent_id)
-        else:
-            updated.append(agent_id)
-            logger.info("Refreshed mandatory agent %s", agent_id)
-        persistence_service.persist_agent_state(agent=persisted)
-        items.append(_clone(persisted))
-
+    logger.info(
+        "Ensured mandatory agents registered: %s",
+        ", ".join(agent_id for agent_id in registered_agent_ids if agent_id),
+    )
     return {
         "ok": True,
-        "created": created,
-        "updated": updated,
-        "items": items,
-        "total": len(items),
+        "registered_agent_ids": registered_agent_ids,
+        "total": len(registered_agent_ids),
+    }
+
+
+def purge_mandatory_agents() -> dict[str, Any]:
+    _purge_legacy_agents()
+    mandatory_agent_ids = [
+        str(spec.get("id") or "").strip()
+        for spec in MANDATORY_AGENT_SPECS
+        if str(spec.get("id") or "").strip()
+    ]
+    if not mandatory_agent_ids:
+        return {"ok": True, "removed_agent_ids": [], "total": 0}
+
+    store.agents = [
+        agent
+        for agent in getattr(store, "agents", [])
+        if str(agent.get("id") or "").strip() not in mandatory_agent_ids
+    ]
+    store.system_settings.pop(MANDATORY_AGENT_SUPPRESSION_SETTING_KEY, None)
+
+    removed_count = persistence_service.delete_agent_states(agent_ids=mandatory_agent_ids)
+    persist_setting = getattr(persistence_service, "persist_system_setting", None)
+    if callable(persist_setting) and getattr(persistence_service, "enabled", False):
+        persist_setting(
+            key=MANDATORY_AGENT_SUPPRESSION_SETTING_KEY,
+            payload=[],
+            updated_at=store.now_string(),
+        )
+
+    logger.info(
+        "Purged mandatory agents from runtime/persistence: %s",
+        ", ".join(mandatory_agent_ids),
+    )
+    return {
+        "ok": True,
+        "removed_agent_ids": mandatory_agent_ids,
+        "removed_persistence_count": removed_count,
+        "total": len(mandatory_agent_ids),
     }

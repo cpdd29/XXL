@@ -22,6 +22,8 @@ export interface RegisterSkillPayload {
   timeoutSeconds?: number
   tags?: string[]
   capabilities?: string[]
+  scope?: 'shared' | 'tenant'
+  ownerTenantId?: string | null
   sourceId?: string
   sourceName?: string
 }
@@ -41,6 +43,8 @@ export interface RegisterMcpPayload {
   tags?: string[]
   scopes?: string[]
   roles?: string[]
+  scope?: 'shared' | 'tenant'
+  ownerTenantId?: string | null
   sourceId?: string
   sourceName?: string
 }

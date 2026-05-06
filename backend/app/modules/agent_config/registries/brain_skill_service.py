@@ -10,6 +10,16 @@ from typing import Any
 from fastapi import HTTPException, status
 import yaml
 
+from app.modules.agent_config.registries.capability_scope import (
+    CAPABILITY_SCOPE_SHARED,
+    CAPABILITY_SCOPE_TENANT,
+    apply_scope_fields,
+    capability_visible,
+    extract_scope_fields,
+    matches_scope_filter,
+    normalize_scope_fields,
+    scope_priority,
+)
 from app.platform.persistence.persistence_service import persistence_service
 from app.modules.agent_config.registries.skill_registry_service import skill_registry_service
 from app.platform.persistence.runtime_store import store
@@ -133,21 +143,37 @@ class BrainSkillService:
     def bootstrap(self) -> None:
         self._sync_registry(self._library_items())
 
-    def list_skills(self) -> dict[str, Any]:
+    def list_skills(
+        self,
+        *,
+        tenant_id: str | None = None,
+        include_all_tenants: bool = False,
+        scope: str | None = None,
+    ) -> dict[str, Any]:
         items = sorted(
-            (self._public_item(item) for item in self._library_items()),
+            (
+                self._public_item(item)
+                for item in self._library_items()
+                if capability_visible(item, tenant_id=tenant_id, include_all_tenants=include_all_tenants)
+                and matches_scope_filter(item, scope)
+            ),
             key=lambda item: (
+                scope_priority(item, tenant_id=tenant_id),
                 str(item.get("uploaded_at") or ""),
                 str(item.get("name") or "").lower(),
             ),
-            reverse=True,
         )
         return {
             "items": items,
             "total": len(items),
         }
 
-    def upload_skill(self, payload: dict[str, Any]) -> dict[str, Any]:
+    def upload_skill(
+        self,
+        payload: dict[str, Any],
+        *,
+        tenant_id: str | None = None,
+    ) -> dict[str, Any]:
         file_name = _normalize_text(payload.get("file_name") or payload.get("fileName"))
         content = str(payload.get("content") or "")
         if not file_name:
@@ -156,6 +182,22 @@ class BrainSkillService:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Skill 文件内容不能为空")
 
         parsed = self._parse_uploaded_file(file_name=file_name, content=content)
+        requested_scope, requested_owner_tenant_id = normalize_scope_fields(
+            scope=payload.get("scope", parsed["manifest"].get("scope")),
+            owner_tenant_id=(
+                payload.get("owner_tenant_id")
+                or payload.get("ownerTenantId")
+                or parsed["manifest"].get("owner_tenant_id")
+                or parsed["manifest"].get("ownerTenantId")
+                or tenant_id
+            ),
+            default_scope=CAPABILITY_SCOPE_SHARED,
+        )
+        if requested_scope == CAPABILITY_SCOPE_TENANT and not requested_owner_tenant_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="tenant 作用域 Skill 必须提供 owner_tenant_id",
+            )
         items = self._library_items()
         existing_ids = {str(item.get("id") or "").strip() for item in items}
         existing_files = {str(item.get("file_name") or "").strip().lower() for item in items}
@@ -176,6 +218,8 @@ class BrainSkillService:
             "capabilities": parsed["capabilities"],
             "uploaded_at": now,
             "updated_at": now,
+            "scope": requested_scope,
+            "owner_tenant_id": requested_owner_tenant_id,
             "content": content,
             "manifest": parsed["manifest"],
             "ability": self._build_runtime_ability(
@@ -189,6 +233,8 @@ class BrainSkillService:
                 format_name=parsed["format"],
                 uploaded_at=now,
                 manifest=parsed["manifest"],
+                scope=requested_scope,
+                owner_tenant_id=requested_owner_tenant_id,
             ),
         }
         items.append(item)
@@ -216,7 +262,70 @@ class BrainSkillService:
             }
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="未找到对应的本地 skill")
 
-    def resolve_skill_summaries(self, skill_ids: list[str] | None) -> list[dict[str, Any]]:
+    def update_skill_scope(
+        self,
+        skill_id: str,
+        *,
+        scope: str,
+        owner_tenant_id: str | None = None,
+    ) -> dict[str, Any]:
+        normalized_id = _normalize_text(skill_id)
+        requested_scope, requested_owner_tenant_id = normalize_scope_fields(
+            scope=scope,
+            owner_tenant_id=owner_tenant_id,
+            default_scope=CAPABILITY_SCOPE_SHARED,
+        )
+        if requested_scope == CAPABILITY_SCOPE_TENANT and not requested_owner_tenant_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="tenant 作用域 Skill 必须提供 owner_tenant_id",
+            )
+
+        items = self._library_items()
+        for item in items:
+            if str(item.get("id") or "").strip() != normalized_id:
+                continue
+            item["scope"] = requested_scope
+            item["owner_tenant_id"] = requested_owner_tenant_id
+            item["updated_at"] = _now_iso()
+            manifest = deepcopy(item.get("manifest") or {})
+            manifest["scope"] = requested_scope
+            if requested_owner_tenant_id:
+                manifest["owner_tenant_id"] = requested_owner_tenant_id
+            else:
+                manifest.pop("owner_tenant_id", None)
+                manifest.pop("ownerTenantId", None)
+            item["manifest"] = manifest
+            item["ability"] = self._build_runtime_ability(
+                skill_id=str(item.get("id") or ""),
+                display_name=str(item.get("name") or ""),
+                description=str(item.get("description") or ""),
+                enabled=bool(item.get("enabled", True)),
+                tags=list(item.get("tags") or []),
+                capabilities=list(item.get("capabilities") or []),
+                file_name=str(item.get("file_name") or ""),
+                format_name=str(item.get("format") or ""),
+                uploaded_at=str(item.get("uploaded_at") or _now_iso()),
+                manifest=manifest,
+                scope=requested_scope,
+                owner_tenant_id=requested_owner_tenant_id,
+            )
+            self._persist_library(items)
+            self._sync_registry(items)
+            return {
+                "ok": True,
+                "message": f"已更新 Skill {item['name']} 的作用域",
+                "skill": self._public_item(item),
+            }
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="未找到对应的本地 skill")
+
+    def resolve_skill_summaries(
+        self,
+        skill_ids: list[str] | None,
+        *,
+        tenant_id: str | None = None,
+        include_all_tenants: bool = True,
+    ) -> list[dict[str, Any]]:
         requested_ids = [_normalize_text(item) for item in (skill_ids or []) if _normalize_text(item)]
         if not requested_ids:
             return []
@@ -229,6 +338,8 @@ class BrainSkillService:
             item = items_by_id.get(skill_id)
             if item is None:
                 continue
+            if not capability_visible(item, tenant_id=tenant_id, include_all_tenants=include_all_tenants):
+                continue
             resolved.append(
                 {
                     "id": str(item.get("id") or "").strip(),
@@ -238,6 +349,8 @@ class BrainSkillService:
                     "description": str(item.get("description") or "").strip() or None,
                     "tags": list(item.get("tags") or []),
                     "capabilities": list(item.get("capabilities") or []),
+                    "scope": str(item.get("scope") or CAPABILITY_SCOPE_SHARED),
+                    "owner_tenant_id": item.get("owner_tenant_id"),
                 }
             )
         return resolved
@@ -347,6 +460,8 @@ class BrainSkillService:
         format_name: str,
         uploaded_at: str,
         manifest: dict[str, Any],
+        scope: str,
+        owner_tenant_id: str | None,
     ) -> dict[str, Any]:
         metadata = _normalize_metadata(manifest.get("metadata"))
         metadata.update(
@@ -356,6 +471,8 @@ class BrainSkillService:
                 "file_name": file_name,
                 "format": format_name,
                 "uploaded_at": uploaded_at,
+                "scope": scope,
+                "owner_tenant_id": owner_tenant_id,
             }
         )
         return {
@@ -389,6 +506,8 @@ class BrainSkillService:
             "tags": list(item.get("tags") or []),
             "capabilities": list(item.get("capabilities") or []),
             "uploaded_at": str(item.get("uploaded_at") or "").strip() or None,
+            "scope": str(item.get("scope") or CAPABILITY_SCOPE_SHARED),
+            "owner_tenant_id": item.get("owner_tenant_id"),
         }
 
     def _sync_runtime_library(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -448,9 +567,33 @@ class BrainSkillService:
         uploaded_at = _normalize_text(raw_item.get("uploaded_at") or raw_item.get("uploadedAt")) or _now_iso()
         updated_at = _normalize_text(raw_item.get("updated_at") or raw_item.get("updatedAt")) or uploaded_at
         manifest = deepcopy(raw_item.get("manifest") or {})
+        scope, owner_tenant_id = normalize_scope_fields(
+            scope=raw_item.get("scope") or manifest.get("scope"),
+            owner_tenant_id=(
+                raw_item.get("owner_tenant_id")
+                or raw_item.get("ownerTenantId")
+                or manifest.get("owner_tenant_id")
+                or manifest.get("ownerTenantId")
+            ),
+            default_scope=CAPABILITY_SCOPE_SHARED,
+        )
+        manifest["scope"] = scope
+        if owner_tenant_id is not None:
+            manifest["owner_tenant_id"] = owner_tenant_id
+        else:
+            manifest.pop("owner_tenant_id", None)
+            manifest.pop("ownerTenantId", None)
         ability = raw_item.get("ability")
         if isinstance(ability, dict):
-            normalized_ability = deepcopy(ability)
+            normalized_ability = apply_scope_fields(
+                deepcopy(ability),
+                scope=scope,
+                owner_tenant_id=owner_tenant_id,
+            )
+            metadata = normalized_ability.get("metadata") if isinstance(normalized_ability.get("metadata"), dict) else {}
+            metadata["scope"] = scope
+            metadata["owner_tenant_id"] = owner_tenant_id
+            normalized_ability["metadata"] = metadata
         else:
             normalized_ability = self._build_runtime_ability(
                 skill_id=skill_id,
@@ -463,6 +606,8 @@ class BrainSkillService:
                 format_name=format_name,
                 uploaded_at=uploaded_at,
                 manifest=manifest,
+                scope=scope,
+                owner_tenant_id=owner_tenant_id,
             )
         return {
             "id": skill_id,
@@ -475,6 +620,8 @@ class BrainSkillService:
             "capabilities": capabilities,
             "uploaded_at": uploaded_at,
             "updated_at": updated_at,
+            "scope": scope,
+            "owner_tenant_id": owner_tenant_id,
             "content": str(raw_item.get("content") or ""),
             "manifest": manifest,
             "ability": normalized_ability,

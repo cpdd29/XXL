@@ -31,6 +31,7 @@ import {
 import { toast } from "@/shared/hooks/use-toast"
 
 const HTTP_METHOD_OPTIONS = ["POST", "GET", "PUT", "PATCH", "DELETE"] as const
+const MCP_TAG_OPTIONS = ["专业流", "自由流"] as const
 
 const initialSkillForm: RegisterSkillPayload = {
   name: "",
@@ -96,19 +97,20 @@ function skillSubmitPayload(
   }
 }
 
-function mcpSubmitPayload(form: RegisterMcpPayload, tagsInput: string): RegisterMcpPayload {
+function mcpSubmitPayload(form: RegisterMcpPayload, selectedTag: string): RegisterMcpPayload {
   return {
-    ...form,
     name: form.name.trim(),
-    id: form.id?.trim() || undefined,
     description: form.description?.trim() || undefined,
     baseUrl: form.baseUrl.trim(),
     invokePath: normalizePath(form.invokePath || "", "/invoke"),
     method: form.method?.trim().toUpperCase() || "POST",
-    provider: form.provider?.trim() || undefined,
     timeoutSeconds: Number(form.timeoutSeconds || 10),
-    tags: parseCommaSeparated(tagsInput),
+    tags: selectedTag ? [selectedTag] : [],
+    requiresPermission: Boolean(form.requiresPermission),
     approvalRequired: form.requiresPermission ? Boolean(form.approvalRequired) : false,
+    enabled: Boolean(form.enabled),
+    scopes: form.scopes ?? [],
+    roles: form.roles ?? [],
   }
 }
 
@@ -125,7 +127,7 @@ export function ToolRegistrationActions({
   const [mcpForm, setMcpForm] = useState<RegisterMcpPayload>(initialMcpForm)
   const [skillTagsInput, setSkillTagsInput] = useState("")
   const [skillCapabilitiesInput, setSkillCapabilitiesInput] = useState("")
-  const [mcpTagsInput, setMcpTagsInput] = useState("")
+  const [mcpTag, setMcpTag] = useState("")
   const [skillError, setSkillError] = useState("")
   const [mcpError, setMcpError] = useState("")
 
@@ -134,13 +136,21 @@ export function ToolRegistrationActions({
 
   const skillPending = registerSkill.isPending
   const mcpPending = registerMcp.isPending
-  const showSkillAction = mode !== "mcp-only"
+  const skillExternalDisabled = true
+  const showSkillAction = !skillExternalDisabled && mode !== "mcp-only"
   const showMcpAction = mode !== "skill-only"
   const skillPreview = useMemo(
     () => skillSubmitPayload(skillForm, skillTagsInput, skillCapabilitiesInput),
     [skillCapabilitiesInput, skillForm, skillTagsInput],
   )
-  const mcpPreview = useMemo(() => mcpSubmitPayload(mcpForm, mcpTagsInput), [mcpForm, mcpTagsInput])
+  const mcpPreview = useMemo(() => mcpSubmitPayload(mcpForm, mcpTag), [mcpForm, mcpTag])
+  const mcpRequiredErrors = useMemo(
+    () => ({
+      name: !mcpPreview.name,
+      baseUrl: !mcpPreview.baseUrl,
+    }),
+    [mcpPreview.baseUrl, mcpPreview.name],
+  )
 
   const resetSkillForm = () => {
     setSkillForm(initialSkillForm)
@@ -151,7 +161,7 @@ export function ToolRegistrationActions({
 
   const resetMcpForm = () => {
     setMcpForm(initialMcpForm)
-    setMcpTagsInput("")
+    setMcpTag("")
     setMcpError("")
   }
 
@@ -181,8 +191,11 @@ export function ToolRegistrationActions({
   }
 
   const handleSubmitMcp = async () => {
-    if (!mcpPreview.name || !mcpPreview.baseUrl) {
-      setMcpError("请填写 MCP 名称和服务地址。")
+    if (mcpRequiredErrors.name || mcpRequiredErrors.baseUrl) {
+      const reasons: string[] = []
+      if (mcpRequiredErrors.name) reasons.push("MCP 名称")
+      if (mcpRequiredErrors.baseUrl) reasons.push("服务地址")
+      setMcpError(`缺少必填项：${reasons.join("、")}`)
       return
     }
 
@@ -441,39 +454,27 @@ export function ToolRegistrationActions({
 
           <div className="grid gap-4 py-2 sm:grid-cols-2">
             <div className="space-y-2">
-              <Label htmlFor="mcp-name">MCP 名称</Label>
+              <Label htmlFor="mcp-name">
+                MCP 名称 <span className="text-destructive">*</span>
+              </Label>
               <Input
                 id="mcp-name"
                 value={mcpForm.name ?? ""}
                 onChange={(event) => setMcpForm((current) => ({ ...current, name: event.target.value }))}
                 placeholder="例如：crm_lookup"
+                className={mcpRequiredErrors.name ? "border-destructive focus-visible:ring-destructive" : ""}
               />
             </div>
             <div className="space-y-2">
-              <Label htmlFor="mcp-id">MCP ID</Label>
-              <Input
-                id="mcp-id"
-                value={mcpForm.id ?? ""}
-                onChange={(event) => setMcpForm((current) => ({ ...current, id: event.target.value }))}
-                placeholder="留空自动生成"
-              />
-            </div>
-            <div className="space-y-2">
-              <Label htmlFor="mcp-base-url">服务地址</Label>
+              <Label htmlFor="mcp-base-url">
+                服务地址 <span className="text-destructive">*</span>
+              </Label>
               <Input
                 id="mcp-base-url"
                 value={mcpForm.baseUrl ?? ""}
                 onChange={(event) => setMcpForm((current) => ({ ...current, baseUrl: event.target.value }))}
                 placeholder="https://mcp.example.com"
-              />
-            </div>
-            <div className="space-y-2">
-              <Label htmlFor="mcp-provider">接入标识</Label>
-              <Input
-                id="mcp-provider"
-                value={mcpForm.provider ?? ""}
-                onChange={(event) => setMcpForm((current) => ({ ...current, provider: event.target.value }))}
-                placeholder="mcp-http"
+                className={mcpRequiredErrors.baseUrl ? "border-destructive focus-visible:ring-destructive" : ""}
               />
             </div>
             <div className="space-y-2">
@@ -521,12 +522,18 @@ export function ToolRegistrationActions({
             </div>
             <div className="space-y-2">
               <Label htmlFor="mcp-tags">标签</Label>
-              <Input
-                id="mcp-tags"
-                value={mcpTagsInput}
-                onChange={(event) => setMcpTagsInput(event.target.value)}
-                placeholder="crm, lookup"
-              />
+              <Select value={mcpTag} onValueChange={setMcpTag}>
+                <SelectTrigger id="mcp-tags">
+                  <SelectValue placeholder="请选择标签" />
+                </SelectTrigger>
+                <SelectContent>
+                  {MCP_TAG_OPTIONS.map((option) => (
+                    <SelectItem key={option} value={option}>
+                      {option}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
             </div>
             <div className="space-y-2 sm:col-span-2">
               <Label htmlFor="mcp-description">说明</Label>
@@ -535,43 +542,6 @@ export function ToolRegistrationActions({
                 value={mcpForm.description ?? ""}
                 onChange={(event) => setMcpForm((current) => ({ ...current, description: event.target.value }))}
                 placeholder="说明这个 MCP 能处理什么请求。"
-              />
-            </div>
-            <div className="flex items-center justify-between rounded-lg border border-border px-3 py-2">
-              <div>
-                <div className="text-sm font-medium text-foreground">新增后立即启用</div>
-                <div className="text-xs text-muted-foreground">关闭后会写入目录，但默认不参与调度。</div>
-              </div>
-              <Switch
-                checked={Boolean(mcpForm.enabled)}
-                onCheckedChange={(checked) => setMcpForm((current) => ({ ...current, enabled: checked }))}
-              />
-            </div>
-            <div className="flex items-center justify-between rounded-lg border border-border px-3 py-2">
-              <div>
-                <div className="text-sm font-medium text-foreground">需要权限控制</div>
-                <div className="text-xs text-muted-foreground">敏感接口建议开启，便于后续纳入审批流。</div>
-              </div>
-              <Switch
-                checked={Boolean(mcpForm.requiresPermission)}
-                onCheckedChange={(checked) =>
-                  setMcpForm((current) => ({
-                    ...current,
-                    requiresPermission: checked,
-                    approvalRequired: checked ? current.approvalRequired : false,
-                  }))
-                }
-              />
-            </div>
-            <div className="flex items-center justify-between rounded-lg border border-border px-3 py-2 sm:col-span-2">
-              <div>
-                <div className="text-sm font-medium text-foreground">需要人工审批</div>
-                <div className="text-xs text-muted-foreground">仅在开启权限控制时生效。</div>
-              </div>
-              <Switch
-                checked={Boolean(mcpForm.approvalRequired)}
-                onCheckedChange={(checked) => setMcpForm((current) => ({ ...current, approvalRequired: checked }))}
-                disabled={!mcpForm.requiresPermission}
               />
             </div>
           </div>

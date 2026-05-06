@@ -3,6 +3,7 @@ import type { ToolSourceType } from '@/shared/types/tool-source'
 export type ToolType = 'skill' | 'tool' | 'mcp' | 'unknown'
 
 export type ToolHealthStatus = 'healthy' | 'degraded' | 'unhealthy' | 'unknown'
+export type CapabilityScope = 'global' | 'tenant' | 'unknown'
 
 export type ToolMigrationStage =
   | 'retained'
@@ -64,6 +65,8 @@ export interface Tool {
   requiredPermissions: string[]
   permissions: ToolPermissions
   requiredCapabilities: string[]
+  scope: CapabilityScope
+  ownerTenantId: string | null
   inputSchema: Record<string, unknown> | null
   outputSchema: Record<string, unknown> | null
   configDetail: Record<string, unknown> | null

@@ -2,6 +2,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from app.config import get_settings
+from app.modules.organization.application import profile_service as organization_profile_service
 from app.platform.security.encryption_service import ENCRYPTED_TEXT_PREFIX, encryption_service
 from app.platform.persistence.persistence_service import persistence_service
 from app.platform.persistence.runtime_store import store
@@ -15,15 +16,23 @@ _runtime_defaults = get_settings()
 DEFAULT_WEBHOOK_SECRET_HEADER = "X-WorkBot-Webhook-Secret"
 DEFAULT_WEBHOOK_SECRET_QUERY_PARAM = "token"
 DEFAULT_SECURITY_POLICY_SETTINGS = {
+    "input_monitor_enabled": True,
+    "output_monitor_enabled": True,
     "message_rate_limit_per_minute": int(_runtime_defaults.message_rate_limit_per_minute),
     "message_rate_limit_cooldown_seconds": int(_runtime_defaults.message_rate_limit_cooldown_seconds),
     "message_rate_limit_ban_threshold": int(_runtime_defaults.message_rate_limit_ban_threshold),
     "message_rate_limit_ban_seconds": int(_runtime_defaults.message_rate_limit_ban_seconds),
     "security_incident_window_seconds": int(_runtime_defaults.security_incident_window_seconds),
+    "dos_protection_enabled": True,
     "prompt_rule_block_threshold": 4,
     "prompt_classifier_block_threshold": 3,
     "prompt_injection_enabled": True,
+    "xss_enabled": True,
+    "keyword_blocklist_enabled": False,
+    "keyword_blocklist": [],
+    "keyword_block_threshold": 1,
     "content_redaction_enabled": True,
+    "audit_enabled": True,
 }
 AGENT_API_PROVIDER_KEYS = (
     "openai",
@@ -108,7 +117,7 @@ DEFAULT_AGENT_API_SETTINGS = {
 }
 DEFAULT_CHANNEL_INTEGRATION_SETTINGS = {
     "telegram": {
-        "enabled": True,
+        "enabled": False,
         "api_base_url": str(_runtime_defaults.telegram_api_base_url),
         "http_timeout_seconds": float(_runtime_defaults.telegram_http_timeout_seconds),
         "tenant_id": None,
@@ -117,7 +126,7 @@ DEFAULT_CHANNEL_INTEGRATION_SETTINGS = {
         "webhook_secret": str(_runtime_defaults.telegram_webhook_secret or "").strip() or None,
     },
     "wecom": {
-        "enabled": True,
+        "enabled": False,
         "tenant_id": None,
         "tenant_name": None,
         "webhook_secret": str(_runtime_defaults.wecom_webhook_secret or "").strip() or None,
@@ -141,7 +150,7 @@ DEFAULT_CHANNEL_INTEGRATION_SETTINGS = {
         "http_timeout_seconds": float(getattr(_runtime_defaults, "wecom_http_timeout_seconds", 10.0) or 10.0),
     },
     "feishu": {
-        "enabled": True,
+        "enabled": False,
         "tenant_id": None,
         "tenant_name": None,
         "webhook_secret": str(_runtime_defaults.feishu_webhook_secret or "").strip() or None,
@@ -165,7 +174,7 @@ DEFAULT_CHANNEL_INTEGRATION_SETTINGS = {
         "http_timeout_seconds": float(getattr(_runtime_defaults, "feishu_http_timeout_seconds", 10.0) or 10.0),
     },
     "dingtalk": {
-        "enabled": True,
+        "enabled": False,
         "tenant_id": None,
         "tenant_name": None,
         "app_id": str(getattr(_runtime_defaults, "dingtalk_app_id", "") or "").strip(),
@@ -213,6 +222,28 @@ def _coerce_string(value: Any, *, default: str = "") -> str:
     if value is None:
         return default
     return str(value).strip()
+
+
+def _coerce_string_list(value: Any) -> list[str]:
+    if isinstance(value, str):
+        source = value.splitlines()
+    elif isinstance(value, (list, tuple, set)):
+        source = list(value)
+    else:
+        source = []
+
+    items: list[str] = []
+    seen: set[str] = set()
+    for item in source:
+        normalized = str(item or "").strip()
+        if not normalized:
+            continue
+        lookup_key = normalized.lower()
+        if lookup_key in seen:
+            continue
+        seen.add(lookup_key)
+        items.append(normalized)
+    return items
 
 
 def _coerce_positive_int(
@@ -274,6 +305,14 @@ def _normalize_general_settings(payload: dict[str, Any] | None) -> dict[str, boo
 def _normalize_security_policy_settings(payload: dict[str, Any] | None) -> dict[str, Any]:
     source = payload or {}
     return {
+        "input_monitor_enabled": _coerce_bool(
+            source.get("input_monitor_enabled", source.get("inputMonitorEnabled")),
+            default=DEFAULT_SECURITY_POLICY_SETTINGS["input_monitor_enabled"],
+        ),
+        "output_monitor_enabled": _coerce_bool(
+            source.get("output_monitor_enabled", source.get("outputMonitorEnabled")),
+            default=DEFAULT_SECURITY_POLICY_SETTINGS["output_monitor_enabled"],
+        ),
         "message_rate_limit_per_minute": _coerce_positive_int(
             source.get("message_rate_limit_per_minute", source.get("messageRateLimitPerMinute")),
             default=DEFAULT_SECURITY_POLICY_SETTINGS["message_rate_limit_per_minute"],
@@ -310,6 +349,10 @@ def _normalize_security_policy_settings(payload: dict[str, Any] | None) -> dict[
             minimum=1,
             maximum=24 * 3600,
         ),
+        "dos_protection_enabled": _coerce_bool(
+            source.get("dos_protection_enabled", source.get("dosProtectionEnabled")),
+            default=DEFAULT_SECURITY_POLICY_SETTINGS["dos_protection_enabled"],
+        ),
         "prompt_rule_block_threshold": _coerce_positive_int(
             source.get("prompt_rule_block_threshold", source.get("promptRuleBlockThreshold")),
             default=DEFAULT_SECURITY_POLICY_SETTINGS["prompt_rule_block_threshold"],
@@ -329,10 +372,29 @@ def _normalize_security_policy_settings(payload: dict[str, Any] | None) -> dict[
             source.get("prompt_injection_enabled", source.get("promptInjectionEnabled")),
             default=DEFAULT_SECURITY_POLICY_SETTINGS["prompt_injection_enabled"],
         ),
+        "xss_enabled": _coerce_bool(
+            source.get("xss_enabled", source.get("xssEnabled")),
+            default=DEFAULT_SECURITY_POLICY_SETTINGS["xss_enabled"],
+        ),
+        "keyword_blocklist_enabled": _coerce_bool(
+            source.get("keyword_blocklist_enabled", source.get("keywordBlocklistEnabled")),
+            default=DEFAULT_SECURITY_POLICY_SETTINGS["keyword_blocklist_enabled"],
+        ),
+        "keyword_blocklist": _coerce_string_list(
+            source.get("keyword_blocklist", source.get("keywordBlocklist")),
+        ),
+        "keyword_block_threshold": _coerce_positive_int(
+            source.get("keyword_block_threshold", source.get("keywordBlockThreshold")),
+            default=DEFAULT_SECURITY_POLICY_SETTINGS["keyword_block_threshold"],
+            minimum=1,
+            maximum=20,
+        ),
         "content_redaction_enabled": _coerce_bool(
             source.get("content_redaction_enabled", source.get("contentRedactionEnabled")),
             default=DEFAULT_SECURITY_POLICY_SETTINGS["content_redaction_enabled"],
         ),
+        # Runtime audit is platform-governed and must stay enabled.
+        "audit_enabled": True,
     }
 
 
@@ -552,7 +614,7 @@ def _normalize_channel_tenant_binding(
     if tenant_id is None:
         tenant_name = None
 
-    return tenant_id, tenant_name
+    return organization_profile_service.resolve_tenant_binding(tenant_id, tenant_name)
 
 
 def _normalize_channel_integration_settings(
@@ -576,7 +638,7 @@ def _normalize_channel_integration_settings(
         channel_settings = {**base}
         channel_settings["enabled"] = _coerce_bool(
             _channel_payload_value(channel_payload, "enabled", "enabled"),
-            default=bool(base.get("enabled", True)),
+            default=bool(base.get("enabled", False)),
         )
         tenant_id, tenant_name = _normalize_channel_tenant_binding(channel_payload, base=base)
         channel_settings["tenant_id"] = tenant_id
@@ -671,7 +733,7 @@ def _to_channel_integration_response_settings(payload: dict[str, Any] | None) ->
     normalized = _normalize_channel_integration_settings(payload)
     return {
         "telegram": {
-            "enabled": bool(normalized["telegram"].get("enabled", True)),
+            "enabled": bool(normalized["telegram"].get("enabled", False)),
             "api_base_url": str(normalized["telegram"]["api_base_url"]),
             "http_timeout_seconds": float(normalized["telegram"]["http_timeout_seconds"]),
             "tenant_id": normalized["telegram"].get("tenant_id"),
@@ -682,7 +744,7 @@ def _to_channel_integration_response_settings(payload: dict[str, Any] | None) ->
             "webhook_secret_masked": _mask_secret_value(normalized["telegram"].get("webhook_secret")),
         },
         "wecom": {
-            "enabled": bool(normalized["wecom"].get("enabled", True)),
+            "enabled": bool(normalized["wecom"].get("enabled", False)),
             "tenant_id": normalized["wecom"].get("tenant_id"),
             "tenant_name": normalized["wecom"].get("tenant_name"),
             "webhook_secret_header": str(normalized["wecom"]["webhook_secret_header"]),
@@ -695,7 +757,7 @@ def _to_channel_integration_response_settings(payload: dict[str, Any] | None) ->
             "webhook_secret_masked": _mask_secret_value(normalized["wecom"].get("webhook_secret")),
         },
         "feishu": {
-            "enabled": bool(normalized["feishu"].get("enabled", True)),
+            "enabled": bool(normalized["feishu"].get("enabled", False)),
             "tenant_id": normalized["feishu"].get("tenant_id"),
             "tenant_name": normalized["feishu"].get("tenant_name"),
             "webhook_secret_header": str(normalized["feishu"]["webhook_secret_header"]),
@@ -708,7 +770,7 @@ def _to_channel_integration_response_settings(payload: dict[str, Any] | None) ->
             "webhook_secret_masked": _mask_secret_value(normalized["feishu"].get("webhook_secret")),
         },
         "dingtalk": {
-            "enabled": bool(normalized["dingtalk"].get("enabled", True)),
+            "enabled": bool(normalized["dingtalk"].get("enabled", False)),
             "tenant_id": normalized["dingtalk"].get("tenant_id"),
             "tenant_name": normalized["dingtalk"].get("tenant_name"),
             "app_id": str(normalized["dingtalk"]["app_id"]),

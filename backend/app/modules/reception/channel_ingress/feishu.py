@@ -5,7 +5,7 @@ from urllib.parse import quote
 
 import httpx
 
-from app.modules.reception.channel_ingress.json_text import JSONTextChannelAdapter
+from app.modules.reception.channel_ingress.json_text import JSONTextChannelAdapter, normalize_attachment
 from app.config import get_settings
 from app.modules.reception.schemas.messages import ChannelType
 from app.platform.config.settings_service import get_channel_integration_runtime_settings
@@ -48,6 +48,30 @@ class FeishuAdapter(JSONTextChannelAdapter):
         "sender_type": ("event.sender.sender_type", "sender.sender_type"),
     }
 
+    def extract_attachments(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
+        message_type = str(
+            payload.get("event", {}).get("message", {}).get("message_type")
+            or payload.get("message", {}).get("message_type")
+            or payload.get("message_type")
+            or payload.get("msg_type")
+            or payload.get("msgtype")
+            or ""
+        ).strip().lower()
+        if message_type not in {"image", "file", "audio", "media", "video"}:
+            return []
+
+        raw_content = (
+            payload.get("event", {}).get("message", {}).get("content")
+            or payload.get("message", {}).get("content")
+            or payload.get("content")
+        )
+        attachment = normalize_attachment(
+            raw_content,
+            fallback_kind="video" if message_type == "media" else message_type,
+            fallback_name=f"Feishu {message_type}",
+        )
+        return [attachment] if attachment is not None else [{"kind": message_type, "name": f"Feishu {message_type}"}]
+
     def send_message(self, *, chat_id: str, text: str) -> dict[str, Any]:
         target_url = self._resolve_outbound_url(chat_id)
         payload = self._request(
@@ -77,7 +101,7 @@ class FeishuAdapter(JSONTextChannelAdapter):
     def _resolve_outbound_url(self, target: str) -> str:
         normalized_target = str(target or "").strip()
         runtime_settings = get_channel_integration_runtime_settings()["feishu"]
-        if not runtime_settings.get("enabled", True):
+        if not runtime_settings.get("enabled", False):
             raise RuntimeError("Feishu channel integration is disabled")
         if normalized_target.startswith(("http://", "https://")):
             return normalized_target

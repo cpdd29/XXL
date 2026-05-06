@@ -56,10 +56,16 @@ class LongTermMemory(MemoryGovernanceMixin):
     user_id: str
     source_mid_term_id: str
     memory_type: str = "session_summary"
+    subject_type: str | None = None
+    subject_id: str | None = None
+    title: str | None = None
+    source: str | None = None
+    importance: float | None = None
     summary: str | None = None
     memory_text: str
     keywords: list[str] = Field(default_factory=list)
     created_at: str
+    updated_at: str | None = None
 
 
 class IngestMemoryMessageRequest(APIModel):
@@ -152,6 +158,35 @@ class MemoryRetrieveResponse(APIModel):
     items: list[MemoryRetrieveItem]
     total: int
     query_expanded_terms: list[str] = Field(default_factory=list)
+    scope_breakdown: dict[str, int] = Field(default_factory=dict)
+
+
+class UpsertLongTermMemoryRequest(APIModel):
+    memory_id: str | None = None
+    tenant_id: str | None = None
+    subject_type: str = "customer"
+    subject_id: str | None = None
+    memory_type: str
+    title: str | None = None
+    content: str
+    summary: str | None = None
+    source: str | None = None
+    importance: float | None = None
+    keywords: list[str] = Field(default_factory=list)
+    write_source: str = "brain_internal"
+    trust_level: str | None = None
+    memory_scope: str = "tenant"
+
+
+class LongTermMemoryActionResponse(APIModel):
+    ok: bool
+    message: str
+    item: LongTermMemory
+
+
+class LongTermMemoryListResponse(APIModel):
+    items: list[LongTermMemory] = Field(default_factory=list)
+    total: int
     scope_breakdown: dict[str, int] = Field(default_factory=dict)
 
 

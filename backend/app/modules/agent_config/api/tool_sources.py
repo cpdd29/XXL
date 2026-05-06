@@ -12,6 +12,7 @@ from app.modules.agent_config.schemas.tool_sources import (
     ToolSourceScanResponse,
     ToolSourceSkillRegistrationRequest,
 )
+from app.modules.organization.application.tenancy_service import DEFAULT_TENANT_ID, ROOT_SCOPE_ROLES, current_user_scope, resolve_scope
 from app.platform.auth.authz import require_authenticated_user, require_permission
 from app.platform.audit.control_plane_audit_service import append_control_plane_audit_log
 
@@ -25,6 +26,20 @@ def _operator_identity(current_user: dict[str, Any]) -> str:
         or str(current_user.get("id") or "").strip()
         or "system"
     )
+
+
+def _capability_tenant_context(
+    current_user: dict[str, Any],
+    *,
+    tenant_id: str | None,
+) -> tuple[str | None, bool]:
+    role = str(current_user.get("role") or "").strip().lower()
+    user_scope = current_user_scope(current_user)
+    requested_tenant_id = str(tenant_id or "").strip() or None
+    if role in ROOT_SCOPE_ROLES and requested_tenant_id is None and user_scope.get("tenant_id") == DEFAULT_TENANT_ID:
+        return None, True
+    resolved_scope = resolve_scope(current_user=current_user, tenant_id=requested_tenant_id)
+    return str(resolved_scope.get("tenant_id") or "").strip() or None, False
 
 
 @router.get(
@@ -62,9 +77,15 @@ def scan_tool_sources_route(
 def register_tool_source_skill_route(
     payload: ToolSourceSkillRegistrationRequest,
     current_user: dict[str, Any] = Depends(require_authenticated_user),
+    tenant_id: str | None = Query(default=None),
 ) -> ToolSourceRegistrationResponse:
+    requested_tenant_id = payload.owner_tenant_id or tenant_id
+    resolved_tenant_id, _ = _capability_tenant_context(current_user, tenant_id=requested_tenant_id)
+    normalized_payload = payload.model_dump(exclude_none=True)
+    if resolved_tenant_id is not None and payload.scope == "tenant":
+        normalized_payload["owner_tenant_id"] = resolved_tenant_id
     response = ToolSourceRegistrationResponse(
-        **tool_source_service.register_external_skill_tool(payload.model_dump(exclude_none=True))
+        **tool_source_service.register_external_skill_tool(normalized_payload)
     )
     append_control_plane_audit_log(
         action="tool_sources.skill_registered",
@@ -84,9 +105,15 @@ def register_tool_source_skill_route(
 def register_tool_source_mcp_route(
     payload: ToolSourceMcpRegistrationRequest,
     current_user: dict[str, Any] = Depends(require_authenticated_user),
+    tenant_id: str | None = Query(default=None),
 ) -> ToolSourceRegistrationResponse:
+    requested_tenant_id = payload.owner_tenant_id or tenant_id
+    resolved_tenant_id, _ = _capability_tenant_context(current_user, tenant_id=requested_tenant_id)
+    normalized_payload = payload.model_dump(exclude_none=True)
+    if resolved_tenant_id is not None and payload.scope == "tenant":
+        normalized_payload["owner_tenant_id"] = resolved_tenant_id
     response = ToolSourceRegistrationResponse(
-        **tool_source_service.register_external_mcp_tool(payload.model_dump(exclude_none=True))
+        **tool_source_service.register_external_mcp_tool(normalized_payload)
     )
     append_control_plane_audit_log(
         action="tool_sources.mcp_registered",
@@ -107,9 +134,15 @@ def update_tool_source_skill_route(
     tool_id: str,
     payload: ToolSourceSkillRegistrationRequest,
     current_user: dict[str, Any] = Depends(require_authenticated_user),
+    tenant_id: str | None = Query(default=None),
 ) -> ToolSourceRegistrationResponse:
+    requested_tenant_id = payload.owner_tenant_id or tenant_id
+    resolved_tenant_id, _ = _capability_tenant_context(current_user, tenant_id=requested_tenant_id)
+    normalized_payload = payload.model_dump(exclude_none=True)
+    if resolved_tenant_id is not None and payload.scope == "tenant":
+        normalized_payload["owner_tenant_id"] = resolved_tenant_id
     response = ToolSourceRegistrationResponse(
-        **tool_source_service.update_external_skill_tool(tool_id, payload.model_dump(exclude_none=True))
+        **tool_source_service.update_external_skill_tool(tool_id, normalized_payload)
     )
     append_control_plane_audit_log(
         action="tool_sources.skill_updated",
@@ -130,9 +163,15 @@ def update_tool_source_mcp_route(
     tool_id: str,
     payload: ToolSourceMcpRegistrationRequest,
     current_user: dict[str, Any] = Depends(require_authenticated_user),
+    tenant_id: str | None = Query(default=None),
 ) -> ToolSourceRegistrationResponse:
+    requested_tenant_id = payload.owner_tenant_id or tenant_id
+    resolved_tenant_id, _ = _capability_tenant_context(current_user, tenant_id=requested_tenant_id)
+    normalized_payload = payload.model_dump(exclude_none=True)
+    if resolved_tenant_id is not None and payload.scope == "tenant":
+        normalized_payload["owner_tenant_id"] = resolved_tenant_id
     response = ToolSourceRegistrationResponse(
-        **tool_source_service.update_external_mcp_tool(tool_id, payload.model_dump(exclude_none=True))
+        **tool_source_service.update_external_mcp_tool(tool_id, normalized_payload)
     )
     append_control_plane_audit_log(
         action="tool_sources.mcp_updated",
@@ -169,5 +208,20 @@ def delete_tool_source_tool_route(
     response_model=ToolSourceDetailResponse,
     dependencies=[Depends(require_permission("tool_sources:read"))],
 )
-def get_tool_source_detail_route(source_id: str, refresh: bool = Query(default=False)) -> ToolSourceDetailResponse:
-    return ToolSourceDetailResponse(**tool_source_service.get_source(source_id, refresh=refresh))
+def get_tool_source_detail_route(
+    source_id: str,
+    refresh: bool = Query(default=False),
+    tenant_id: str | None = Query(default=None),
+    scope: str | None = Query(default=None),
+    current_user: dict[str, Any] = Depends(require_authenticated_user),
+) -> ToolSourceDetailResponse:
+    resolved_tenant_id, include_all_tenants = _capability_tenant_context(current_user, tenant_id=tenant_id)
+    return ToolSourceDetailResponse(
+        **tool_source_service.get_source(
+            source_id,
+            refresh=refresh,
+            tenant_id=resolved_tenant_id,
+            include_all_tenants=include_all_tenants,
+            scope=scope,
+        )
+    )

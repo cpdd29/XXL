@@ -1,13 +1,16 @@
 import {
+  Activity,
   Bot,
   Building2,
+  ClipboardCheck,
+  Database,
   Headphones,
   LayoutDashboard,
   ListTodo,
   Settings,
   Shield,
   Sparkles,
-  Users,
+  TerminalSquare,
   Wrench,
   type LucideIcon,
 } from "lucide-react"
@@ -57,6 +60,12 @@ export const sidebarNavSections: NavSection[] = [
     title: "能力接入",
     items: [
       {
+        title: "知识库",
+        href: "/knowledge",
+        icon: Database,
+        permission: "settings:read",
+      },
+      {
         title: "SKILL/MCP",
         href: "/tools",
         icon: Wrench,
@@ -75,6 +84,12 @@ export const sidebarNavSections: NavSection[] = [
         permission: "settings:read",
       },
       {
+        title: "执行器接入",
+        href: "/settings/executors",
+        icon: TerminalSquare,
+        permission: "settings:read",
+      },
+      {
         title: "Agent 管理",
         href: "/agents",
         icon: Bot,
@@ -83,8 +98,31 @@ export const sidebarNavSections: NavSection[] = [
     ],
   },
   {
+    title: "接入层",
+    items: [
+      {
+        title: "接入运营台",
+        href: "/intake",
+        icon: Activity,
+        permission: "dashboard:read",
+      },
+      {
+        title: "安全监听配置",
+        href: "/settings/intake-security",
+        icon: Shield,
+        permission: "settings:read",
+      },
+    ],
+  },
+  {
     title: "组织设置",
     items: [
+      {
+        title: "客户准入配置",
+        href: "/settings/admission-template",
+        icon: ClipboardCheck,
+        permission: "settings:read",
+      },
       {
         title: "租户管理",
         href: "/settings/tenants",
@@ -92,10 +130,10 @@ export const sidebarNavSections: NavSection[] = [
         permission: "users:read",
       },
       {
-        title: "人员画像",
-        href: "/users",
-        icon: Users,
-        permission: "users:read",
+        title: "知识库管理",
+        href: "/settings/knowledge",
+        icon: Database,
+        permission: "settings:read",
       },
       {
         title: "通用设置",
@@ -113,9 +151,9 @@ export function isSidebarNavItemActive(pathname: string, href: string) {
   if (
     href === "/dashboard" ||
     href === "/tasks" ||
-    href === "/users" ||
     href === "/agents" ||
-    href === "/tools"
+    href === "/tools" ||
+    href === "/knowledge"
   ) {
     return pathname.startsWith(`${href}/`)
   }

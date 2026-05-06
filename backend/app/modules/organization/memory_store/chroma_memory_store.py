@@ -408,10 +408,16 @@ class ChromaLongTermMemoryStore:
             "user_id": memory["user_id"],
             "source_mid_term_id": memory["source_mid_term_id"],
             "memory_type": memory.get("memory_type", "session_summary"),
+            "subject_type": memory.get("subject_type"),
+            "subject_id": memory.get("subject_id"),
+            "title": encryption_service.encrypt_text(str(memory.get("title") or "")),
             "summary": encryption_service.encrypt_text(
                 str(memory.get("summary") or "")
             ),
             "created_at": memory["created_at"],
+            "updated_at": memory.get("updated_at") or memory["created_at"],
+            "source": encryption_service.encrypt_text(str(memory.get("source") or "")),
+            "importance": memory.get("importance"),
             "keywords_json": encryption_service.encrypt_text(
                 json.dumps(memory.get("keywords", []), ensure_ascii=False)
             ),
@@ -462,15 +468,26 @@ class ChromaLongTermMemoryStore:
                 local_only_reasons = []
         except Exception:
             local_only_reasons = []
+        raw_importance = payload.get("importance")
+        try:
+            normalized_importance = float(raw_importance) if raw_importance is not None else None
+        except (TypeError, ValueError):
+            normalized_importance = None
         return {
             "id": memory_id,
             "user_id": payload.get("user_id", ""),
             "source_mid_term_id": payload.get("source_mid_term_id", ""),
             "memory_type": payload.get("memory_type", "session_summary"),
+            "subject_type": payload.get("subject_type"),
+            "subject_id": payload.get("subject_id"),
+            "title": encryption_service.decrypt_text(str(payload.get("title") or "")),
             "summary": decrypted_summary,
             "memory_text": decrypted_memory_text or "",
             "keywords": keywords,
             "created_at": payload.get("created_at", ""),
+            "updated_at": payload.get("updated_at"),
+            "source": encryption_service.decrypt_text(str(payload.get("source") or "")),
+            "importance": normalized_importance,
             "memory_scope": payload.get("memory_scope", "tenant"),
             "memory_layer_kind": payload.get("memory_layer_kind", "conversation"),
             "write_source": payload.get("write_source", "brain_internal"),
@@ -533,6 +550,43 @@ class ChromaLongTermMemoryStore:
             return items
         except Exception as exc:  # pragma: no cover - depends on runtime environment
             logger.warning("Chroma long-term memory read failed, using in-memory fallback: %s", exc)
+            return None
+
+    def list_memories_by_filters(
+        self,
+        *,
+        filters: dict[str, Any] | None = None,
+        limit: int | None = None,
+    ) -> list[dict] | None:
+        collection = self._get_collection()
+        if collection is None:
+            return None
+
+        try:
+            result = collection.get(where=filters or {}, include=["documents", "metadatas"])
+            ids = result.get("ids") or []
+            documents = result.get("documents") or []
+            metadatas = result.get("metadatas") or []
+            items = [
+                self._from_record(
+                    memory_id=memory_id,
+                    document=documents[index] if index < len(documents) else None,
+                    metadata=metadatas[index] if index < len(metadatas) else None,
+                )
+                for index, memory_id in enumerate(ids)
+            ]
+            items.sort(
+                key=lambda item: (
+                    item.get("updated_at") or item.get("created_at", ""),
+                    item["id"],
+                ),
+                reverse=True,
+            )
+            if limit is not None:
+                return items[: max(1, int(limit))]
+            return items
+        except Exception as exc:  # pragma: no cover - depends on runtime environment
+            logger.warning("Chroma long-term memory filtered read failed, using in-memory fallback: %s", exc)
             return None
 
     def query_memories(

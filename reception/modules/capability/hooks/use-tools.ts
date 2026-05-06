@@ -4,6 +4,7 @@ import { useQuery } from '@tanstack/react-query'
 import { apiRequest } from '@/platform/api/client'
 import { queryKeys } from '@/platform/query/query-keys'
 import type {
+  CapabilityScope,
   Tool,
   ToolHealthStatus,
   ToolInvocationSummary,
@@ -181,6 +182,14 @@ function normalizeSourceMode(value: unknown): string | null {
   return raw
 }
 
+function normalizeCapabilityScope(value: unknown): CapabilityScope {
+  const normalized = asString(value)?.trim().toLowerCase().replace(/-/g, '_')
+  if (!normalized) return 'unknown'
+  if (['global', 'public', 'shared', 'platform'].includes(normalized)) return 'global'
+  if (['tenant', 'private', 'dedicated', 'tenant_private'].includes(normalized)) return 'tenant'
+  return 'unknown'
+}
+
 function normalizeMigrationStage(value: unknown): ToolMigrationStage {
   const normalized = asString(value)?.trim().toLowerCase()
   if (!normalized) return 'unknown'
@@ -256,6 +265,15 @@ export function normalizeTool(item: unknown, index: number): Tool | null {
   const configSummaryRaw = firstValue(row, ['configSummary', 'config_summary'])
   const configDetail = asObject(firstValue(row, ['configDetail', 'config_detail'])) ?? asObject(configSummaryRaw)
   const permissions = normalizePermissions(firstValue(row, ['permissions']))
+  const scope = normalizeCapabilityScope(
+    firstValue(row, ['scope', 'capabilityScope', 'capability_scope']) ??
+      firstValue(configDetail ?? {}, ['scope', 'capabilityScope', 'capability_scope']) ??
+      permissions.executionScope,
+  )
+  const ownerTenantId =
+    asString(firstValue(row, ['ownerTenantId', 'owner_tenant_id', 'tenantId', 'tenant_id'])) ??
+    asString(firstValue(configDetail ?? {}, ['ownerTenantId', 'owner_tenant_id', 'tenantId', 'tenant_id'])) ??
+    null
 
   const sourceId =
     asString(firstValue(row, ['sourceId', 'source_id'])) ??
@@ -366,6 +384,8 @@ export function normalizeTool(item: unknown, index: number): Tool | null {
     requiredPermissions,
     permissions,
     requiredCapabilities,
+    scope,
+    ownerTenantId,
     inputSchema: asObject(firstValue(row, ['inputSchema', 'input_schema', 'input', 'inputs', 'parameters'])),
     outputSchema: asObject(firstValue(row, ['outputSchema', 'output_schema', 'output', 'outputs', 'result_schema'])),
     configDetail,

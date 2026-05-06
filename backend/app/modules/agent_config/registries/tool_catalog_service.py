@@ -6,6 +6,13 @@ from typing import Any
 
 from fastapi import HTTPException, status
 
+from app.modules.agent_config.registries.capability_scope import (
+    CAPABILITY_SCOPE_SHARED,
+    capability_visible,
+    extract_scope_fields,
+    matches_scope_filter,
+    scope_priority,
+)
 from app.modules.agent_config.registries.mcp_runtime_service import MCPRuntimeService, mcp_runtime_service
 from app.modules.agent_config.registries.tool_source_service import tool_source_service, ToolSourceService
 
@@ -43,17 +50,45 @@ class ToolCatalogService:
         self._source_service = source_service or tool_source_service
         self._runtime_service = runtime_service or mcp_runtime_service
 
-    def list_tools(self, *, refresh: bool = False) -> dict[str, Any]:
-        raw_tools = self._source_service.list_tools(refresh=refresh)
-        aggregated = self._aggregate_tools(raw_tools)
+    def list_tools(
+        self,
+        *,
+        refresh: bool = False,
+        tenant_id: str | None = None,
+        include_all_tenants: bool = False,
+        scope: str | None = None,
+    ) -> dict[str, Any]:
+        raw_tools = self._source_service.list_tools(
+            refresh=refresh,
+            tenant_id=tenant_id,
+            include_all_tenants=include_all_tenants,
+            scope=scope,
+        )
+        aggregated = self._aggregate_tools(
+            raw_tools,
+            tenant_id=tenant_id,
+            include_all_tenants=include_all_tenants,
+        )
         self._enrich_with_runtime_state(aggregated)
         return {
             "items": aggregated,
             "total": len(aggregated),
         }
 
-    def get_catalog(self, *, refresh: bool = False) -> dict[str, Any]:
-        tools_payload = self.list_tools(refresh=refresh)
+    def get_catalog(
+        self,
+        *,
+        refresh: bool = False,
+        tenant_id: str | None = None,
+        include_all_tenants: bool = False,
+        scope: str | None = None,
+    ) -> dict[str, Any]:
+        tools_payload = self.list_tools(
+            refresh=refresh,
+            tenant_id=tenant_id,
+            include_all_tenants=include_all_tenants,
+            scope=scope,
+        )
         source_items = self._source_service.list_sources(refresh=refresh)["items"]
         source_summary: dict[str, int] = {}
         type_summary: dict[str, int] = {}
@@ -74,30 +109,53 @@ class ToolCatalogService:
     def get_health(self, *, refresh: bool = False) -> dict[str, Any]:
         return self._runtime_service.list_health(refresh=refresh)
 
-    def get_tool(self, tool_id: str, *, refresh: bool = False) -> dict[str, Any]:
+    def get_tool(
+        self,
+        tool_id: str,
+        *,
+        refresh: bool = False,
+        tenant_id: str | None = None,
+        include_all_tenants: bool = False,
+        scope: str | None = None,
+    ) -> dict[str, Any]:
         normalized_tool_id = str(tool_id or "").strip()
-        for item in self.list_tools(refresh=refresh)["items"]:
+        for item in self.list_tools(
+            refresh=refresh,
+            tenant_id=tenant_id,
+            include_all_tenants=include_all_tenants,
+            scope=scope,
+        )["items"]:
             if item["id"] == normalized_tool_id:
                 return item
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tool not found")
 
-    def _aggregate_tools(self, raw_tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        grouped: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+    def _aggregate_tools(
+        self,
+        raw_tools: list[dict[str, Any]],
+        *,
+        tenant_id: str | None,
+        include_all_tenants: bool,
+    ) -> list[dict[str, Any]]:
+        grouped: dict[tuple[str, str, str, str, str, str], dict[str, Any]] = {}
 
         for entry in raw_tools:
             source = str(entry.get("source") or "").strip()
             tool_type = str(entry.get("type") or "tool").strip() or "tool"
             name = str(entry.get("name") or "").strip()
             provider = str(entry.get("provider") or "unknown").strip() or "unknown"
+            scope_value, owner_tenant_id = extract_scope_fields(entry)
             if not source or not name:
                 continue
-            group_key = (source, tool_type, name, provider)
+            group_key = (source, tool_type, name, provider, scope_value, owner_tenant_id or "")
             if group_key not in grouped:
+                raw_tool_id = str(entry.get("id") or "").strip()
                 grouped[group_key] = {
-                    "id": f"tool-{_slugify(':'.join(group_key))}",
+                    "id": raw_tool_id or f"tool-{_slugify(':'.join(group_key))}",
                     "name": name,
                     "type": tool_type,
                     "source": source,
+                    "scope": scope_value,
+                    "owner_tenant_id": owner_tenant_id,
                     "source_kind": str(entry.get("source_kind") or "unknown"),
                     "bridge_mode": str(entry.get("bridge_mode") or "catalog"),
                     "enabled": bool(entry.get("enabled", True)),
@@ -196,6 +254,8 @@ class ToolCatalogService:
             )
             item.setdefault("input_schema", {"type": "object", "properties": {}})
             item.setdefault("output_schema", {"type": "object", "properties": {}})
+            item.setdefault("scope", CAPABILITY_SCOPE_SHARED)
+            item.setdefault("owner_tenant_id", None)
             item.setdefault("source_kind", "unknown")
             item.setdefault("bridge_mode", "catalog")
             item.setdefault(
@@ -238,7 +298,20 @@ class ToolCatalogService:
             )
             items.append(item)
 
-        items.sort(key=lambda entry: (entry["source"], entry["type"], entry["name"], entry["id"]))
+        items = [
+            item
+            for item in items
+            if capability_visible(item, tenant_id=tenant_id, include_all_tenants=include_all_tenants)
+        ]
+        items.sort(
+            key=lambda entry: (
+                entry["source"],
+                scope_priority(entry, tenant_id=tenant_id),
+                entry["type"],
+                entry["name"],
+                entry["id"],
+            )
+        )
         return items
 
     def _coalesce_health_entries(self, *, health_entries: list[dict[str, Any]], fallback_status: str) -> dict[str, Any]:

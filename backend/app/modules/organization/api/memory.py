@@ -6,6 +6,8 @@ from app.modules.organization.schemas.memory import (
     DistillMemoryResponse,
     IngestMemoryMessageRequest,
     IngestMemoryMessageResponse,
+    LongTermMemoryActionResponse,
+    LongTermMemoryListResponse,
     MemoryAuditResponse,
     MemoryLifecycleResponse,
     MemoryLayersResponse,
@@ -13,6 +15,7 @@ from app.modules.organization.schemas.memory import (
     MemoryRetrieveResponse,
     ReviewMemoryRequest,
     ReviewMemoryResponse,
+    UpsertLongTermMemoryRequest,
 )
 from app.modules.organization.application.memory_service import memory_service
 from app.modules.organization.application.tenancy_service import resolve_scope
@@ -49,6 +52,73 @@ def ingest_memory_message_route(
             write_source=payload.write_source,
             trust_level=payload.trust_level,
             memory_scope=payload.memory_scope,
+        )
+    )
+
+
+@router.post(
+    "/long-term",
+    response_model=LongTermMemoryActionResponse,
+    dependencies=[Depends(require_permission("memory:write"))],
+)
+def write_long_term_memory_route(
+    payload: UpsertLongTermMemoryRequest,
+    current_user: dict = Depends(require_authenticated_user),
+) -> LongTermMemoryActionResponse:
+    scope = resolve_scope(
+        current_user=current_user,
+        tenant_id=payload.tenant_id,
+    )
+    return LongTermMemoryActionResponse(
+        **memory_service.write_long_term_memory(
+            memory_id=payload.memory_id,
+            memory_type=payload.memory_type,
+            content=payload.content,
+            scope=scope,
+            subject_type=payload.subject_type,
+            subject_id=payload.subject_id,
+            title=payload.title,
+            summary=payload.summary,
+            source=payload.source,
+            importance=payload.importance,
+            keywords=payload.keywords,
+            write_source=payload.write_source,
+            trust_level=payload.trust_level,
+            memory_scope=payload.memory_scope,
+        )
+    )
+
+
+@router.get(
+    "/long-term",
+    response_model=LongTermMemoryListResponse,
+    dependencies=[Depends(require_permission("memory:read"))],
+)
+def list_long_term_memories_route(
+    tenant_id: str | None = Query(default=None, alias="tenantId"),
+    subject_id: str | None = Query(default=None, alias="subjectId"),
+    subject_type: str = Query(default="customer", alias="subjectType"),
+    memory_type: str | None = Query(default=None, alias="memoryType"),
+    query: str | None = Query(default=None),
+    limit: int = Query(default=20, ge=1, le=100),
+    include_inactive: bool = Query(default=False, alias="includeInactive"),
+    memory_scope: str | None = Query(default=None, alias="memoryScope"),
+    current_user: dict = Depends(require_authenticated_user),
+) -> LongTermMemoryListResponse:
+    scope = resolve_scope(
+        current_user=current_user,
+        tenant_id=tenant_id,
+    )
+    return LongTermMemoryListResponse(
+        **memory_service.list_long_term_memories(
+            scope=scope,
+            subject_id=subject_id,
+            subject_type=subject_type,
+            memory_type=memory_type,
+            query=query,
+            limit=limit,
+            include_inactive=include_inactive,
+            memory_scope=memory_scope,
         )
     )
 

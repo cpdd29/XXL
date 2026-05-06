@@ -1,17 +1,29 @@
 "use client"
 
+import Link from "next/link"
 import { startTransition, useDeferredValue, useEffect, useMemo, useState } from "react"
 import { BrainSkillManagementActions } from "@/modules/capability/components/brain-skill-management-actions"
 import { BrainSkillRegistrationActions } from "@/modules/capability/components/brain-skill-registration-actions"
 import { ToolDetailSheet } from "@/modules/capability/components/tool-catalog-detail-sheet"
 import { ToolRegistrationActions } from "@/modules/capability/components/tool-registration-actions"
 import { ToolManagementActions, isControlPlaneManagedTool } from "@/modules/capability/components/tool-management-actions"
-import { useBrainSkills } from "@/modules/capability/hooks/use-brain-skills"
+import { useBrainSkills, useUpdateBrainSkillScope } from "@/modules/capability/hooks/use-brain-skills"
+import { toast } from "@/shared/hooks/use-toast"
 import { Badge } from "@/shared/ui/badge"
 import { Button } from "@/shared/ui/button"
 import { Card, CardContent } from "@/shared/ui/card"
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/shared/ui/dialog"
 import { Input } from "@/shared/ui/input"
+import { Label } from "@/shared/ui/label"
 import { Skeleton } from "@/shared/ui/skeleton"
+import { Switch } from "@/shared/ui/switch"
 import {
   Select,
   SelectContent,
@@ -28,10 +40,10 @@ import {
   TableHeader,
   TableRow,
 } from "@/shared/ui/table"
-import { useToolSources } from "@/modules/capability/hooks/use-tool-sources"
+import { useToolSources, useUpdateToolMcp } from "@/modules/capability/hooks/use-tool-sources"
 import { useToolDetail, useTools } from "@/modules/capability/hooks/use-tools"
 import { cn } from "@/shared/utils"
-import type { BrainSkillItem, Tool, ToolHealthStatus, ToolSourceType, ToolType } from "@/shared/types"
+import type { BrainSkillItem, CapabilityScope, Tool, ToolHealthStatus, ToolSourceType, ToolType } from "@/shared/types"
 import { RefreshCw, Search } from "lucide-react"
 
 const LOCAL_MCP_SOURCE_ID = "local-mcp-services"
@@ -92,8 +104,38 @@ const migrationStageClass: Record<string, string> = {
   unknown: "bg-muted text-muted-foreground",
 }
 
+const scopeFilterOptions = ["all", "global", "tenant"] as const
+type ScopeFilterOption = (typeof scopeFilterOptions)[number]
+
+const capabilityScopeLabel: Record<CapabilityScope, string> = {
+  global: "通用",
+  tenant: "专用",
+  unknown: "未标记",
+}
+
+const capabilityScopeClass: Record<CapabilityScope, string> = {
+  global: "bg-primary/15 text-primary",
+  tenant: "bg-warning/20 text-warning-foreground",
+  unknown: "bg-muted text-muted-foreground",
+}
+
+const capabilityScopeSortOrder: Record<CapabilityScope, number> = {
+  tenant: 1,
+  global: 2,
+  unknown: 3,
+}
+
 function boolLabel(value: boolean) {
   return value ? "是" : "否"
+}
+
+function getConfigString(config: Record<string, unknown> | null, keys: string[], fallback = "") {
+  if (!config) return fallback
+  for (const key of keys) {
+    const value = config[key]
+    if (typeof value === "string" && value.trim()) return value.trim()
+  }
+  return fallback
 }
 
 function toDisplayDate(value: string | null) {
@@ -134,6 +176,38 @@ function isBrainMcpTool(tool: Tool) {
     tool.sourceId === LOCAL_MCP_SOURCE_ID ||
     tool.sourceId === CONTROL_PLANE_MCP_SOURCE_ID ||
     isControlPlaneManagedTool(tool)
+  )
+}
+
+function normalizeCapabilityScope(value: unknown): CapabilityScope {
+  if (typeof value !== "string") return "unknown"
+  const normalized = value.trim().toLowerCase().replace(/-/g, "_")
+  if (["global", "public", "shared", "platform"].includes(normalized)) return "global"
+  if (["tenant", "private", "dedicated", "tenant_private"].includes(normalized)) return "tenant"
+  return "unknown"
+}
+
+function normalizeOwnerTenantId(value: unknown) {
+  if (typeof value !== "string") return null
+  const trimmed = value.trim()
+  return trimmed || null
+}
+
+function toEditableScopePayload(scope: CapabilityScope): "shared" | "tenant" | null {
+  if (scope === "global") return "shared"
+  if (scope === "tenant") return "tenant"
+  return null
+}
+
+function resolveBrainSkillScope(skill: BrainSkillItem): CapabilityScope {
+  const row = skill as unknown as Record<string, unknown>
+  return normalizeCapabilityScope(row.scope ?? row.capabilityScope ?? row.capability_scope)
+}
+
+function resolveBrainSkillOwnerTenantId(skill: BrainSkillItem) {
+  const row = skill as unknown as Record<string, unknown>
+  return normalizeOwnerTenantId(
+    row.ownerTenantId ?? row.owner_tenant_id ?? row.tenantId ?? row.tenant_id,
   )
 }
 
@@ -201,6 +275,123 @@ function ToolSourceAgents({ names }: { names: string[] }) {
         </Badge>
       ) : null}
     </div>
+  )
+}
+
+function CapabilityScopeBadge({ scope }: { scope: CapabilityScope }) {
+  return (
+    <Badge variant="secondary" className={cn("text-xs", capabilityScopeClass[scope])}>
+      {capabilityScopeLabel[scope]}
+    </Badge>
+  )
+}
+
+function CapabilityScopeEditor({
+  title,
+  description,
+  scope,
+  ownerTenantId,
+  disabled = false,
+  isSaving = false,
+  onSave,
+}: {
+  title: string
+  description?: string
+  scope: CapabilityScope
+  ownerTenantId: string | null
+  disabled?: boolean
+  isSaving?: boolean
+  onSave: (payload: { scope: CapabilityScope; ownerTenantId: string | null }) => Promise<string | void>
+}) {
+  const [open, setOpen] = useState(false)
+  const [draftScope, setDraftScope] = useState<CapabilityScope>(scope)
+  const [draftTenantId, setDraftTenantId] = useState(ownerTenantId ?? "")
+
+  const normalizedTenantId = draftTenantId.trim() || null
+
+  return (
+    <>
+      <Button
+        variant="outline"
+        size="sm"
+        className="h-7 px-2 text-xs"
+        disabled={disabled}
+        onClick={() => {
+          setDraftScope(scope)
+          setDraftTenantId(ownerTenantId ?? "")
+          setOpen(true)
+        }}
+      >
+        作用域
+      </Button>
+      <Dialog open={open} onOpenChange={setOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>{title}</DialogTitle>
+            <DialogDescription>
+              {description || "修改并保存能力作用域与所属租户。"}
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-4">
+            <div className="space-y-2">
+              <Label>作用域</Label>
+              <Select value={draftScope} onValueChange={(value) => setDraftScope(value as CapabilityScope)}>
+                <SelectTrigger>
+                  <SelectValue placeholder="选择作用域" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="global">通用</SelectItem>
+                  <SelectItem value="tenant">专用</SelectItem>
+                  <SelectItem value="unknown">未标记</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="space-y-2">
+              <Label>所属租户 ID（专用可选）</Label>
+              <Input
+                placeholder="例如 tenant_acme"
+                value={draftTenantId}
+                onChange={(event) => setDraftTenantId(event.target.value)}
+              />
+            </div>
+          </div>
+          <DialogFooter>
+            <Button
+              variant="outline"
+              onClick={() => setOpen(false)}
+              disabled={isSaving}
+            >
+              取消
+            </Button>
+            <Button
+              disabled={disabled || isSaving}
+              onClick={async () => {
+                try {
+                  const message = await onSave({
+                    scope: draftScope,
+                    ownerTenantId: draftScope === "tenant" ? normalizedTenantId : null,
+                  })
+                  toast({
+                    title: "作用域已更新",
+                    description: message || "已保存最新作用域配置。",
+                  })
+                  setOpen(false)
+                } catch (error) {
+                  const message = error instanceof Error ? error.message : "保存失败"
+                  toast({
+                    title: "作用域更新失败",
+                    description: message,
+                    variant: "destructive",
+                  })
+                }
+              }}
+            >
+              {isSaving ? "保存中..." : "保存"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </>
   )
 }
 
@@ -340,12 +531,15 @@ function getBrainSkillSearchValues(skill: BrainSkillItem) {
 export default function ToolsPage() {
   const [activeTab, setActiveTab] = useState("brain-mcp")
   const [searchQuery, setSearchQuery] = useState("")
+  const [scopeFilter, setScopeFilter] = useState<ScopeFilterOption>("all")
   const [mcpPage, setMcpPage] = useState(1)
   const [mcpPageSize, setMcpPageSize] = useState<(typeof pageSizeOptions)[number]>("10")
   const [skillPage, setSkillPage] = useState(1)
   const [skillPageSize, setSkillPageSize] = useState<(typeof pageSizeOptions)[number]>("10")
   const [selectedToolId, setSelectedToolId] = useState<string | null>(null)
   const [toolDetailOpen, setToolDetailOpen] = useState(false)
+  const [updatingEnabledToolId, setUpdatingEnabledToolId] = useState<string | null>(null)
+  const [updatingScopeKey, setUpdatingScopeKey] = useState<string | null>(null)
   const deferredSearch = useDeferredValue(searchQuery.trim().toLowerCase())
 
   const {
@@ -373,6 +567,8 @@ export default function ToolsPage() {
     error: brainSkillsError,
     refetch: refetchBrainSkills,
   } = useBrainSkills()
+  const updateBrainSkillScope = useUpdateBrainSkillScope()
+  const updateMcp = useUpdateToolMcp()
 
   const tools = toolsData?.items ?? []
   const sources = sourceData?.items ?? []
@@ -387,6 +583,7 @@ export default function ToolsPage() {
 
   const filteredBrainMcpTools = useMemo(() => {
     const matched = brainMcpTools.filter((tool) => {
+      const matchesScope = scopeFilter === "all" ? true : tool.scope === scopeFilter
       const matchesSearch =
         !deferredSearch ||
         tool.name.toLowerCase().includes(deferredSearch) ||
@@ -398,24 +595,35 @@ export default function ToolsPage() {
         tool.linkedAgents.some((agent) => agent.toLowerCase().includes(deferredSearch)) ||
         tool.requiredCapabilities.some((capability) => capability.toLowerCase().includes(deferredSearch))
 
-      return matchesSearch
+      return matchesScope && matchesSearch
     })
 
-    return sortToolsByPriority(matched)
-  }, [brainMcpTools, deferredSearch])
+    return sortToolsByPriority(matched).sort((left, right) => {
+      const scopeDiff = capabilityScopeSortOrder[left.scope] - capabilityScopeSortOrder[right.scope]
+      if (scopeDiff !== 0) return scopeDiff
+      return left.name.localeCompare(right.name, "zh-CN")
+    })
+  }, [brainMcpTools, deferredSearch, scopeFilter])
 
   const filteredBrainSkills = useMemo(() => {
     return brainSkills
       .filter((skill) => {
+        const skillScope = resolveBrainSkillScope(skill)
+        const matchesScope = scopeFilter === "all" ? true : skillScope === scopeFilter
+        if (!matchesScope) return false
         if (!deferredSearch) return true
         return getBrainSkillSearchValues(skill).some((value) => value.includes(deferredSearch))
       })
       .sort((left, right) => {
+        const scopeDiff =
+          capabilityScopeSortOrder[resolveBrainSkillScope(left)] -
+          capabilityScopeSortOrder[resolveBrainSkillScope(right)]
+        if (scopeDiff !== 0) return scopeDiff
         const uploadedDiff = toTimestamp(getBrainSkillUploadedAt(right)) - toTimestamp(getBrainSkillUploadedAt(left))
         if (uploadedDiff !== 0) return uploadedDiff
         return left.name.localeCompare(right.name, "zh-CN")
       })
-  }, [brainSkills, deferredSearch])
+  }, [brainSkills, deferredSearch, scopeFilter])
 
   const mcpLimit = Number(mcpPageSize)
   const skillLimit = Number(skillPageSize)
@@ -459,6 +667,113 @@ export default function ToolsPage() {
     }
   }
 
+  const handleToggleEnabled = async (tool: Tool, checked: boolean) => {
+    if (!isControlPlaneManagedTool(tool)) return
+    const baseUrl = getConfigString(tool.configDetail, ["base_url", "baseUrl"])
+    if (!tool.name.trim() || !baseUrl) {
+      toast({
+        title: "更新失败",
+        description: "当前 MCP 缺少必要接入信息（名称或服务地址）。",
+        variant: "destructive",
+      })
+      return
+    }
+
+    setUpdatingEnabledToolId(tool.id)
+    try {
+      const response = await updateMcp.mutateAsync({
+        toolId: tool.id,
+        payload: {
+          name: tool.name.trim(),
+          baseUrl,
+          enabled: checked,
+        },
+      })
+      toast({
+        title: checked ? "已启用 MCP" : "已停用 MCP",
+        description: response.message,
+      })
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "状态更新失败"
+      toast({
+        title: "状态更新失败",
+        description: message,
+        variant: "destructive",
+      })
+    } finally {
+      setUpdatingEnabledToolId(null)
+    }
+  }
+
+  const handleUpdateMcpScope = async ({
+    tool,
+    scope,
+    ownerTenantId,
+  }: {
+    tool: Tool
+    scope: CapabilityScope
+    ownerTenantId: string | null
+  }) => {
+    if (!isControlPlaneManagedTool(tool)) {
+      throw new Error("当前 MCP 来源不支持在此页面直接更新作用域。")
+    }
+    const payloadScope = toEditableScopePayload(scope)
+    if (!payloadScope) {
+      throw new Error("请先选择“通用”或“专用”作用域后再保存。")
+    }
+    const baseUrl = getConfigString(tool.configDetail, ["base_url", "baseUrl"])
+    if (!tool.name.trim() || !baseUrl) {
+      throw new Error("当前 MCP 缺少必要接入信息（名称或服务地址）。")
+    }
+
+    const key = `mcp:${tool.id}`
+    setUpdatingScopeKey(key)
+    try {
+      const response = await updateMcp.mutateAsync({
+        toolId: tool.id,
+        payload: {
+          name: tool.name.trim(),
+          baseUrl,
+          scope: payloadScope,
+          ownerTenantId: payloadScope === "tenant" ? ownerTenantId : null,
+        },
+      })
+      return response.message
+    } finally {
+      setUpdatingScopeKey((current) => (current === key ? null : current))
+    }
+  }
+
+  const handleUpdateSkillScope = async ({
+    skillId,
+    scope,
+    ownerTenantId,
+  }: {
+    skillId: string
+    scope: CapabilityScope
+    ownerTenantId: string | null
+  }) => {
+    const payloadScope = toEditableScopePayload(scope)
+    if (!payloadScope) {
+      throw new Error("请先选择“通用”或“专用”作用域后再保存。")
+    }
+
+    const key = `skill:${skillId}`
+    setUpdatingScopeKey(key)
+    try {
+      const response = await updateBrainSkillScope.mutateAsync({
+        skillId,
+        payload: {
+          scope: payloadScope,
+          ownerTenantId: payloadScope === "tenant" ? ownerTenantId : null,
+        },
+      })
+      return response.message
+    } finally {
+      setUpdatingScopeKey((current) => (current === key ? null : current))
+    }
+  }
+
   return (
     <>
       <div className="flex h-full min-h-0 w-full flex-col p-6">
@@ -493,6 +808,16 @@ export default function ToolsPage() {
                       className="w-full bg-secondary pl-10"
                     />
                   </div>
+                  <Select value={scopeFilter} onValueChange={(value) => setScopeFilter(value as ScopeFilterOption)}>
+                    <SelectTrigger className="w-full bg-secondary sm:w-[150px]">
+                      <SelectValue placeholder="作用域筛选" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="all">全部作用域</SelectItem>
+                      <SelectItem value="global">仅通用</SelectItem>
+                      <SelectItem value="tenant">仅专用</SelectItem>
+                    </SelectContent>
+                  </Select>
                   {activeTab === "brain-skills" ? (
                     <BrainSkillRegistrationActions />
                   ) : (
@@ -510,12 +835,18 @@ export default function ToolsPage() {
                   </Button>
                 </div>
               </div>
+              <div className="flex flex-wrap gap-2">
+                <Button asChild variant="outline" size="sm">
+                  <Link href="/settings/admission-template">客户准入模板</Link>
+                </Button>
+              </div>
 
               <TabsContent value="brain-mcp" className="mt-4 flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
                 <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-lg border border-border">
                   <div className="min-h-0 flex-1 overflow-auto">
-                    <Table className="min-w-[1760px] table-fixed">
+                    <Table className="min-w-[1840px] table-fixed">
                       <colgroup>
+                        <col className="w-[96px]" />
                         <col className="w-[390px]" />
                         <col className="w-[96px]" />
                         <col className="w-[160px]" />
@@ -525,11 +856,13 @@ export default function ToolsPage() {
                         <col className="w-[180px]" />
                         <col className="w-[220px]" />
                         <col className="w-[120px]" />
+                        <col className="w-[180px]" />
                         <col className="w-[120px]" />
                         <col className="w-[160px]" />
                       </colgroup>
                       <TableHeader className="sticky top-0 z-10 bg-card/95 backdrop-blur supports-[backdrop-filter]:bg-card/80">
                         <TableRow className="border-border">
+                          <TableHead className={tableHeadClassName}>是否启用</TableHead>
                           <TableHead className={tableHeadClassName}>能力</TableHead>
                           <TableHead className={tableHeadClassName}>类型</TableHead>
                           <TableHead className={tableHeadClassName}>来源</TableHead>
@@ -539,6 +872,7 @@ export default function ToolsPage() {
                           <TableHead className={tableHeadClassName}>关联角色</TableHead>
                           <TableHead className={tableHeadClassName}>接入说明</TableHead>
                           <TableHead className={tableHeadClassName}>调用要求</TableHead>
+                          <TableHead className={tableHeadClassName}>作用域</TableHead>
                           <TableHead className={tableHeadClassName}>状态</TableHead>
                           <TableHead className={tableHeadClassName}>最近调用 / 扫描</TableHead>
                         </TableRow>
@@ -547,20 +881,36 @@ export default function ToolsPage() {
                         {toolsLoading ? (
                           Array.from({ length: 6 }).map((_, index) => (
                             <TableRow key={`tool-skeleton-${index}`}>
-                              <TableCell colSpan={11}>
+                              <TableCell colSpan={13}>
                               <Skeleton className="h-7 w-full" />
                             </TableCell>
                           </TableRow>
                         ))
                         ) : paginatedBrainMcpTools.length === 0 ? (
                           <EmptyRow
-                            colSpan={11}
+                            colSpan={13}
                             title="没有匹配的主脑 MCP"
                             description="请修改搜索条件，或先在右上角新增 MCP。"
                           />
                         ) : (
                           paginatedBrainMcpTools.map((tool) => (
                             <TableRow key={tool.id} className="border-border">
+                              <TableCell className={compactCellClassName}>
+                                <div className="flex items-center gap-2">
+                                  <Switch
+                                    checked={tool.enabled}
+                                    disabled={
+                                      !isControlPlaneManagedTool(tool) ||
+                                      updateMcp.isPending ||
+                                      updatingEnabledToolId === tool.id
+                                    }
+                                    onCheckedChange={(checked) => {
+                                      void handleToggleEnabled(tool, checked)
+                                    }}
+                                  />
+                                  <span className="text-xs text-muted-foreground">{tool.enabled ? "启用" : "停用"}</span>
+                                </div>
+                              </TableCell>
                               <TableCell className={wrapCellClassName}>
                                 <div className="min-w-0 space-y-2">
                                   <div className="flex items-start justify-between gap-2">
@@ -647,6 +997,29 @@ export default function ToolsPage() {
                                 <div className="mt-1">权限控制: {boolLabel(tool.permissions.requiresPermission)}</div>
                                 <div>人工审批: {boolLabel(tool.permissions.approvalRequired)}</div>
                               </TableCell>
+                              <TableCell className={wrapCellClassName}>
+                                <div className="space-y-2">
+                                  <CapabilityScopeBadge scope={tool.scope} />
+                                  <div className="text-[11px] text-muted-foreground">
+                                    {tool.ownerTenantId ? `租户: ${tool.ownerTenantId}` : "租户: -"}
+                                  </div>
+                                  <CapabilityScopeEditor
+                                    title={`编辑 MCP 作用域：${tool.name}`}
+                                    description={
+                                      isControlPlaneManagedTool(tool)
+                                        ? "修改后将通过 MCP 管理接口持久化 scope / ownerTenantId。"
+                                        : "当前来源为只读能力，不支持在此页面修改作用域。"
+                                    }
+                                    scope={tool.scope}
+                                    ownerTenantId={tool.ownerTenantId}
+                                    disabled={!isControlPlaneManagedTool(tool)}
+                                    isSaving={updatingScopeKey === `mcp:${tool.id}`}
+                                    onSave={({ scope, ownerTenantId }) =>
+                                      handleUpdateMcpScope({ tool, scope, ownerTenantId })
+                                    }
+                                  />
+                                </div>
+                              </TableCell>
                               <TableCell className={compactCellClassName}>
                                 <Badge
                                   variant="secondary"
@@ -693,6 +1066,7 @@ export default function ToolsPage() {
                         <col className="w-[220px]" />
                         <col className="w-[120px]" />
                         <col className="w-[240px]" />
+                        <col className="w-[220px]" />
                         <col className="w-[320px]" />
                         <col className="w-[160px]" />
                         <col className="w-[120px]" />
@@ -703,6 +1077,7 @@ export default function ToolsPage() {
                           <TableHead className={tableHeadClassName}>文件名</TableHead>
                           <TableHead className={tableHeadClassName}>格式</TableHead>
                           <TableHead className={tableHeadClassName}>能力 / 标签</TableHead>
+                          <TableHead className={tableHeadClassName}>作用域</TableHead>
                           <TableHead className={tableHeadClassName}>说明</TableHead>
                           <TableHead className={tableHeadClassName}>上传时间</TableHead>
                           <TableHead className={tableHeadClassName}>操作</TableHead>
@@ -712,14 +1087,14 @@ export default function ToolsPage() {
                         {brainSkillsLoading ? (
                           Array.from({ length: 6 }).map((_, index) => (
                             <TableRow key={`brain-skill-skeleton-${index}`}>
-                              <TableCell colSpan={7}>
+                              <TableCell colSpan={8}>
                               <Skeleton className="h-7 w-full" />
                             </TableCell>
                           </TableRow>
                         ))
                         ) : paginatedBrainSkills.length === 0 ? (
                           <EmptyRow
-                            colSpan={7}
+                            colSpan={8}
                             title="还没有本地 Skill"
                             description="点击右上角上传 Skill 文件。"
                           />
@@ -756,6 +1131,26 @@ export default function ToolsPage() {
                                   ) : (
                                     <span className="text-xs text-muted-foreground">未解析</span>
                                   )}
+                                </div>
+                              </TableCell>
+                              <TableCell className={wrapCellClassName}>
+                                <div className="space-y-2">
+                                  <CapabilityScopeBadge scope={resolveBrainSkillScope(skill)} />
+                                  <div className="text-[11px] text-muted-foreground">
+                                    {resolveBrainSkillOwnerTenantId(skill)
+                                      ? `租户: ${resolveBrainSkillOwnerTenantId(skill)}`
+                                      : "租户: -"}
+                                  </div>
+                                  <CapabilityScopeEditor
+                                    title={`编辑 Skill 作用域：${skill.name}`}
+                                    description="修改后将通过 Skill 管理接口持久化 scope / ownerTenantId。"
+                                    scope={resolveBrainSkillScope(skill)}
+                                    ownerTenantId={resolveBrainSkillOwnerTenantId(skill)}
+                                    isSaving={updatingScopeKey === `skill:${skill.id}`}
+                                    onSave={({ scope, ownerTenantId }) =>
+                                      handleUpdateSkillScope({ skillId: skill.id, scope, ownerTenantId })
+                                    }
+                                  />
                                 </div>
                               </TableCell>
                               <TableCell className={wrapCellClassName}>
@@ -814,7 +1209,7 @@ export default function ToolsPage() {
             {brainMcpTools.length > 0 && activeTab === "brain-mcp" ? (
               <div className="text-[11px] text-muted-foreground">
                 当前共接入 {brainMcpTools.length} 个主脑 MCP，已声明能力点总计 {totalScannedCapabilities}。
-                点击“详情”可查看输入输出、权限要求、接入说明和最近调用摘要。
+                已支持按作用域筛选排序，点击“作用域”可直接保存更新。
               </div>
             ) : null}
           </CardContent>

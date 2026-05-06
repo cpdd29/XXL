@@ -4,6 +4,7 @@ from copy import deepcopy
 from datetime import UTC, datetime
 import hashlib
 import json
+import logging
 from typing import Any
 from uuid import uuid4
 
@@ -15,12 +16,14 @@ from app.platform.persistence.runtime_store import store
 
 
 CONTROL_PLANE_APPROVALS_KEY = "control_plane_approvals"
+logger = logging.getLogger(__name__)
 
 
 def _read_setting_payload() -> tuple[list[dict[str, Any]], bool]:
     payload, authoritative = persistence_service.read_system_setting(CONTROL_PLANE_APPROVALS_KEY)
     if authoritative:
-        data = payload.get("items") if isinstance(payload, dict) else []
+        persisted_payload = payload.get("payload") if isinstance(payload, dict) else {}
+        data = persisted_payload.get("items") if isinstance(persisted_payload, dict) else []
         return (deepcopy(data) if isinstance(data, list) else []), True
     items = store.system_settings.get(CONTROL_PLANE_APPROVALS_KEY, {}).get("items", [])
     return deepcopy(items) if isinstance(items, list) else [], False
@@ -28,12 +31,14 @@ def _read_setting_payload() -> tuple[list[dict[str, Any]], bool]:
 
 def _persist_items(items: list[dict[str, Any]]) -> None:
     payload = {"items": deepcopy(items)}
-    if not persistence_service.persist_system_setting(
+    persisted = persistence_service.persist_system_setting(
         key=CONTROL_PLANE_APPROVALS_KEY,
         payload=payload,
         updated_at=datetime.now(UTC).isoformat(),
-    ):
-        store.system_settings[CONTROL_PLANE_APPROVALS_KEY] = payload
+    )
+    store.system_settings[CONTROL_PLANE_APPROVALS_KEY] = payload
+    if not persisted:
+        logger.warning("Falling back to runtime approval store because persistence write failed")
 
 
 def list_approvals(*, status_filter: str | None = None, request_type: str | None = None) -> dict:

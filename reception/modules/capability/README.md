@@ -1,23 +1,19 @@
-# capability 模块
+# Skill / MCP 作用域规则
 
 ## 模块职责
+Skill 与 MCP 支持租户作用域控制，用于区分全平台共享能力与租户专用能力。
 
-负责工具能力管理，包括工具源、工具目录、Skill 注册与管理、外部连接管理。
+## 作用域定义
+- `global`：通用
+- `tenant`：专用
 
-## 当前路由
+## 字段说明
+- `scope`
+- `owner_tenant_id`
 
-- `/tools`
-
-## 主要文件
-
-- `pages/tools-page.tsx`
-- `hooks/use-tools.ts`
-- `hooks/use-tool-sources.ts`
-- `hooks/use-brain-skills.ts`
-- `hooks/use-external-connections.ts`
-- `components/*`
-
-## 注意事项
-
-- 该模块是“产品赋能”主入口，避免混入与组织管理、任务执行无关逻辑。
-- 模型与 Agent 的绑定配置应交由对应模块，不在这里做跨域写入。
+## 规则说明
+1. Agent 不共享，按租户私有
+2. Skill / MCP 可配置为通用或专用
+3. 专用能力仅所属租户可见、可绑定、可执行
+4. 通用能力可被多个租户复用
+5. 运行时解析顺序为先专用后通用

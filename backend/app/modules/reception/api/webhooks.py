@@ -55,14 +55,14 @@ def _configured_channel_secret(channel: ChannelType) -> tuple[str | None, str, s
 def _channel_enabled(channel: ChannelType) -> bool:
     settings = get_channel_integration_runtime_settings()
     if channel == ChannelType.TELEGRAM:
-        return bool(settings["telegram"].get("enabled", True))
+        return bool(settings["telegram"].get("enabled", False))
     if channel == ChannelType.WECOM:
-        return bool(settings["wecom"].get("enabled", True))
+        return bool(settings["wecom"].get("enabled", False))
     if channel == ChannelType.FEISHU:
-        return bool(settings["feishu"].get("enabled", True))
+        return bool(settings["feishu"].get("enabled", False))
     if channel == ChannelType.DINGTALK:
-        return bool(settings["dingtalk"].get("enabled", True))
-    return True
+        return bool(settings["dingtalk"].get("enabled", False))
+    return False
 
 
 def _validate_channel_secret(
@@ -107,7 +107,11 @@ def _ingest_channel_webhook_route(
     _validate_channel_secret(channel=channel, request=request)
 
     try:
-        result = ingest_channel_webhook(channel.value, payload)
+        result = ingest_channel_webhook(
+            channel.value,
+            payload,
+            request_base_url=str(request.base_url or "").strip().rstrip("/"),
+        )
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
@@ -140,7 +144,10 @@ def telegram_webhook_route(
         )
 
     try:
-        result = ingest_telegram_webhook(payload.model_dump(by_alias=True))
+        result = ingest_telegram_webhook(
+            payload.model_dump(by_alias=True),
+            request_base_url=str(request.base_url or "").strip().rstrip("/"),
+        )
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 

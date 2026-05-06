@@ -70,7 +70,7 @@ services:
       [
         "sh",
         "-lc",
-        "alembic upgrade head && exec uvicorn app.main:app --host 0.0.0.0 --port 8080 --reload",
+        "alembic upgrade head && exec uvicorn app.main:app --host 0.0.0.0 --port 8080",
       ]
     environment:
       WORKBOT_ENVIRONMENT: ${WORKBOT_ENVIRONMENT:-docker-compose}
@@ -88,6 +88,7 @@ services:
       WORKBOT_WORKFLOW_EXECUTION_POLL_INTERVAL_SECONDS: ${WORKBOT_WORKFLOW_EXECUTION_POLL_INTERVAL_SECONDS:-0.2}
       WORKBOT_MEMORY_RETRIEVE_LIMIT: ${WORKBOT_MEMORY_RETRIEVE_LIMIT:-5}
       WORKBOT_METRICS_SCRAPE_TOKEN: ${WORKBOT_METRICS_SCRAPE_TOKEN:-}
+      WORKBOT_EXTERNAL_CONNECTION_SHARED_SECRET: ${WORKBOT_EXTERNAL_CONNECTION_SHARED_SECRET:-}
       WORKBOT_TOOL_SOURCES_MODE: ${WORKBOT_TOOL_SOURCES_MODE:-external_only}
       WORKBOT_ENABLE_LOCAL_MCP_SOURCE: ${WORKBOT_ENABLE_LOCAL_MCP_SOURCE:-false}
       WORKBOT_ENABLE_LOCAL_AGENT_SOURCE: ${WORKBOT_ENABLE_LOCAL_AGENT_SOURCE:-false}
@@ -104,7 +105,7 @@ services:
     volumes:
       - ./backend:/app
       - .:/workspace:ro
-      - ./deploy/external-registry:/opt/workbot/external-registry:ro
+      - ./deploy/external-registry:/opt/workbot/external-registry:rw
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:

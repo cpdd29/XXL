@@ -199,6 +199,48 @@ MEMORY_LAYER_RETENTION_DAYS = {
     MEMORY_LAYER_WORKING: 30,
 }
 LONG_TERM_MEMORY_TYPE_POLICY = {
+    "tenant_soul": {
+        "label": "租户灵魂",
+        "memory_layer_kind": MEMORY_LAYER_FACT,
+        "retention_days": None,
+        "allowed_scopes": (MEMORY_SCOPE_TENANT,),
+        "allowed_write_sources": (WRITE_SOURCE_BRAIN_INTERNAL,),
+    },
+    "tenant_rule": {
+        "label": "租户规则",
+        "memory_layer_kind": MEMORY_LAYER_FACT,
+        "retention_days": None,
+        "allowed_scopes": (MEMORY_SCOPE_TENANT,),
+        "allowed_write_sources": (WRITE_SOURCE_BRAIN_INTERNAL,),
+    },
+    "customer_preference": {
+        "label": "客户偏好",
+        "memory_layer_kind": MEMORY_LAYER_FACT,
+        "retention_days": None,
+        "allowed_scopes": (MEMORY_SCOPE_TENANT,),
+        "allowed_write_sources": (WRITE_SOURCE_BRAIN_INTERNAL, WRITE_SOURCE_DISTILLATION),
+    },
+    "business_fact": {
+        "label": "业务事实",
+        "memory_layer_kind": MEMORY_LAYER_FACT,
+        "retention_days": None,
+        "allowed_scopes": (MEMORY_SCOPE_TENANT, MEMORY_SCOPE_GLOBAL),
+        "allowed_write_sources": (WRITE_SOURCE_BRAIN_INTERNAL, WRITE_SOURCE_DISTILLATION),
+    },
+    "decision": {
+        "label": "业务决策",
+        "memory_layer_kind": MEMORY_LAYER_WORKING,
+        "retention_days": MEMORY_LAYER_RETENTION_DAYS.get(MEMORY_LAYER_WORKING),
+        "allowed_scopes": (MEMORY_SCOPE_TENANT,),
+        "allowed_write_sources": (WRITE_SOURCE_BRAIN_INTERNAL, WRITE_SOURCE_DISTILLATION),
+    },
+    "service_policy": {
+        "label": "服务策略",
+        "memory_layer_kind": MEMORY_LAYER_FACT,
+        "retention_days": None,
+        "allowed_scopes": (MEMORY_SCOPE_TENANT, MEMORY_SCOPE_GLOBAL),
+        "allowed_write_sources": (WRITE_SOURCE_BRAIN_INTERNAL,),
+    },
     "session_summary": {
         "label": "会话摘要",
         "memory_layer_kind": MEMORY_LAYER_CONVERSATION,
@@ -252,6 +294,10 @@ LOCAL_ONLY_REASON_DESCRIPTIONS = {
 
 
 logger = logging.getLogger(__name__)
+
+SUBJECT_TYPE_TENANT = "tenant"
+SUBJECT_TYPE_CUSTOMER = "customer"
+SUBJECT_TYPE_TASK_SUMMARY = "task_summary"
 
 
 def _normalize_identifier_list(values: list[str] | tuple[str, ...] | set[str] | None) -> list[str]:
@@ -357,6 +403,56 @@ class MemoryService:
             return deepcopy(runtime_items)
         self._long_term.pop(user_id, None)
         return authoritative_items
+
+    def _load_long_term_items_by_filters(
+        self,
+        *,
+        filters: dict[str, object] | None = None,
+        limit: int | None = None,
+    ) -> list[dict]:
+        normalized_filters = {
+            str(key): value
+            for key, value in (filters or {}).items()
+            if value is not None and str(value).strip()
+        }
+        list_by_filters = getattr(self._long_term_store, "list_memories_by_filters", None)
+        if callable(list_by_filters):
+            try:
+                stored_items = list_by_filters(filters=normalized_filters, limit=limit)
+            except Exception as exc:  # pragma: no cover - defensive fallback for external stores
+                logger.warning("Long-term memory filtered list failed: %s", exc)
+                stored_items = None
+            if stored_items is not None:
+                items = [
+                    deepcopy(item)
+                    for item in stored_items
+                    if isinstance(item, dict) and str(item.get("id") or "").strip()
+                ]
+                items.sort(
+                    key=lambda item: (
+                        str(item.get("updated_at") or item.get("created_at") or ""),
+                        str(item.get("id") or ""),
+                    ),
+                    reverse=True,
+                )
+                return items[:limit] if limit is not None else items
+
+        items: list[dict] = []
+        for bucket in self._long_term.values():
+            for item in bucket:
+                if not isinstance(item, dict):
+                    continue
+                if any(str(item.get(key) or "") != str(value) for key, value in normalized_filters.items()):
+                    continue
+                items.append(deepcopy(item))
+        items.sort(
+            key=lambda item: (
+                str(item.get("updated_at") or item.get("created_at") or ""),
+                str(item.get("id") or ""),
+            ),
+            reverse=True,
+        )
+        return items[:limit] if limit is not None else items
 
     @staticmethod
     def _short_term_key(user_id: str) -> str:
@@ -757,6 +853,29 @@ class MemoryService:
             return normalized
         return default
 
+    @staticmethod
+    def _normalize_subject_type(value: str | None) -> str:
+        normalized = str(value or "").strip().lower()
+        if normalized in {SUBJECT_TYPE_TENANT, SUBJECT_TYPE_CUSTOMER, SUBJECT_TYPE_TASK_SUMMARY}:
+            return normalized
+        return SUBJECT_TYPE_CUSTOMER
+
+    def _resolve_long_term_subject(
+        self,
+        *,
+        scope: dict[str, str],
+        subject_type: str | None,
+        subject_id: str | None,
+    ) -> tuple[str, str]:
+        normalized_subject_type = self._normalize_subject_type(subject_type)
+        normalized_subject_id = str(subject_id or "").strip()
+        if normalized_subject_type == SUBJECT_TYPE_TENANT:
+            normalized_subject_id = normalized_subject_id or scope["tenant_id"]
+            return normalized_subject_type, f"tenant:{normalized_subject_id}"
+        if not normalized_subject_id:
+            raise HTTPException(status_code=422, detail="subject_id is required for non-tenant memory")
+        return normalized_subject_type, normalized_subject_id
+
     @classmethod
     def _long_term_memory_type_policy(cls, memory_type: str) -> dict[str, object]:
         normalized = str(memory_type or "").strip().lower()
@@ -769,6 +888,27 @@ class MemoryService:
     def _memory_layer_kind_for_long_term_type(cls, memory_type: str) -> str:
         policy = cls._long_term_memory_type_policy(memory_type)
         return str(policy["memory_layer_kind"])
+
+    @classmethod
+    def _validate_long_term_type_policy(
+        cls,
+        *,
+        memory_type: str,
+        memory_scope: str,
+        write_source: str,
+    ) -> dict[str, object]:
+        policy = cls._long_term_memory_type_policy(memory_type)
+        if memory_scope not in set(policy.get("allowed_scopes") or (MEMORY_SCOPE_TENANT,)):
+            raise HTTPException(
+                status_code=422,
+                detail=f"Memory type {memory_type} does not support scope {memory_scope}",
+            )
+        if write_source not in set(policy.get("allowed_write_sources") or (WRITE_SOURCE_DISTILLATION,)):
+            raise HTTPException(
+                status_code=422,
+                detail=f"Memory type {memory_type} does not support write source {write_source}",
+            )
+        return policy
 
     @classmethod
     def governance_snapshot(cls) -> dict[str, object]:
@@ -2112,6 +2252,198 @@ class MemoryService:
                 seen_fingerprints.add(fingerprint)
             deduped.append(candidate)
         return deduped
+
+    @staticmethod
+    def _memory_matches_keyword(item: dict, keyword: str) -> bool:
+        normalized_keyword = str(keyword or "").strip().lower()
+        if not normalized_keyword:
+            return True
+        haystacks = [
+            str(item.get("title") or "").lower(),
+            str(item.get("summary") or "").lower(),
+            str(item.get("memory_text") or "").lower(),
+            str(item.get("source") or "").lower(),
+            str(item.get("subject_id") or "").lower(),
+        ]
+        haystacks.extend(str(term).lower() for term in (item.get("keywords") or []))
+        return any(normalized_keyword in haystack for haystack in haystacks if haystack)
+
+    def write_long_term_memory(
+        self,
+        *,
+        memory_id: str | None = None,
+        memory_type: str,
+        content: str,
+        scope: dict | None = None,
+        subject_type: str = SUBJECT_TYPE_CUSTOMER,
+        subject_id: str | None = None,
+        title: str | None = None,
+        summary: str | None = None,
+        source: str | None = None,
+        importance: float | None = None,
+        keywords: list[str] | None = None,
+        write_source: str = WRITE_SOURCE_BRAIN_INTERNAL,
+        trust_level: str | None = None,
+        memory_scope: str = MEMORY_SCOPE_TENANT,
+    ) -> dict:
+        normalized_scope = self._normalize_scope(scope)
+        normalized_write_source = self._normalize_write_source(write_source)
+        normalized_trust = self._normalize_trust_level(trust_level, default=TRUST_LEVEL_TRUSTED)
+        normalized_memory_scope = self._normalize_memory_scope(memory_scope)
+        self._enforce_memory_write_policy(
+            target_layer="long_term",
+            write_source=normalized_write_source,
+            trust_level=normalized_trust,
+            memory_scope=normalized_memory_scope,
+        )
+        self._validate_long_term_type_policy(
+            memory_type=memory_type,
+            memory_scope=normalized_memory_scope,
+            write_source=normalized_write_source,
+        )
+
+        raw_content = str(content or "").strip()
+        if not raw_content:
+            raise HTTPException(status_code=422, detail="content is required")
+        retention_policy, local_only_reasons = self._retention_policy_for_content(raw_content)
+        if retention_policy == RETENTION_POLICY_LOCAL_ONLY:
+            raise HTTPException(
+                status_code=422,
+                detail="content contains local-only sensitive fragments and cannot be stored as long-term memory",
+            )
+        normalized_subject_type, resolved_user_id = self._resolve_long_term_subject(
+            scope=normalized_scope,
+            subject_type=subject_type,
+            subject_id=subject_id,
+        )
+        normalized_subject_id = (
+            normalized_scope["tenant_id"]
+            if normalized_subject_type == SUBJECT_TYPE_TENANT
+            else str(subject_id or "").strip()
+        )
+
+        now = self._to_iso(self._now())
+        normalized_memory_id = str(memory_id or "").strip() or f"lng-{uuid4().hex[:12]}"
+        normalized_summary = str(summary or "").strip() or None
+        normalized_title = str(title or "").strip() or None
+        normalized_source = str(source or "").strip() or None
+        normalized_keywords = self._ordered_unique(
+            [
+                *[str(item).strip() for item in (keywords or []) if str(item).strip()],
+                *self._extract_keywords([raw_content, normalized_summary or "", normalized_title or ""]),
+            ],
+            limit=KEYWORD_LIMIT,
+        )
+        normalized_importance = self._safe_float(importance)
+        memory_layer_kind = self._memory_layer_kind_for_long_term_type(memory_type)
+        item = self._apply_governance_defaults(
+            {
+                "id": normalized_memory_id,
+                "user_id": resolved_user_id,
+                "source_mid_term_id": "",
+                "memory_type": str(memory_type).strip().lower(),
+                "subject_type": normalized_subject_type,
+                "subject_id": normalized_subject_id,
+                "title": normalized_title,
+                "summary": normalized_summary,
+                "memory_text": self._sanitize_memory_text(raw_content),
+                "keywords": normalized_keywords,
+                "source": normalized_source,
+                "importance": round(normalized_importance, 4) if normalized_importance is not None else None,
+                "created_at": now,
+                "updated_at": now,
+                "retention_policy": RETENTION_POLICY_DISTILLABLE,
+                "local_only_reasons": local_only_reasons,
+                "local_only_filtered_count": 0,
+            },
+            scope=normalized_scope,
+            memory_scope=normalized_memory_scope,
+            memory_layer_kind=memory_layer_kind,
+            write_source=normalized_write_source,
+            trust_level=normalized_trust,
+        )
+
+        authoritative = self._load_long_term_bucket(resolved_user_id)
+        long_bucket = self._long_term.setdefault(resolved_user_id, list(authoritative))
+        replaced = False
+        for index, existing in enumerate(long_bucket):
+            if str(existing.get("id") or "").strip() != normalized_memory_id:
+                continue
+            created_at = str(existing.get("created_at") or "").strip()
+            if created_at:
+                item["created_at"] = created_at
+            long_bucket[index] = item
+            replaced = True
+            break
+        if not replaced:
+            long_bucket.append(item)
+        long_bucket.sort(
+            key=lambda entry: (
+                str(entry.get("updated_at") or entry.get("created_at") or ""),
+                str(entry.get("id") or ""),
+            ),
+            reverse=True,
+        )
+        if self._long_term_store is not None:
+            self._long_term_store.save_memory(item)
+        return {"ok": True, "message": "Long-term memory saved", "item": item}
+
+    def list_long_term_memories(
+        self,
+        *,
+        scope: dict | None = None,
+        subject_id: str | None = None,
+        subject_type: str | None = None,
+        memory_type: str | None = None,
+        query: str | None = None,
+        limit: int = 20,
+        include_inactive: bool = False,
+        memory_scope: str | None = None,
+    ) -> dict:
+        normalized_scope = self._normalize_scope(scope)
+        normalized_limit = max(1, min(int(limit), 100))
+        normalized_subject_id = str(subject_id or "").strip()
+        normalized_subject_type = self._normalize_subject_type(subject_type)
+        filters: dict[str, object] = {"tenant_id": normalized_scope["tenant_id"]}
+        if memory_type:
+            filters["memory_type"] = str(memory_type).strip().lower()
+
+        if normalized_subject_id:
+            if normalized_subject_type == SUBJECT_TYPE_TENANT:
+                filters["subject_type"] = SUBJECT_TYPE_TENANT
+                filters["subject_id"] = normalized_subject_id
+                filters["user_id"] = f"tenant:{normalized_subject_id}"
+            else:
+                filters["subject_type"] = normalized_subject_type
+                filters["subject_id"] = normalized_subject_id
+                filters["user_id"] = normalized_subject_id
+
+        items = self._load_long_term_items_by_filters(filters=filters)
+        filtered_items = self._filter_memory_items(
+            items,
+            scope=normalized_scope,
+            memory_scope=memory_scope,
+            include_inactive=include_inactive,
+            include_untrusted=True,
+        )
+        if query:
+            filtered_items = [
+                item for item in filtered_items if self._memory_matches_keyword(item, query)
+            ]
+        filtered_items.sort(
+            key=lambda item: (
+                str(item.get("updated_at") or item.get("created_at") or ""),
+                str(item.get("id") or ""),
+            ),
+            reverse=True,
+        )
+        total = len(filtered_items)
+        result_items = filtered_items[:normalized_limit]
+        return {
+            "items": result_items,
+            "total": total,
+            "scope_breakdown": self._scope_breakdown(result_items),
+        }
 
     def retrieve(
         self,

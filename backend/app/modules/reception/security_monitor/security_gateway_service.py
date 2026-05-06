@@ -36,7 +36,9 @@ from app.modules.reception.security_monitor.policy import (
     CONTENT_POLICY_RULES,
     _apply_content_rule as _apply_single_content_rule,
     apply_content_policy,
+    assess_xss_risk,
     assess_prompt_injection,
+    match_keyword_blocklist_hits,
 )
 from app.modules.reception.security_monitor.rate_limit import (
     build_penalty_payload,
@@ -466,6 +468,8 @@ class SecurityGatewayService:
         metadata: dict[str, object] | None = None,
         ip: str = "-",
     ) -> None:
+        if not bool(normalized_security_policy_settings(self._policy())["audit_enabled"]):
+            return
         log_payload = build_audit_log_payload(
             action=action,
             user=user,
@@ -723,6 +727,8 @@ class SecurityGatewayService:
         trace_context: dict[str, object],
         normalized_policy: dict[str, int | bool],
     ) -> None:
+        if not bool(normalized_policy["dos_protection_enabled"]):
+            return
         if not self._is_rule_enabled("频率限制"):
             return
 
@@ -861,6 +867,72 @@ class SecurityGatewayService:
         )
         return prompt_assessment
 
+    def _enforce_xss_guard(
+        self,
+        *,
+        user_key: str,
+        text: str,
+        trace_id: str,
+        trace_context: dict[str, object],
+        normalized_policy: dict[str, int | bool],
+    ) -> None:
+        if not self._is_rule_enabled("XSS 防护"):
+            return
+        if not bool(normalized_policy["xss_enabled"]):
+            return
+
+        xss_assessment = assess_xss_risk(text)
+        if not bool(xss_assessment.get("matched")):
+            return
+
+        self._block(
+            user_key=user_key,
+            layer="xss",
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="XSS risk detected",
+            rule_name="XSS 防护",
+            trace_id=trace_id,
+            trace_context=trace_context,
+            audit_details=f"matches={', '.join(str(item) for item in (xss_assessment.get('matches') or []))}",
+        )
+
+    def _enforce_keyword_blocklist_guard(
+        self,
+        *,
+        user_key: str,
+        text: str,
+        trace_id: str,
+        trace_context: dict[str, object],
+        normalized_policy: dict[str, int | bool],
+    ) -> None:
+        if not self._is_rule_enabled("敏感词过滤"):
+            return
+        if not bool(normalized_policy["keyword_blocklist_enabled"]):
+            return
+
+        keywords = [
+            str(item or "").strip()
+            for item in (self._policy().get("keyword_blocklist") or [])
+            if str(item or "").strip()
+        ]
+        if not keywords:
+            return
+
+        hits = match_keyword_blocklist_hits(text, keywords=keywords)
+        if len(hits) < int(normalized_policy["keyword_block_threshold"]):
+            return
+
+        self._block(
+            user_key=user_key,
+            layer="keyword_blocklist",
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Blocked by keyword blocklist",
+            rule_name="敏感词过滤",
+            trace_id=trace_id,
+            trace_context=trace_context,
+            audit_details=f"hits={', '.join(hits)}; threshold={normalized_policy['keyword_block_threshold']}",
+        )
+
     def _apply_content_redaction_guard(
         self,
         *,
@@ -872,6 +944,17 @@ class SecurityGatewayService:
         if not bool(normalized_policy["content_redaction_enabled"]):
             return text, [], [], []
         return self._apply_content_policy(text)
+
+    @staticmethod
+    def _monitor_enabled_for_direction(
+        *,
+        direction: str,
+        normalized_policy: dict[str, int | bool],
+    ) -> bool:
+        normalized_direction = str(direction or "input").strip().lower()
+        if normalized_direction == "output":
+            return bool(normalized_policy["output_monitor_enabled"])
+        return bool(normalized_policy["input_monitor_enabled"])
 
     def _finalize_allow_audit(
         self,
@@ -977,6 +1060,8 @@ class SecurityGatewayService:
                 layer=layer,
                 user_key=user_key,
                 status_code=status_code,
+                detail=detail,
+                rule_name=rule_name,
             ),
         )
         raise HTTPException(status_code=status_code, detail=detail)
@@ -1003,6 +1088,7 @@ class SecurityGatewayService:
         blocked_layer: str,
         status_code: int,
         detail: str,
+        rule_name: str | None = None,
     ) -> dict[str, object]:
         trace_event = self._build_trace_event(
             trace_context,
@@ -1031,6 +1117,7 @@ class SecurityGatewayService:
                 "layer": blocked_layer,
                 "status_code": status_code,
                 "detail": detail,
+                "rule_name": str(rule_name or "").strip() or None,
             },
         }
 
@@ -1079,13 +1166,20 @@ class SecurityGatewayService:
         text: str,
         user_key: str,
         auth_scope: str,
+        direction: str = "input",
+        trace_id: str | None = None,
     ) -> dict[str, object]:
         policy = self._policy()
         normalized_policy = normalized_security_policy_settings(policy)
+        normalized_direction = str(direction or "input").strip().lower()
+        monitor_enabled = self._monitor_enabled_for_direction(
+            direction=normalized_direction,
+            normalized_policy=normalized_policy,
+        )
         now = self._now()
-        trace_id = f"trace-{uuid4().hex[:12]}"
+        normalized_trace_id = str(trace_id or "").strip() or f"trace-{uuid4().hex[:12]}"
         trace_context = self._build_trace_context(
-            trace_id=trace_id,
+            trace_id=normalized_trace_id,
             user_key=user_key,
             auth_scope=auth_scope,
             now=now,
@@ -1097,16 +1191,17 @@ class SecurityGatewayService:
         rewrite_diffs: list[dict[str, object]] = []
 
         try:
-            self._enforce_rate_limit_guard(
-                user_key=user_key,
-                now=now,
-                trace_id=trace_id,
-                trace_context=trace_context,
-                normalized_policy=normalized_policy,
-            )
+            if normalized_direction == "input" and monitor_enabled:
+                self._enforce_rate_limit_guard(
+                    user_key=user_key,
+                    now=now,
+                    trace_id=normalized_trace_id,
+                    trace_context=trace_context,
+                    normalized_policy=normalized_policy,
+                )
         except HTTPException as exc:
             return self._build_block_result(
-                trace_id=trace_id,
+                trace_id=normalized_trace_id,
                 user_key=user_key,
                 auth_scope=auth_scope,
                 text=normalized_text,
@@ -1117,18 +1212,19 @@ class SecurityGatewayService:
                 blocked_layer="rate_limit",
                 status_code=exc.status_code,
                 detail=str(exc.detail),
+                rule_name="频率限制",
             )
 
         try:
             self._enforce_auth_scope_guard(
                 user_key=user_key,
                 auth_scope=auth_scope,
-                trace_id=trace_id,
+                trace_id=normalized_trace_id,
                 trace_context=trace_context,
             )
         except HTTPException as exc:
             return self._build_block_result(
-                trace_id=trace_id,
+                trace_id=normalized_trace_id,
                 user_key=user_key,
                 auth_scope=auth_scope,
                 text=normalized_text,
@@ -1139,48 +1235,101 @@ class SecurityGatewayService:
                 blocked_layer="auth_rbac",
                 status_code=exc.status_code,
                 detail=str(exc.detail),
+                rule_name=None,
             )
 
-        try:
-            prompt_assessment = self._assess_prompt_injection_guard(
-                user_key=user_key,
-                now=now,
+        if monitor_enabled:
+            try:
+                prompt_assessment = self._assess_prompt_injection_guard(
+                    user_key=user_key,
+                    now=now,
+                    text=normalized_text,
+                    trace_id=normalized_trace_id,
+                    trace_context=trace_context,
+                    normalized_policy=normalized_policy,
+                )
+            except HTTPException as exc:
+                if str(prompt_assessment.get("verdict") or "").strip() != "block":
+                    prompt_assessment = self._prompt_injection_assessment(normalized_text)
+                return self._build_block_result(
+                    trace_id=normalized_trace_id,
+                    user_key=user_key,
+                    auth_scope=auth_scope,
+                    text=normalized_text,
+                    prompt_assessment=prompt_assessment,
+                    warnings=warnings,
+                    rewrite_diffs=rewrite_diffs,
+                    trace_context=trace_context,
+                    blocked_layer="prompt_injection",
+                    status_code=exc.status_code,
+                    detail=str(exc.detail),
+                    rule_name="恶意内容检测",
+                )
+
+            try:
+                self._enforce_xss_guard(
+                    user_key=user_key,
+                    text=normalized_text,
+                    trace_id=normalized_trace_id,
+                    trace_context=trace_context,
+                    normalized_policy=normalized_policy,
+                )
+            except HTTPException as exc:
+                return self._build_block_result(
+                    trace_id=normalized_trace_id,
+                    user_key=user_key,
+                    auth_scope=auth_scope,
+                    text=normalized_text,
+                    prompt_assessment=prompt_assessment,
+                    warnings=warnings,
+                    rewrite_diffs=rewrite_diffs,
+                    trace_context=trace_context,
+                    blocked_layer="xss",
+                    status_code=exc.status_code,
+                    detail=str(exc.detail),
+                    rule_name="XSS 防护",
+                )
+
+            try:
+                self._enforce_keyword_blocklist_guard(
+                    user_key=user_key,
+                    text=normalized_text,
+                    trace_id=normalized_trace_id,
+                    trace_context=trace_context,
+                    normalized_policy=normalized_policy,
+                )
+            except HTTPException as exc:
+                return self._build_block_result(
+                    trace_id=normalized_trace_id,
+                    user_key=user_key,
+                    auth_scope=auth_scope,
+                    text=normalized_text,
+                    prompt_assessment=prompt_assessment,
+                    warnings=warnings,
+                    rewrite_diffs=rewrite_diffs,
+                    trace_context=trace_context,
+                    blocked_layer="keyword_blocklist",
+                    status_code=exc.status_code,
+                    detail=str(exc.detail),
+                    rule_name="敏感词过滤",
+                )
+
+            sanitized_text, warnings, rewrite_notes, rewrite_diffs = self._apply_content_redaction_guard(
                 text=normalized_text,
-                trace_id=trace_id,
-                trace_context=trace_context,
                 normalized_policy=normalized_policy,
             )
-        except HTTPException as exc:
-            if str(prompt_assessment.get("verdict") or "").strip() != "block":
-                prompt_assessment = self._prompt_injection_assessment(normalized_text)
-            return self._build_block_result(
-                trace_id=trace_id,
-                user_key=user_key,
-                auth_scope=auth_scope,
-                text=normalized_text,
-                prompt_assessment=prompt_assessment,
-                warnings=warnings,
-                rewrite_diffs=rewrite_diffs,
-                trace_context=trace_context,
-                blocked_layer="prompt_injection",
-                status_code=exc.status_code,
-                detail=str(exc.detail),
-            )
-
-        sanitized_text, warnings, rewrite_notes, rewrite_diffs = self._apply_content_redaction_guard(
-            text=normalized_text,
-            normalized_policy=normalized_policy,
-        )
+        else:
+            sanitized_text = normalized_text
         trace_event = self._finalize_allow_audit(
             user_key=user_key,
-            trace_id=trace_id,
+            trace_id=normalized_trace_id,
             trace_context=trace_context,
             prompt_assessment=prompt_assessment,
             rewrite_notes=rewrite_notes,
             rewrite_diffs=rewrite_diffs,
         )
         return self._build_allow_result(
-            trace_id=trace_id,
+            trace_id=normalized_trace_id,
             user_key=user_key,
             auth_scope=auth_scope,
             sanitized_text=sanitized_text,

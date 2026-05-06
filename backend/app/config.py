@@ -1,9 +1,14 @@
 from functools import lru_cache
+from pathlib import Path
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 EXTERNAL_CONNECTION_DEFAULT_SHARED_SECRET = "workbot-external-secret"
+BACKEND_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = BACKEND_ROOT.parent
+PROJECT_ENV_FILE = PROJECT_ROOT / ".env"
+BACKEND_ENV_FILE = BACKEND_ROOT / ".env"
 
 
 class Settings(BaseSettings):
@@ -87,10 +92,12 @@ class Settings(BaseSettings):
     external_connection_circuit_breaker_threshold: int = 3
     external_connection_backoff_base_seconds: int = 15
     external_connection_backoff_max_seconds: int = 300
+    reception_agent_id: str | None = None
+    reception_public_base_url: str | None = None
 
     model_config = SettingsConfigDict(
         env_prefix="WORKBOT_",
-        env_file=".env",
+        env_file=(str(PROJECT_ENV_FILE), str(BACKEND_ENV_FILE)),
         extra="ignore",
     )
 

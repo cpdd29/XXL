@@ -10,6 +10,7 @@ from app.modules.reception.security_monitor.security_service import get_security
 from app.platform.persistence.runtime_store import store
 from app.modules.organization.application.tenancy_service import attach_scope, matches_scope
 from app.modules.dispatch.workflow_runtime.workflow_runtime_snapshot_service import workflow_runtime_snapshot_service
+from app.platform.observability.audit_log_presenter import present_audit_log
 
 
 ACTIVE_AGENT_STATUSES = {"running", "waiting"}
@@ -24,12 +25,15 @@ DEFAULT_REALTIME_LOG_LIMIT = 20
 DEFAULT_REALTIME_PAYLOAD_LIMIT = 5
 AUDIT_LOG_EXPORT_HEADERS = {
     "timestamp": "时间",
-    "action": "动作",
-    "user": "用户",
-    "resource": "资源",
+    "action_label": "事件类型",
+    "operator_summary": "运营摘要",
+    "user": "操作人",
+    "resource_label": "业务对象",
     "status": "状态",
     "ip": "IP",
-    "details": "详情",
+    "action": "系统动作",
+    "resource": "系统资源",
+    "details": "原始详情",
 }
 
 FAILURE_BREAKDOWN_STAGE_ORDER = ("route", "dispatch", "execution", "outbound")
@@ -284,6 +288,7 @@ def _normalize_audit_log_as_realtime(log: dict | None) -> dict | None:
     if not isinstance(log, dict):
         return None
 
+    presented = present_audit_log(log)
     status_value = str(log.get("status") or "").strip().lower()
     type_value = (
         "error"
@@ -294,11 +299,11 @@ def _normalize_audit_log_as_realtime(log: dict | None) -> dict | None:
         if status_value == "success"
         else "info"
     )
-    message = str(log.get("details") or log.get("action") or "").strip()
+    message = str(presented.get("operator_summary") or presented.get("details") or presented.get("action_label") or log.get("action") or "").strip()
     if not message:
         return None
 
-    source = str(log.get("resource") or log.get("user") or "Audit").strip()
+    source = str(presented.get("resource_label") or log.get("resource") or log.get("user") or "Audit").strip()
     return {
         "id": str(log.get("id") or ""),
         "timestamp": _time_label(log.get("timestamp")),
@@ -1428,6 +1433,7 @@ def _filter_audit_logs(
     scope: dict[str, str] | None = None,
 ) -> list[dict]:
     items = _filter_items_by_scope(_load_audit_logs(), scope)
+    presented_items = [present_audit_log(item) for item in items]
 
     search_keyword = _normalize_keyword(search)
     status_keyword = _normalize_keyword(status_filter)
@@ -1436,29 +1442,44 @@ def _filter_audit_logs(
     resource_keyword = _normalize_keyword(resource)
 
     if search_keyword is not None:
-        items = [
+        presented_items = [
             log
-            for log in items
+            for log in presented_items
             if _matches_keyword(
                 log,
-                ("action", "user", "resource", "status", "ip", "details"),
+                (
+                    "action",
+                    "action_label",
+                    "operator_summary",
+                    "resource",
+                    "resource_label",
+                    "module_label",
+                    "user",
+                    "status",
+                    "ip",
+                    "details",
+                ),
                 search_keyword,
             )
         ]
 
     if status_keyword is not None:
-        items = [log for log in items if str(log.get("status") or "").lower() == status_keyword]
+        presented_items = [log for log in presented_items if str(log.get("status") or "").lower() == status_keyword]
 
     if layer_keyword is not None:
-        items = [log for log in items if _audit_log_layer(log) == layer_keyword]
+        presented_items = [log for log in presented_items if _audit_log_layer(log) == layer_keyword]
 
     if user_keyword is not None:
-        items = [log for log in items if _matches_keyword(log, ("user",), user_keyword)]
+        presented_items = [log for log in presented_items if _matches_keyword(log, ("user",), user_keyword)]
 
     if resource_keyword is not None:
-        items = [log for log in items if _matches_keyword(log, ("resource",), resource_keyword)]
+        presented_items = [
+            log
+            for log in presented_items
+            if _matches_keyword(log, ("resource", "resource_label"), resource_keyword)
+        ]
 
-    return items
+    return presented_items
 
 
 def get_audit_logs(
@@ -1519,11 +1540,14 @@ def export_audit_logs_csv(
         writer.writerow(
             [
                 str(item.get("timestamp") or ""),
-                str(item.get("action") or ""),
+                str(item.get("action_label") or item.get("action") or ""),
+                str(item.get("operator_summary") or item.get("details") or ""),
                 str(item.get("user") or ""),
-                str(item.get("resource") or ""),
+                str(item.get("resource_label") or item.get("resource") or ""),
                 str(item.get("status") or ""),
                 str(item.get("ip") or ""),
+                str(item.get("action") or ""),
+                str(item.get("resource") or ""),
                 str(item.get("details") or ""),
             ]
         )

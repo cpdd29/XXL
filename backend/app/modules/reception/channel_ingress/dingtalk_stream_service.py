@@ -74,7 +74,6 @@ except Exception:  # pragma: no cover - optional dependency fallback
         async def background_task(self, json_message: dict[str, Any]) -> None:
             return None
 
-from app.modules.reception.channel_ingress.dingtalk import DingTalkAdapter
 from app.modules.reception.application.message_ingestion_service import ingest_channel_webhook
 from app.platform.observability.operational_log_service import append_realtime_event
 from app.platform.config.settings_service import get_channel_integration_runtime_settings
@@ -86,7 +85,6 @@ logger = logging.getLogger(__name__)
 class WorkBotDingTalkStreamHandler(ChatbotHandler):
     def __init__(self) -> None:
         super().__init__()
-        self._adapter = DingTalkAdapter()
 
     @staticmethod
     def _normalize_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -121,9 +119,9 @@ class WorkBotDingTalkStreamHandler(ChatbotHandler):
     @classmethod
     def _expected_skip_reason(cls, payload: dict[str, Any]) -> str | None:
         msgtype = str(payload.get("msgtype") or "").strip().lower()
-        if msgtype and msgtype != "text":
+        if msgtype and msgtype not in {"text", "image", "audio", "voice", "video", "file"}:
             return f"ignored non-text message ({msgtype})"
-        if not cls._message_text_content(payload):
+        if not cls._message_text_content(payload) and msgtype not in {"image", "audio", "voice", "video", "file"}:
             return "ignored message without text content"
         return None
 
@@ -138,20 +136,6 @@ class WorkBotDingTalkStreamHandler(ChatbotHandler):
         try:
             result = ingest_channel_webhook("dingtalk", normalized_payload)
             response_text = str(result.get("message") or result.get("result_message") or "").strip()
-            if response_text:
-                chat_id = str(normalized_payload.get("sessionWebhook") or normalized_payload.get("chat_id") or normalized_payload.get("conversationId") or "").strip()
-                if chat_id:
-                    try:
-                        self._adapter.send_message(chat_id=chat_id, text=response_text)
-                    except Exception as send_exc:  # pragma: no cover - outbound defensive path
-                        logger.warning("Failed to send DingTalk reply: %s", send_exc)
-                        append_realtime_event(
-                            agent="DingTalk Stream",
-                            message=f"钉钉回复发送失败：{send_exc}",
-                            type_="warning",
-                            source="dingtalk_stream",
-                            metadata={"event": "message_reply_failed", "error": str(send_exc)},
-                        )
             append_realtime_event(
                 agent="DingTalk Stream",
                 message=f"已接受钉钉消息：{response_text or 'no reply text'}",
@@ -203,7 +187,7 @@ class DingTalkStreamService:
 
     def reconcile_runtime(self) -> bool:
         runtime_settings = get_channel_integration_runtime_settings()["dingtalk"]
-        if not bool(runtime_settings.get("enabled", True)):
+        if not bool(runtime_settings.get("enabled", False)):
             self.stop()
             return False
 

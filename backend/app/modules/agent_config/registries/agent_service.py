@@ -7,12 +7,10 @@ from fastapi import HTTPException, status
 
 from app.modules.agent_config.registries.agent_config_service import agent_config_service, build_agent_config_summary
 from app.modules.agent_config.registries.brain_skill_service import brain_skill_service
-from app.modules.agent_config.registries.external_agent_registry_service import external_agent_registry_service
-from app.modules.agent_config.registries.mandatory_agent_registry_service import (
-    get_mandatory_agent_projection,
-    is_mandatory_agent_id,
-    list_mandatory_agent_projections,
-    suppress_mandatory_agent,
+from app.modules.agent_config.registries.capability_scope import CAPABILITY_SCOPE_SHARED
+from app.modules.agent_config.registries.external_agent_registry_service import (
+    external_agent_registry_service,
+    redact_external_agent_payload,
 )
 from app.platform.persistence.persistence_service import persistence_service
 from app.platform.config.settings_service import get_agent_api_runtime_settings
@@ -118,15 +116,12 @@ def _load_agents() -> list[dict]:
     }
     for external_agent in external_agent_registry_service.list_agents(include_offline=True):
         agent_id = str(external_agent.get("id") or "").strip()
-        if not agent_id or agent_id in merged or agent_id in LEGACY_AGENT_IDS:
+        if not agent_id or agent_id in LEGACY_AGENT_IDS:
             continue
-        merged[agent_id] = store.clone(external_agent)
-    if getattr(persistence_service, "enabled", False):
-        for projection in list_mandatory_agent_projections(existing_agents=list(merged.values())):
-            agent_id = str(projection.get("id") or "").strip()
-            if not agent_id or agent_id in merged:
-                continue
-            merged[agent_id] = store.clone(projection)
+        existing = merged.get(agent_id)
+        if existing is not None and not _should_refresh_from_external_registry(existing):
+            continue
+        merged[agent_id] = store.clone(redact_external_agent_payload(external_agent))
     return list(merged.values())
 
 
@@ -135,6 +130,23 @@ def _find_cached_agent(agent_id: str) -> dict | None:
         if agent["id"] == agent_id:
             return agent
     return None
+
+
+def _should_refresh_from_external_registry(agent_payload: dict[str, Any]) -> bool:
+    config_summary = agent_payload.get("config_summary") if isinstance(agent_payload.get("config_summary"), dict) else {}
+    config_snapshot = agent_payload.get("config_snapshot") if isinstance(agent_payload.get("config_snapshot"), dict) else {}
+    metadata = agent_payload.get("metadata") if isinstance(agent_payload.get("metadata"), dict) else {}
+    runtime = config_snapshot.get("runtime") if isinstance(config_snapshot.get("runtime"), dict) else {}
+
+    source = str(
+        config_summary.get("source")
+        or metadata.get("source")
+        or runtime.get("source")
+        or ""
+    ).strip().lower()
+    snapshot_status = str(config_snapshot.get("status") or "").strip().lower()
+
+    return source in {"external_agent_registry", "control_plane"} or snapshot_status == "external_registered"
 
 
 def _sync_cached_agent(agent_payload: dict) -> dict:
@@ -350,6 +362,16 @@ def _resolve_agent_skill_binding(agent_payload: dict) -> list[str]:
     return _normalize_identifier_list(binding.get("skill_ids"))
 
 
+def _resolve_agent_soul(agent_payload: dict | None) -> str | None:
+    if not isinstance(agent_payload, dict):
+        return None
+    snapshot = agent_payload.get("config_snapshot")
+    if not isinstance(snapshot, dict):
+        return None
+    soul = _normalize_text(snapshot.get("soul"))
+    return soul or None
+
+
 def _runtime_tool_binding(snapshot: dict | None) -> dict[str, Any] | None:
     if not isinstance(snapshot, dict):
         return None
@@ -398,24 +420,22 @@ def _runtime_workflow_binding(snapshot: dict | None) -> dict[str, Any] | None:
             workflow_id = _normalize_text(
                 binding.get("agent_workflow_id") or binding.get("agentWorkflowId")
             ) or None
-            if not workflow_id:
+            input_contract = store.clone(
+                binding.get("input_contract") or binding.get("inputContract")
+            ) if isinstance(binding.get("input_contract") or binding.get("inputContract"), dict) else {}
+            output_contract = store.clone(
+                binding.get("output_contract") or binding.get("outputContract")
+            ) if isinstance(binding.get("output_contract") or binding.get("outputContract"), dict) else {}
+            contract_version = _normalize_text(
+                binding.get("contract_version") or binding.get("contractVersion")
+            ) or None
+            if not workflow_id and not input_contract and not output_contract and not contract_version:
                 return None
             return {
                 "agent_workflow_id": workflow_id,
-                "input_contract": store.clone(
-                    binding.get("input_contract") or binding.get("inputContract")
-                )
-                if isinstance(binding.get("input_contract") or binding.get("inputContract"), dict)
-                else {},
-                "output_contract": store.clone(
-                    binding.get("output_contract") or binding.get("outputContract")
-                )
-                if isinstance(binding.get("output_contract") or binding.get("outputContract"), dict)
-                else {},
-                "contract_version": _normalize_text(
-                    binding.get("contract_version") or binding.get("contractVersion")
-                )
-                or None,
+                "input_contract": input_contract,
+                "output_contract": output_contract,
+                "contract_version": contract_version,
                 "source": _normalize_text(binding.get("source")) or "manual",
             }
 
@@ -434,7 +454,7 @@ def _runtime_workflow_binding(snapshot: dict | None) -> dict[str, Any] | None:
     contract_version = _normalize_text(
         agent_doc.get("contract_version") or agent_doc.get("contractVersion")
     ) or None
-    if not workflow_id:
+    if not workflow_id and not input_contract and not output_contract and not contract_version:
         return None
     return {
         "agent_workflow_id": workflow_id,
@@ -445,9 +465,38 @@ def _runtime_workflow_binding(snapshot: dict | None) -> dict[str, Any] | None:
     }
 
 
-def _available_tool_map(*, refresh: bool = False) -> dict[str, dict[str, Any]]:
+def _runtime_agent_metadata(snapshot: dict | None) -> dict[str, Any] | None:
+    if not isinstance(snapshot, dict):
+        return None
+    runtime = snapshot.get("runtime")
+    if isinstance(runtime, dict):
+        metadata_binding = runtime.get("agent_metadata")
+        if isinstance(metadata_binding, dict):
+            metadata = metadata_binding.get("metadata")
+            if isinstance(metadata, dict) and metadata:
+                return store.clone(metadata)
+
+    agent_doc = snapshot.get("agent")
+    if not isinstance(agent_doc, dict):
+        return None
+    metadata = agent_doc.get("metadata")
+    if isinstance(metadata, dict) and metadata:
+        return store.clone(metadata)
+    return None
+
+
+def _available_tool_map(
+    *,
+    refresh: bool = False,
+    tenant_id: str | None = None,
+    include_all_tenants: bool = True,
+) -> dict[str, dict[str, Any]]:
     available_tools: dict[str, dict[str, Any]] = {}
-    for tool in tool_source_service.list_tools(refresh=refresh):
+    for tool in tool_source_service.list_tools(
+        refresh=refresh,
+        tenant_id=tenant_id,
+        include_all_tenants=include_all_tenants,
+    ):
         tool_id = _normalize_text(tool.get("id"))
         if not tool_id:
             continue
@@ -455,40 +504,125 @@ def _available_tool_map(*, refresh: bool = False) -> dict[str, dict[str, Any]]:
     return available_tools
 
 
-def _validate_tool_ids(tool_ids: list[str], *, refresh: bool = False) -> list[str]:
+def _validate_tool_ids(
+    tool_ids: list[str],
+    *,
+    refresh: bool = False,
+    tenant_id: str | None = None,
+    include_all_tenants: bool = True,
+) -> list[str]:
     normalized_tool_ids = _normalize_identifier_list(tool_ids)
     if not normalized_tool_ids:
         return []
 
-    available_tools = _available_tool_map(refresh=refresh)
+    available_tools = _available_tool_map(
+        refresh=refresh,
+        tenant_id=tenant_id,
+        include_all_tenants=include_all_tenants,
+    )
     missing_tool_ids = [tool_id for tool_id in normalized_tool_ids if tool_id not in available_tools]
     if missing_tool_ids:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"以下 Tool 不存在：{', '.join(missing_tool_ids)}",
+            detail=f"以下 Tool 不存在或当前租户不可绑定：{', '.join(missing_tool_ids)}",
         )
     return normalized_tool_ids
 
 
-def _resolve_bound_tools(tool_ids: list[str], *, refresh: bool = False) -> list[dict[str, Any]]:
-    validated_tool_ids = _validate_tool_ids(tool_ids, refresh=refresh)
-    if not validated_tool_ids:
-        return []
+def _format_missing_tool_binding_warning(tool_ids: list[str]) -> str:
+    normalized_tool_ids = _normalize_identifier_list(tool_ids)
+    if not normalized_tool_ids:
+        return ""
+    return f"以下 Tool 已失效或当前租户不可见：{', '.join(normalized_tool_ids)}"
 
-    available_tools = _available_tool_map(refresh=refresh)
-    return [
-        {
+
+def _bound_tool_payload(
+    tool_id: str,
+    tool_doc: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if not isinstance(tool_doc, dict):
+        return {
             "id": tool_id,
-            "name": _normalize_text(available_tools[tool_id].get("name")) or tool_id,
-            "type": _normalize_text(available_tools[tool_id].get("type")) or "unknown",
-            "description": _normalize_text(available_tools[tool_id].get("description")) or None,
-            "source": _normalize_text(
-                available_tools[tool_id].get("source") or available_tools[tool_id].get("source_id")
-            )
-            or None,
+            "name": tool_id,
+            "type": "unavailable",
+            "description": None,
+            "source": None,
+            "scope": CAPABILITY_SCOPE_SHARED,
+            "owner_tenant_id": None,
         }
-        for tool_id in validated_tool_ids
+    return {
+        "id": tool_id,
+        "name": _normalize_text(tool_doc.get("name")) or tool_id,
+        "type": _normalize_text(tool_doc.get("type")) or "unknown",
+        "description": _normalize_text(tool_doc.get("description")) or None,
+        "source": _normalize_text(tool_doc.get("source") or tool_doc.get("source_id")) or None,
+        "scope": _normalize_text(tool_doc.get("scope")) or CAPABILITY_SCOPE_SHARED,
+        "owner_tenant_id": _normalize_text(tool_doc.get("owner_tenant_id")) or None,
+    }
+
+
+def _resolve_bound_tools_result(
+    tool_ids: list[str],
+    *,
+    refresh: bool = False,
+    tenant_id: str | None = None,
+    include_all_tenants: bool = True,
+    strict: bool = True,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    normalized_tool_ids = _normalize_identifier_list(tool_ids)
+    if not normalized_tool_ids:
+        return [], []
+
+    available_tools = _available_tool_map(
+        refresh=refresh,
+        tenant_id=tenant_id,
+        include_all_tenants=include_all_tenants,
+    )
+    missing_tool_ids = [tool_id for tool_id in normalized_tool_ids if tool_id not in available_tools]
+    if strict and missing_tool_ids:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"以下 Tool 不存在或当前租户不可绑定：{', '.join(missing_tool_ids)}",
+        )
+
+    resolved_tools = [
+        _bound_tool_payload(tool_id, available_tools.get(tool_id))
+        for tool_id in normalized_tool_ids
     ]
+    return resolved_tools, missing_tool_ids
+
+
+def _resolve_bound_tools(
+    tool_ids: list[str],
+    *,
+    refresh: bool = False,
+    tenant_id: str | None = None,
+    include_all_tenants: bool = True,
+) -> list[dict[str, Any]]:
+    resolved_tools, _ = _resolve_bound_tools_result(
+        tool_ids,
+        refresh=refresh,
+        tenant_id=tenant_id,
+        include_all_tenants=include_all_tenants,
+        strict=True,
+    )
+    return resolved_tools
+
+
+def _resolve_bound_tools_safe(
+    tool_ids: list[str],
+    *,
+    refresh: bool = False,
+    tenant_id: str | None = None,
+    include_all_tenants: bool = True,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    return _resolve_bound_tools_result(
+        tool_ids,
+        refresh=refresh,
+        tenant_id=tenant_id,
+        include_all_tenants=include_all_tenants,
+        strict=False,
+    )
 
 
 def _resolve_agent_tool_binding(agent_payload: dict) -> list[str]:
@@ -647,10 +781,9 @@ def _apply_workflow_binding_to_snapshot(
     normalized_contract_version = _normalize_text(contract_version) or None
     normalized_input_contract = _normalize_contract_payload(input_contract, field_name="input_contract")
     normalized_output_contract = _normalize_contract_payload(output_contract, field_name="output_contract")
-    if normalized_workflow_id is None:
-        normalized_input_contract = {}
-        normalized_output_contract = {}
-        normalized_contract_version = None
+    has_contract_payload = bool(
+        normalized_input_contract or normalized_output_contract or normalized_contract_version
+    )
 
     agent_doc = next_snapshot.get("agent")
     if not isinstance(agent_doc, dict):
@@ -658,13 +791,16 @@ def _apply_workflow_binding_to_snapshot(
     agent_doc["agent_id"] = str(agent.get("id") or "").strip()
     agent_doc["name"] = str(agent.get("name") or "").strip()
     agent_doc["type"] = str(agent.get("type") or DEFAULT_AGENT_TYPE).strip().lower() or DEFAULT_AGENT_TYPE
-    if normalized_workflow_id is None:
+    if normalized_workflow_id is None and not has_contract_payload:
         agent_doc.pop("agent_workflow_id", None)
         agent_doc.pop("input_contract", None)
         agent_doc.pop("output_contract", None)
         agent_doc.pop("contract_version", None)
     else:
-        agent_doc["agent_workflow_id"] = normalized_workflow_id
+        if normalized_workflow_id is None:
+            agent_doc.pop("agent_workflow_id", None)
+        else:
+            agent_doc["agent_workflow_id"] = normalized_workflow_id
         agent_doc["input_contract"] = store.clone(normalized_input_contract)
         agent_doc["output_contract"] = store.clone(normalized_output_contract)
         agent_doc["contract_version"] = normalized_contract_version
@@ -673,7 +809,7 @@ def _apply_workflow_binding_to_snapshot(
     runtime = next_snapshot.get("runtime")
     if not isinstance(runtime, dict):
         runtime = {}
-    if normalized_workflow_id is None:
+    if normalized_workflow_id is None and not has_contract_payload:
         runtime.pop(WORKFLOW_BINDING_RUNTIME_KEY, None)
     else:
         runtime[WORKFLOW_BINDING_RUNTIME_KEY] = {
@@ -683,6 +819,97 @@ def _apply_workflow_binding_to_snapshot(
             "contract_version": normalized_contract_version,
             "source": source,
         }
+    next_snapshot["runtime"] = runtime
+    next_snapshot["loaded_at"] = _now().isoformat()
+    return next_snapshot
+
+
+def _apply_soul_to_snapshot(
+    snapshot: dict | None,
+    *,
+    agent: dict,
+    soul: str | None,
+    source: str = "manual",
+) -> dict[str, Any]:
+    next_snapshot = store.clone(snapshot) if isinstance(snapshot, dict) else _build_manual_config_snapshot(agent)
+    normalized_soul = _normalize_text(soul) or None
+
+    agent_doc = next_snapshot.get("agent")
+    if not isinstance(agent_doc, dict):
+        agent_doc = {}
+    agent_doc["agent_id"] = str(agent.get("id") or "").strip()
+    agent_doc["name"] = str(agent.get("name") or "").strip()
+    agent_doc["type"] = str(agent.get("type") or DEFAULT_AGENT_TYPE).strip().lower() or DEFAULT_AGENT_TYPE
+    if normalized_soul is None:
+        agent_doc.pop("soul", None)
+    else:
+        agent_doc["soul"] = normalized_soul
+    next_snapshot["agent"] = agent_doc
+
+    if normalized_soul is None:
+        next_snapshot["soul"] = None
+    else:
+        next_snapshot["soul"] = normalized_soul
+
+    files_loaded = next_snapshot.get("files_loaded")
+    normalized_files_loaded = [
+        str(item or "").strip()
+        for item in files_loaded
+        if str(item or "").strip()
+    ] if isinstance(files_loaded, list) else []
+    has_soul_file = "soul.md" in normalized_files_loaded
+    if normalized_soul is not None and not has_soul_file:
+        normalized_files_loaded.append("soul.md")
+    if normalized_soul is None and has_soul_file:
+        normalized_files_loaded = [item for item in normalized_files_loaded if item != "soul.md"]
+    next_snapshot["files_loaded"] = normalized_files_loaded
+
+    runtime = next_snapshot.get("runtime")
+    if not isinstance(runtime, dict):
+        runtime = {}
+    if normalized_soul is None:
+        runtime.pop("soul_binding", None)
+    else:
+        runtime["soul_binding"] = {
+            "source": source,
+        }
+    next_snapshot["runtime"] = runtime
+    next_snapshot["loaded_at"] = _now().isoformat()
+    return next_snapshot
+
+
+def _apply_agent_metadata_to_snapshot(
+    snapshot: dict | None,
+    *,
+    agent: dict,
+    metadata: dict[str, Any] | None,
+    source: str = "manual",
+) -> dict[str, Any]:
+    next_snapshot = store.clone(snapshot) if isinstance(snapshot, dict) else _build_manual_config_snapshot(agent)
+    normalized_metadata = store.clone(metadata) if isinstance(metadata, dict) else {}
+
+    agent_doc = next_snapshot.get("agent")
+    if not isinstance(agent_doc, dict):
+        agent_doc = {}
+    agent_doc["agent_id"] = str(agent.get("id") or "").strip()
+    agent_doc["name"] = str(agent.get("name") or "").strip()
+    agent_doc["type"] = str(agent.get("type") or DEFAULT_AGENT_TYPE).strip().lower() or DEFAULT_AGENT_TYPE
+    if normalized_metadata:
+        agent_doc["metadata"] = normalized_metadata
+    else:
+        agent_doc.pop("metadata", None)
+    next_snapshot["agent"] = agent_doc
+
+    runtime = next_snapshot.get("runtime")
+    if not isinstance(runtime, dict):
+        runtime = {}
+    if normalized_metadata:
+        runtime["agent_metadata"] = {
+            "metadata": normalized_metadata,
+            "source": source,
+        }
+    else:
+        runtime.pop("agent_metadata", None)
     next_snapshot["runtime"] = runtime
     next_snapshot["loaded_at"] = _now().isoformat()
     return next_snapshot
@@ -718,7 +945,13 @@ def _build_agent_config_summary_with_bindings(
     return merged_summary
 
 
-def _normalize_agent_config_payload(payload: dict[str, Any], *, current_agent: dict | None = None) -> dict[str, Any]:
+def _normalize_agent_config_payload(
+    payload: dict[str, Any],
+    *,
+    current_agent: dict | None = None,
+    tenant_id: str | None = None,
+    include_all_tenants: bool = True,
+) -> dict[str, Any]:
     current = current_agent or {}
     name = _normalize_text(payload.get("name", current.get("name")))
     if not name:
@@ -731,6 +964,12 @@ def _normalize_agent_config_payload(payload: dict[str, Any], *, current_agent: d
 
     enabled_value = payload.get("enabled", current.get("enabled", True))
     enabled = bool(enabled_value)
+
+    soul_requested, requested_soul = _payload_value(payload, "soul")
+    if soul_requested:
+        soul = _normalize_text(requested_soul) or None
+    else:
+        soul = _resolve_agent_soul(current)
 
     provider_key = _normalize_text(
         payload.get("provider_key", payload.get("providerKey")),
@@ -758,13 +997,17 @@ def _normalize_agent_config_payload(payload: dict[str, Any], *, current_agent: d
         skill_ids = _normalize_identifier_list(requested_skill_ids)
 
     if skill_ids:
-        resolved_skills = brain_skill_service.resolve_skill_summaries(skill_ids)
+        resolved_skills = brain_skill_service.resolve_skill_summaries(
+            skill_ids,
+            tenant_id=tenant_id,
+            include_all_tenants=include_all_tenants,
+        )
         resolved_skill_ids = {str(item.get("id") or "") for item in resolved_skills}
         missing_skill_ids = [skill_id for skill_id in skill_ids if skill_id not in resolved_skill_ids]
         if missing_skill_ids:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"以下 Skill 不存在：{', '.join(missing_skill_ids)}",
+                detail=f"以下 Skill 不存在或当前租户不可绑定：{', '.join(missing_skill_ids)}",
             )
 
     requested_tool_ids = payload.get("tool_ids", payload.get("toolIds"))
@@ -772,7 +1015,11 @@ def _normalize_agent_config_payload(payload: dict[str, Any], *, current_agent: d
         tool_ids = _resolve_agent_tool_binding(current)
     else:
         tool_ids = _normalize_identifier_list(requested_tool_ids)
-    tool_ids = _validate_tool_ids(tool_ids)
+    tool_ids = _validate_tool_ids(
+        tool_ids,
+        tenant_id=tenant_id,
+        include_all_tenants=include_all_tenants,
+    )
 
     current_workflow_binding = _resolve_agent_workflow_binding(current) or {}
     current_agent_workflow_id = _normalize_text(current_workflow_binding.get("agent_workflow_id")) or None
@@ -838,29 +1085,26 @@ def _normalize_agent_config_payload(payload: dict[str, Any], *, current_agent: d
         if contract_version is None and agent_workflow_id and current_agent_workflow_id is None:
             contract_version = DEFAULT_AGENT_WORKFLOW_CONTRACT_VERSION
 
-    if agent_workflow_id is None:
-        input_contract = {}
-        output_contract = {}
-        contract_version = None
-
     if agent_workflow_id and not _workflow_exists(agent_workflow_id):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"agent_workflow_id 不存在：{agent_workflow_id}",
         )
 
-    current_enabled = bool(current.get("enabled", False))
-    if enabled and agent_workflow_id is None and not current_enabled:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="启用 Agent 前必须绑定 agent_workflow_id",
-        )
+    metadata_value = payload.get("metadata")
+    if isinstance(metadata_value, dict):
+        metadata = store.clone(metadata_value)
+    elif current:
+        metadata = _runtime_agent_metadata(current.get("config_snapshot")) or {}
+    else:
+        metadata = {}
 
     return {
         "name": name,
         "description": description,
         "type": agent_type,
         "enabled": enabled,
+        "soul": soul,
         "provider_key": provider_key,
         "provider_label": enabled_models[provider_key]["provider_label"],
         "model": model,
@@ -870,6 +1114,7 @@ def _normalize_agent_config_payload(payload: dict[str, Any], *, current_agent: d
         "input_contract": input_contract,
         "output_contract": output_contract,
         "contract_version": contract_version,
+        "metadata": metadata,
     }
 
 
@@ -900,6 +1145,21 @@ def _runtime_priority(status_text: str) -> int:
         "degraded": 1,
         "offline": 0,
     }.get(status_text, 0)
+
+
+def _is_task_child_agent(agent_payload: dict[str, Any] | None) -> bool:
+    if not isinstance(agent_payload, dict):
+        return False
+    snapshot = agent_payload.get("config_snapshot")
+    metadata = _runtime_agent_metadata(snapshot if isinstance(snapshot, dict) else None) or {}
+    if not metadata and isinstance(agent_payload.get("metadata"), dict):
+        metadata = store.clone(agent_payload.get("metadata"))
+    source = _normalize_text(metadata.get("source"), lowercase=True)
+    if source == "requirement_dispatch_agent":
+        return True
+    task_id = _normalize_text(metadata.get("task_id") or metadata.get("taskId"))
+    group_id = _normalize_text(metadata.get("group_id") or metadata.get("groupId"))
+    return bool(task_id and group_id)
 
 
 def _build_runtime_view(agent: dict, *, now: datetime | None = None) -> dict:
@@ -997,12 +1257,26 @@ def _decorate_agent(agent_payload: dict, *, include_snapshot: bool = True) -> di
                 existing_summary=cached_agent.get("config_summary"),
             )
     payload["bound_tool_ids"] = _resolve_agent_tool_binding(payload)
-    payload["bound_tools"] = _resolve_bound_tools(payload["bound_tool_ids"])
+    payload["bound_tools"], missing_bound_tool_ids = _resolve_bound_tools_safe(payload["bound_tool_ids"])
+    payload["soul"] = _resolve_agent_soul(payload)
     payload["config_summary"] = _build_agent_config_summary_with_bindings(
         snapshot,
         bound_tool_ids=payload["bound_tool_ids"],
         existing_summary=payload.get("config_summary"),
     )
+    if missing_bound_tool_ids:
+        config_summary = payload["config_summary"] if isinstance(payload.get("config_summary"), dict) else {}
+        existing_warnings = config_summary.get("warnings")
+        warnings = [
+            str(item or "").strip()
+            for item in existing_warnings
+            if str(item or "").strip()
+        ] if isinstance(existing_warnings, list) else []
+        missing_tools_warning = _format_missing_tool_binding_warning(missing_bound_tool_ids)
+        if missing_tools_warning and missing_tools_warning not in warnings:
+            warnings.append(missing_tools_warning)
+        config_summary["warnings"] = warnings
+        payload["config_summary"] = config_summary
     payload.update(_build_runtime_view(payload))
     payload["model_binding"] = _resolve_agent_model_binding(payload)
     payload["bound_skill_ids"] = _resolve_agent_skill_binding(payload)
@@ -1020,6 +1294,7 @@ def _decorate_agent(agent_payload: dict, *, include_snapshot: bool = True) -> di
         else {}
     )
     payload["contract_version"] = _normalize_text(workflow_binding.get("contract_version")) or None
+    payload["metadata"] = _runtime_agent_metadata(snapshot) or {}
     payload["delete_blocked_reason"] = _delete_blocked_reason(str(payload.get("id") or "").strip())
     payload["deletable"] = payload["delete_blocked_reason"] is None
     if not include_snapshot:
@@ -1049,18 +1324,10 @@ def _find_agent_mutable(agent_id: str) -> dict:
     database_agent, database_authoritative = _load_database_agent(agent_id)
     if database_authoritative:
         if database_agent is None:
-            projection = None
-            if getattr(persistence_service, "enabled", False):
-                projection = get_mandatory_agent_projection(
-                    agent_id,
-                    existing=_find_cached_agent(agent_id),
-                )
-            if projection is None:
-                external_agent = external_agent_registry_service.get_agent(agent_id)
-                if external_agent is not None:
-                    return _sync_cached_agent(external_agent)
-                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent not found")
-            return _sync_cached_agent(projection)
+            external_agent = external_agent_registry_service.get_agent(agent_id)
+            if external_agent is not None:
+                return _sync_cached_agent(redact_external_agent_payload(external_agent))
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent not found")
         return _sync_cached_agent(database_agent)
 
     cached_agent = _find_cached_agent(agent_id)
@@ -1069,7 +1336,7 @@ def _find_agent_mutable(agent_id: str) -> dict:
 
     external_agent = external_agent_registry_service.get_agent(agent_id)
     if external_agent is not None:
-        return _sync_cached_agent(external_agent)
+        return _sync_cached_agent(redact_external_agent_payload(external_agent))
 
     raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent not found")
 
@@ -1096,9 +1363,11 @@ def _delete_blocked_reason(agent_id: str) -> str | None:
     return None
 
 
-def list_agents() -> dict:
+def list_agents(*, include_task_child_agents: bool = False) -> dict:
     items = []
     for agent in _load_agents():
+        if not include_task_child_agents and _is_task_child_agent(agent):
+            continue
         items.append(_decorate_agent(agent, include_snapshot=False))
     return {"items": items, "total": len(items)}
 
@@ -1110,25 +1379,25 @@ def get_agent(agent_id: str) -> dict:
     database_agent, database_authoritative = _load_database_agent(agent_id)
     if database_authoritative:
         if database_agent is None:
-            projection = None
-            if getattr(persistence_service, "enabled", False):
-                projection = get_mandatory_agent_projection(
-                    agent_id,
-                    existing=_find_cached_agent(agent_id),
-                )
-            if projection is None:
-                external_agent = external_agent_registry_service.get_agent(agent_id)
-                if external_agent is not None:
-                    return _decorate_agent(_sync_cached_agent(external_agent))
-                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent not found")
-            return _decorate_agent(_sync_cached_agent(projection))
+            external_agent = external_agent_registry_service.get_agent(agent_id)
+            if external_agent is not None:
+                return _decorate_agent(_sync_cached_agent(redact_external_agent_payload(external_agent)))
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent not found")
+        if _should_refresh_from_external_registry(database_agent):
+            external_agent = external_agent_registry_service.get_agent(agent_id)
+            if external_agent is not None:
+                return _decorate_agent(_sync_cached_agent(redact_external_agent_payload(external_agent)))
         return _decorate_agent(database_agent)
     cached_agent = _find_cached_agent(agent_id)
     if cached_agent is not None:
+        if _should_refresh_from_external_registry(cached_agent):
+            external_agent = external_agent_registry_service.get_agent(agent_id)
+            if external_agent is not None:
+                return _decorate_agent(_sync_cached_agent(redact_external_agent_payload(external_agent)))
         return _decorate_agent(cached_agent)
     external_agent = external_agent_registry_service.get_agent(agent_id)
     if external_agent is not None:
-        return _decorate_agent(_sync_cached_agent(external_agent))
+        return _decorate_agent(_sync_cached_agent(redact_external_agent_payload(external_agent)))
     raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent not found")
 
 
@@ -1136,12 +1405,9 @@ def delete_agent(agent_id: str) -> dict[str, Any]:
     normalized_agent_id = _normalize_text(agent_id)
     if not normalized_agent_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent not found")
-    is_mandatory_agent = is_mandatory_agent_id(normalized_agent_id)
 
     external_agent = external_agent_registry_service.get_agent(normalized_agent_id)
     if external_agent is not None:
-        if is_mandatory_agent and not suppress_mandatory_agent(normalized_agent_id):
-            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Agent 删除后持久化失败")
         deleted_external = external_agent_registry_service.delete_agent(normalized_agent_id)
         store.agents = [
             item for item in store.agents if str(item.get("id") or "").strip() != normalized_agent_id
@@ -1157,8 +1423,6 @@ def delete_agent(agent_id: str) -> dict[str, Any]:
         }
 
     agent = _find_agent_mutable(normalized_agent_id)
-    if is_mandatory_agent and not suppress_mandatory_agent(normalized_agent_id):
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Agent 删除后持久化失败")
     store.agents = [
         item for item in store.agents if str(item.get("id") or "").strip() != normalized_agent_id
     ]
@@ -1223,6 +1487,7 @@ def reload_agent(agent_id: str) -> dict:
     existing_skill_binding = _runtime_skill_binding(existing_snapshot if isinstance(existing_snapshot, dict) else None)
     existing_tool_binding = _runtime_tool_binding(existing_snapshot if isinstance(existing_snapshot, dict) else None)
     existing_workflow_binding = _runtime_workflow_binding(existing_snapshot if isinstance(existing_snapshot, dict) else None)
+    existing_metadata = _runtime_agent_metadata(existing_snapshot if isinstance(existing_snapshot, dict) else None)
     runtime_snapshot = _runtime_snapshot(agent)
     config_snapshot = agent_config_service.load_agent_config(agent)
     if runtime_snapshot:
@@ -1258,6 +1523,12 @@ def reload_agent(agent_id: str) -> dict:
             output_contract=store.clone(existing_workflow_binding.get("output_contract") or {}),
             contract_version=_normalize_text(existing_workflow_binding.get("contract_version")) or None,
             source=str(existing_workflow_binding.get("source") or "manual"),
+        )
+    if existing_metadata is not None:
+        config_snapshot = _apply_agent_metadata_to_snapshot(
+            config_snapshot,
+            agent=agent,
+            metadata=existing_metadata,
         )
     agent["config_snapshot"] = config_snapshot
     agent["config_summary"] = _build_agent_config_summary_with_bindings(
@@ -1281,6 +1552,7 @@ def refresh_agent_config_snapshot(agent_id: str) -> dict:
     existing_skill_binding = _runtime_skill_binding(existing_snapshot if isinstance(existing_snapshot, dict) else None)
     existing_tool_binding = _runtime_tool_binding(existing_snapshot if isinstance(existing_snapshot, dict) else None)
     existing_workflow_binding = _runtime_workflow_binding(existing_snapshot if isinstance(existing_snapshot, dict) else None)
+    existing_metadata = _runtime_agent_metadata(existing_snapshot if isinstance(existing_snapshot, dict) else None)
     runtime_snapshot = _runtime_snapshot(agent)
     config_snapshot = agent_config_service.load_agent_config(agent)
     if runtime_snapshot:
@@ -1317,6 +1589,12 @@ def refresh_agent_config_snapshot(agent_id: str) -> dict:
             contract_version=_normalize_text(existing_workflow_binding.get("contract_version")) or None,
             source=str(existing_workflow_binding.get("source") or "manual"),
         )
+    if existing_metadata is not None:
+        config_snapshot = _apply_agent_metadata_to_snapshot(
+            config_snapshot,
+            agent=agent,
+            metadata=existing_metadata,
+        )
     agent["config_snapshot"] = config_snapshot
     agent["config_summary"] = _build_agent_config_summary_with_bindings(
         config_snapshot,
@@ -1326,8 +1604,17 @@ def refresh_agent_config_snapshot(agent_id: str) -> dict:
     return _decorate_agent(agent)
 
 
-def create_agent(payload: dict[str, Any]) -> dict[str, Any]:
-    normalized = _normalize_agent_config_payload(payload)
+def create_agent(
+    payload: dict[str, Any],
+    *,
+    tenant_id: str | None = None,
+    include_all_tenants: bool = True,
+) -> dict[str, Any]:
+    normalized = _normalize_agent_config_payload(
+        payload,
+        tenant_id=tenant_id,
+        include_all_tenants=include_all_tenants,
+    )
     agent_id = _generate_agent_id(normalized["name"], normalized["type"])
     agent = {
         "id": agent_id,
@@ -1360,6 +1647,11 @@ def create_agent(payload: dict[str, Any]) -> dict[str, Any]:
         agent=agent,
         tool_ids=normalized["tool_ids"],
     )
+    agent["config_snapshot"] = _apply_soul_to_snapshot(
+        agent["config_snapshot"],
+        agent=agent,
+        soul=normalized["soul"],
+    )
     agent["config_snapshot"] = _apply_workflow_binding_to_snapshot(
         agent["config_snapshot"],
         agent=agent,
@@ -1367,6 +1659,11 @@ def create_agent(payload: dict[str, Any]) -> dict[str, Any]:
         input_contract=normalized["input_contract"],
         output_contract=normalized["output_contract"],
         contract_version=normalized["contract_version"],
+    )
+    agent["config_snapshot"] = _apply_agent_metadata_to_snapshot(
+        agent["config_snapshot"],
+        agent=agent,
+        metadata=normalized["metadata"],
     )
     agent["config_summary"] = _build_agent_config_summary_with_bindings(
         agent["config_snapshot"],
@@ -1381,9 +1678,20 @@ def create_agent(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def update_agent_config(agent_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+def update_agent_config(
+    agent_id: str,
+    payload: dict[str, Any],
+    *,
+    tenant_id: str | None = None,
+    include_all_tenants: bool = True,
+) -> dict[str, Any]:
     agent = _find_agent_mutable(agent_id)
-    normalized = _normalize_agent_config_payload(payload, current_agent=agent)
+    normalized = _normalize_agent_config_payload(
+        payload,
+        current_agent=agent,
+        tenant_id=tenant_id,
+        include_all_tenants=include_all_tenants,
+    )
     agent["name"] = normalized["name"]
     agent["description"] = normalized["description"]
     agent["type"] = normalized["type"]
@@ -1409,6 +1717,11 @@ def update_agent_config(agent_id: str, payload: dict[str, Any]) -> dict[str, Any
         agent=agent,
         tool_ids=normalized["tool_ids"],
     )
+    updated_snapshot = _apply_soul_to_snapshot(
+        updated_snapshot,
+        agent=agent,
+        soul=normalized["soul"],
+    )
     updated_snapshot = _apply_workflow_binding_to_snapshot(
         updated_snapshot,
         agent=agent,
@@ -1416,6 +1729,11 @@ def update_agent_config(agent_id: str, payload: dict[str, Any]) -> dict[str, Any
         input_contract=normalized["input_contract"],
         output_contract=normalized["output_contract"],
         contract_version=normalized["contract_version"],
+    )
+    updated_snapshot = _apply_agent_metadata_to_snapshot(
+        updated_snapshot,
+        agent=agent,
+        metadata=normalized["metadata"],
     )
     agent["config_snapshot"] = updated_snapshot
     agent["config_summary"] = _build_agent_config_summary_with_bindings(

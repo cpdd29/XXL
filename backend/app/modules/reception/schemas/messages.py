@@ -77,6 +77,12 @@ class TelegramMessage(APIModel):
     message_id: int
     date: int
     text: str | None = None
+    caption: str | None = None
+    photo: list[dict[str, Any]] = Field(default_factory=list)
+    document: dict[str, Any] | None = None
+    voice: dict[str, Any] | None = None
+    audio: dict[str, Any] | None = None
+    video: dict[str, Any] | None = None
     from_: TelegramFrom = Field(alias="from")
     chat: TelegramChat
 
@@ -174,6 +180,30 @@ class MessageBrainDispatchSummary(APIModel):
     state_label: str | None = None
 
 
+class HermesProtocolWritebackStatus(APIModel):
+    scope: str
+    memory_type: str
+    subject_id: str | None = None
+    title: str | None = None
+    summary: str
+    applied: bool = False
+    memory_id: str | None = None
+    error: str | None = None
+
+
+class HermesProtocolSummary(APIModel):
+    request_id: str | None = None
+    binding_id: str | None = None
+    protocol_mode: str | None = None
+    interaction_mode: str | None = None
+    task_signal: str | None = None
+    safety_signal: str | None = None
+    confidence: float | None = None
+    requirement_payload: dict[str, Any] | None = None
+    memory_writeback: list[HermesProtocolWritebackStatus] = Field(default_factory=list)
+    attachments: list[dict[str, Any]] = Field(default_factory=list)
+
+
 class IngestMessageResponse(APIModel):
     ok: bool
     message: str
@@ -192,3 +222,4 @@ class IngestMessageResponse(APIModel):
     route_decision: MessageRouteDecision | None = None
     manager_summary: MessageManagerSummary | None = None
     brain_dispatch_summary: MessageBrainDispatchSummary | None = None
+    hermes_protocol: HermesProtocolSummary | None = None

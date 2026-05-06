@@ -11,8 +11,10 @@ import type {
   UpdateUserProfileRequest,
   UserActionResponse,
   UserActivityResponse,
+  UserDeleteActionResponse,
   UserPortraitListResponse,
   UserProfile,
+  UserTenantServiceRegistrationCodeActionResponse,
   UserTenantActionResponse,
   UserTenantOptionsResponse,
 } from '@/shared/types'
@@ -132,6 +134,23 @@ export function useDeleteUserTenant() {
   })
 }
 
+export function useGenerateTenantServiceRegistrationCode() {
+  const queryClient = useQueryClient()
+
+  return useMutation<UserTenantServiceRegistrationCodeActionResponse, Error, { tenantId: string }>({
+    mutationFn: ({ tenantId }) =>
+      apiRequest<UserTenantServiceRegistrationCodeActionResponse>(
+        `/api/profiles/tenants/${encodeURIComponent(tenantId)}/service-registration-code`,
+        {
+          method: 'POST',
+        },
+      ),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.users.tenants })
+    },
+  })
+}
+
 export function useUsers(params?: UseUsersParams) {
   return useQuery<UserPortraitListResponse>({
     queryKey: [
@@ -190,6 +209,23 @@ export function useUpdateUserProfile() {
       queryClient.invalidateQueries({ queryKey: queryKeys.users.profile(variables.userId) })
       queryClient.invalidateQueries({ queryKey: queryKeys.users.activity(variables.userId) })
       queryClient.invalidateQueries({ queryKey: queryKeys.users.tenants })
+    },
+  })
+}
+
+export function useDeleteUserProfile() {
+  const queryClient = useQueryClient()
+
+  return useMutation<UserDeleteActionResponse, Error, { userId: string }>({
+    mutationFn: ({ userId }) =>
+      apiRequest<UserDeleteActionResponse>(`/api/profiles/${encodeURIComponent(userId)}`, {
+        method: 'DELETE',
+      }),
+    onSuccess: (_, variables) => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.users.list })
+      queryClient.invalidateQueries({ queryKey: queryKeys.users.tenants })
+      queryClient.removeQueries({ queryKey: queryKeys.users.profile(variables.userId) })
+      queryClient.removeQueries({ queryKey: queryKeys.users.activity(variables.userId) })
     },
   })
 }

@@ -12,8 +12,6 @@ from urllib.parse import urlsplit
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import delete
-
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
 
@@ -21,7 +19,6 @@ if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
 
 from app.config import get_settings
-from app.db.models import SecuritySubjectStateRecord
 from app.platform.messaging.nats_event_bus import reset_nats_event_bus_state
 from app.modules.dispatch.single_agent_runtime.agent_execution_worker_service import agent_execution_worker_service
 from app.modules.dispatch.workflow_runtime.internal_event_delivery_poller_service import (
@@ -48,6 +45,21 @@ from app.modules.dispatch.workflow_runtime.workflow_scheduler_service import res
 from app.modules.dispatch.workflow_runtime.workflow_execution_worker_service import workflow_execution_worker_service
 from app.modules.reception.security_monitor.webhook_guard_service import reset_webhook_guard_state
 from app.modules.dispatch.workflow_runtime.workflow_service import reset_internal_event_delivery_state
+
+
+def _build_clean_runtime_snapshot(snapshot: dict[str, object]) -> dict[str, object]:
+    cleaned = deepcopy(snapshot)
+    for key, replacement in (
+        ("tasks", []),
+        ("task_steps", {}),
+        ("workflow_runs", []),
+        ("operational_logs", []),
+        ("audit_logs", []),
+        ("user_profiles", {}),
+    ):
+        if key in cleaned:
+            cleaned[key] = deepcopy(replacement)
+    return cleaned
 
 
 def _base64url_encode(value: bytes) -> str:
@@ -105,19 +117,14 @@ def _should_inject_auth(path: str, headers: dict[str, str]) -> bool:
 
 
 def _reset_persistence_state() -> None:
-    if not persistence_service.enabled:
+    if not persistence_service.enabled and not persistence_service.initialize():
         return
-    session_factory = getattr(persistence_service, "_session_factory", None)
-    if session_factory is None:
-        return
-    with session_factory() as session:
-        session.execute(delete(SecuritySubjectStateRecord))
-        session.commit()
+    persistence_service.reset_database()
 
 
 @pytest.fixture(autouse=True)
 def reset_runtime_state() -> None:
-    snapshot = deepcopy(store.__dict__)
+    snapshot = _build_clean_runtime_snapshot(store.__dict__)
 
     def _restore_runtime(*, start_background_runtime: bool) -> None:
         agent_execution_worker_service.stop()
@@ -137,6 +144,8 @@ def reset_runtime_state() -> None:
         reset_security_gateway_state()
         reset_webhook_guard_state()
         _reset_persistence_state()
+        store.__dict__.clear()
+        store.__dict__.update(deepcopy(snapshot))
 
         if start_background_runtime:
             workflow_execution_worker_service.start()
@@ -146,13 +155,11 @@ def reset_runtime_state() -> None:
 
     _restore_runtime(start_background_runtime=True)
     yield
-    store.__dict__.clear()
-    store.__dict__.update(deepcopy(snapshot))
     _restore_runtime(start_background_runtime=False)
 
 
 @pytest.fixture
-def access_token_factory():
+def access_token_factory(reset_runtime_state):
     def factory(
         *,
         role: str = "admin",
@@ -163,18 +170,18 @@ def access_token_factory():
         settings = get_settings()
         resolved_user_id = user_id or f"test-{role}-user"
         resolved_email = email or f"{resolved_user_id}@example.test"
-        _upsert_runtime_user(
-            {
-                "id": resolved_user_id,
-                "name": f"Test {role.title()}",
-                "email": resolved_email,
-                "role": role,
-                "status": status,
-                "last_login": "",
-                "total_interactions": 0,
-                "created_at": "2026-04-04",
-            }
-        )
+        user_payload = {
+            "id": resolved_user_id,
+            "name": f"Test {role.title()}",
+            "email": resolved_email,
+            "role": role,
+            "status": status,
+            "last_login": "",
+            "total_interactions": 0,
+            "created_at": "2026-04-04",
+        }
+        _upsert_runtime_user(user_payload)
+        persistence_service.persist_user_state(user=user_payload)
         now = int(datetime.now(UTC).timestamp())
         return _encode_jwt(
             {

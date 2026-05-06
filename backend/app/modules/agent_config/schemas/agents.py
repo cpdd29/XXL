@@ -20,6 +20,8 @@ class AgentBoundSkill(APIModel):
     description: str | None = None
     tags: list[str] = Field(default_factory=list)
     capabilities: list[str] = Field(default_factory=list)
+    scope: str = "shared"
+    owner_tenant_id: str | None = None
 
 
 class AgentBoundTool(APIModel):
@@ -28,6 +30,8 @@ class AgentBoundTool(APIModel):
     type: str
     description: str | None = None
     source: str | None = None
+    scope: str = "shared"
+    owner_tenant_id: str | None = None
 
 
 class Agent(APIModel):
@@ -54,11 +58,13 @@ class Agent(APIModel):
     runtime_metrics: dict[str, Any] = Field(default_factory=dict)
     config_summary: dict[str, Any] | None = None
     config_snapshot: dict[str, Any] | None = None
+    soul: str | None = None
     model_binding: AgentModelBinding | None = None
     bound_skill_ids: list[str] = Field(default_factory=list)
     bound_skills: list[AgentBoundSkill] = Field(default_factory=list)
     bound_tool_ids: list[str] = Field(default_factory=list)
     bound_tools: list[AgentBoundTool] = Field(default_factory=list)
+    metadata: dict[str, Any] = Field(default_factory=dict)
     agent_workflow_id: str | None = None
     input_contract: dict[str, Any] = Field(default_factory=dict)
     output_contract: dict[str, Any] = Field(default_factory=dict)
@@ -103,6 +109,7 @@ class AgentConfigRequest(APIModel):
     description: str = ""
     type: str = "default"
     enabled: bool = True
+    soul: str | None = None
     provider_key: str | None = None
     model: str | None = None
     skill_ids: list[str] = Field(default_factory=list)
@@ -111,6 +118,7 @@ class AgentConfigRequest(APIModel):
     input_contract: dict[str, Any] | None = None
     output_contract: dict[str, Any] | None = None
     contract_version: str | None = None
+    metadata: dict[str, Any] | None = None
 
     def model_dump(self, *args, **kwargs) -> dict[str, Any]:
         dumped = super().model_dump(*args, **kwargs)
@@ -123,6 +131,8 @@ class AgentConfigRequest(APIModel):
             "input_contract",
             "output_contract",
             "contract_version",
+            "metadata",
+            "soul",
         ):
             if field_name not in self.model_fields_set:
                 continue
@@ -131,6 +141,29 @@ class AgentConfigRequest(APIModel):
             field_info = self.__class__.model_fields[field_name]
             dumped[field_info.alias if by_alias and field_info.alias else field_name] = None
         return dumped
+
+
+class ExternalAgentCreateRequest(APIModel):
+    id: str
+    name: str
+    description: str | None = None
+    base_url: str
+    enabled: bool = True
+    type: str = "write"
+    agent_family: str | None = None
+    version: str = "1.0.0"
+    protocol: str = "http"
+    invoke_path: str = "/v1/chat/completions"
+    health_path: str = "/health"
+    method: str = "POST"
+    release_channel: str = "stable"
+    remote_model: str | None = None
+    api_key: str | None = None
+    heartbeat_interval_seconds: int | None = None
+    heartbeat_timeout_seconds: int | None = None
+    capabilities: list[str] = Field(default_factory=list)
+    compatibility: list[str] = Field(default_factory=list)
+    tags: list[str] = Field(default_factory=list)
 
 
 class BrainSkillItem(APIModel):
@@ -143,6 +176,8 @@ class BrainSkillItem(APIModel):
     tags: list[str] = Field(default_factory=list)
     capabilities: list[str] = Field(default_factory=list)
     uploaded_at: str | None = None
+    scope: str = "shared"
+    owner_tenant_id: str | None = None
 
 
 class BrainSkillListResponse(APIModel):
@@ -153,6 +188,13 @@ class BrainSkillListResponse(APIModel):
 class BrainSkillUploadRequest(APIModel):
     file_name: str
     content: str
+    scope: str = "shared"
+    owner_tenant_id: str | None = None
+
+
+class BrainSkillScopeUpdateRequest(APIModel):
+    scope: str = "shared"
+    owner_tenant_id: str | None = None
 
 
 class BrainSkillActionResponse(APIModel):

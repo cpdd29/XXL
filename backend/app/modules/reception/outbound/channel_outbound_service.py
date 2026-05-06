@@ -7,7 +7,7 @@ from uuid import uuid4
 from app.modules.reception.channel_ingress.dingtalk import encode_dingtalk_delivery_target
 from app.modules.reception.channel_ingress.base import ChannelAdapter
 from app.modules.reception.channel_ingress.registry import channel_adapter_registry
-from app.modules.reception.schemas.messages import ChannelType, channel_display_name, normalize_channel_type
+from app.modules.reception.schemas.messages import ChannelType, UnifiedMessage, channel_display_name, normalize_channel_type
 from app.platform.observability.operational_log_service import append_realtime_event
 from app.platform.persistence.persistence_service import persistence_service
 from app.platform.config.settings_service import get_channel_integration_runtime_settings
@@ -153,6 +153,33 @@ class ChannelOutboundService:
             channel=channel,
             text=self.render_task_failure_text(task, error_message),
             run=run,
+        )
+
+    def deliver_reception_reply(
+        self,
+        *,
+        message: UnifiedMessage,
+        text: str,
+        trace_id: str | None = None,
+        channel_delivery_binding: dict | None = None,
+    ) -> dict[str, str]:
+        pseudo_task = {
+            "id": f"reception:{message.message_id}",
+            "channel": message.channel.value,
+            "session_id": str(message.session_id or "").strip() or f"{message.channel.value}:{message.chat_id}",
+            "user_key": str(message.user_key or "").strip() or None,
+            "trace_id": trace_id,
+        }
+        pseudo_run = {
+            "dispatch_context": {
+                "channel_delivery": dict(channel_delivery_binding or {}),
+            }
+        } if isinstance(channel_delivery_binding, dict) and channel_delivery_binding else None
+        return self._deliver_channel_message(
+            pseudo_task,
+            channel=message.channel.value,
+            text=self._truncate_text(text),
+            run=pseudo_run,
         )
 
     def _deliver_channel_message(

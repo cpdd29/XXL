@@ -7,6 +7,7 @@ from fastapi import HTTPException, status
 from app.modules.agent_config.registries.agent_service import get_agent, list_agents
 from app.platform.persistence.persistence_service import persistence_service
 from app.modules.reception.security_monitor.security_gateway_service import security_gateway_service
+from app.platform.observability.audit_log_presenter import present_audit_log
 from app.platform.persistence.runtime_store import store
 
 
@@ -255,8 +256,9 @@ def _incident_rule_label(log: dict) -> str | None:
 
 def _build_recent_incident(log: dict) -> dict:
     layer_key = _incident_layer_key(log)
+    presented = present_audit_log(log)
     return {
-        **store.clone(log),
+        **store.clone(presented),
         "layer": SECURITY_LAYER_LABELS.get(layer_key, layer_key),
         "verdict": _incident_verdict(log),
         "rule_label": _incident_rule_label(log),

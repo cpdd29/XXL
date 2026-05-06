@@ -7,6 +7,7 @@ import type {
   BrainSkillActionResponse,
   BrainSkillDeleteResponse,
   BrainSkillListResponse,
+  BrainSkillScopeUpdateRequest,
   BrainSkillUploadRequest,
 } from '@/shared/types'
 
@@ -38,6 +39,31 @@ export function useUploadBrainSkill() {
 }
 
 export const useCreateBrainSkill = useUploadBrainSkill
+
+export function useUpdateBrainSkillScope() {
+  const queryClient = useQueryClient()
+
+  return useMutation({
+    mutationFn: ({
+      skillId,
+      payload,
+    }: {
+      skillId: string
+      payload: BrainSkillScopeUpdateRequest
+    }) =>
+      apiRequest<BrainSkillActionResponse, BrainSkillScopeUpdateRequest>(
+        `/api/agents/brain-skills/${encodeURIComponent(skillId)}/scope`,
+        {
+          method: 'PUT',
+          body: payload,
+        },
+      ),
+    onSuccess: () => {
+      invalidateBrainSkillQueries(queryClient)
+      queryClient.invalidateQueries({ queryKey: ['tools'] })
+    },
+  })
+}
 
 export function useDeleteBrainSkill() {
   const queryClient = useQueryClient()

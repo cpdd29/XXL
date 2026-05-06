@@ -1,7 +1,7 @@
 "use client"
 
 import type { ReactNode } from "react"
-import { useMemo } from "react"
+import { useEffect, useMemo, useState } from "react"
 import Link from "next/link"
 import { Badge } from "@/shared/ui/badge"
 import { Button } from "@/shared/ui/button"
@@ -9,7 +9,41 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/shared/ui/card"
 import { useDashboardStats } from "@/modules/workbench/hooks/use-dashboard"
 import { useExternalCapabilityGovernanceOverview } from "@/modules/capability/hooks/use-external-connections"
 import { useTasks } from "@/modules/dispatch/hooks/use-tasks"
-import { ArrowRight, Clock3, Headphones, Shield, Wrench } from "lucide-react"
+import { buildAuthenticatedWebSocketUrl } from "@/platform/api/auth-storage"
+import { WS_BASE_URL } from "@/platform/api/config"
+import type { DashboardStatsResponse } from "@/shared/types"
+import { ArrowRight, Clock3, Headphones, Shield, Wifi, WifiOff, Wrench } from "lucide-react"
+
+type LiveConnectionState = "connecting" | "connected" | "disconnected" | "error"
+
+function liveConnectionMeta(state: LiveConnectionState) {
+  if (state === "connected") {
+    return {
+      label: "总控实时已连接",
+      tone: "bg-success/10 text-success",
+      icon: <Wifi className="size-3.5" />,
+    }
+  }
+  if (state === "connecting") {
+    return {
+      label: "总控实时连接中",
+      tone: "bg-warning/10 text-warning-foreground",
+      icon: <Wifi className="size-3.5" />,
+    }
+  }
+  if (state === "error") {
+    return {
+      label: "总控实时异常",
+      tone: "bg-destructive/10 text-destructive",
+      icon: <WifiOff className="size-3.5" />,
+    }
+  }
+  return {
+    label: "总控实时未连接",
+    tone: "bg-muted text-muted-foreground",
+    icon: <WifiOff className="size-3.5" />,
+  }
+}
 
 function formatTimestamp(value?: string | null) {
   if (!value) return "--"
@@ -36,6 +70,20 @@ function formatExternalStatus(status?: string | null, circuitState?: string | nu
   if (normalized === "offline") return "离线"
   if (normalized === "unknown") return "未知"
   return status || "--"
+}
+
+function auditStatusMeta(status?: string | null) {
+  const normalized = String(status || "").trim().toLowerCase()
+  if (normalized === "success") {
+    return { label: "成功", tone: "bg-success/10 text-success" }
+  }
+  if (normalized === "warning") {
+    return { label: "告警", tone: "bg-warning/10 text-warning-foreground" }
+  }
+  if (normalized === "error") {
+    return { label: "异常", tone: "bg-destructive/10 text-destructive" }
+  }
+  return { label: "未知", tone: "bg-muted text-muted-foreground" }
 }
 
 function externalRiskScore(item: {
@@ -160,15 +208,19 @@ function SummaryPill({
 }
 
 export default function DashboardPage() {
-  const dashboardQuery = useDashboardStats()
-  const runningTasksQuery = useTasks({ status: "running" })
+  const [liveData, setLiveData] = useState<DashboardStatsResponse | null>(null)
+  const [liveState, setLiveState] = useState<LiveConnectionState>("connecting")
+  const pollingFallbackEnabled = liveState !== "connected"
+  const dashboardQuery = useDashboardStats({ live: pollingFallbackEnabled })
+  const runningTasksQuery = useTasks({ status: "running" }, { live: true })
   const externalGovernanceQuery = useExternalCapabilityGovernanceOverview(8)
 
-  const data = dashboardQuery.data
+  const data = liveData ?? dashboardQuery.data
   const managerQueue = data?.managerQueue ?? []
   const replyQueue = data?.replyQueue ?? []
   const healthSignals = data?.healthSignals ?? []
   const tentacleMetrics = useMemo(() => data?.tentacleMetrics ?? [], [data?.tentacleMetrics])
+  const liveMeta = liveConnectionMeta(liveState)
 
   const runningTasks = useMemo(
     () =>
@@ -203,6 +255,7 @@ export default function DashboardPage() {
         .slice(0, 4),
     [externalItems],
   )
+  const recentAudits = useMemo(() => externalGovernanceQuery.data?.recentAudits ?? [], [externalGovernanceQuery.data?.recentAudits])
 
   const externalProblemCount = useMemo(
     () => externalItems.filter((item) => externalRiskScore(item) > 0).length,
@@ -223,15 +276,89 @@ export default function DashboardPage() {
   const dashboardError = dashboardQuery.error
   const externalError = externalGovernanceQuery.error
 
+  useEffect(() => {
+    let cancelled = false
+    let socket: WebSocket | null = null
+    let retryTimer: ReturnType<typeof setTimeout> | null = null
+
+    const connect = () => {
+      const wsUrl = buildAuthenticatedWebSocketUrl("/api/dashboard/realtime", WS_BASE_URL)
+      if (!wsUrl) {
+        setLiveState("error")
+        return
+      }
+
+      setLiveState("connecting")
+      socket = new WebSocket(wsUrl)
+
+      socket.onopen = () => {
+        if (!cancelled) {
+          setLiveState("connected")
+        }
+      }
+
+      socket.onmessage = (event) => {
+        if (cancelled) return
+        try {
+          setLiveData(JSON.parse(event.data) as DashboardStatsResponse)
+          setLiveState("connected")
+        } catch {
+          setLiveState("error")
+        }
+      }
+
+      socket.onerror = () => {
+        if (!cancelled) {
+          setLiveState("error")
+        }
+      }
+
+      socket.onclose = () => {
+        if (cancelled) return
+        setLiveState("disconnected")
+        retryTimer = setTimeout(() => {
+          connect()
+        }, 3000)
+      }
+    }
+
+    connect()
+
+    return () => {
+      cancelled = true
+      if (retryTimer) {
+        clearTimeout(retryTimer)
+      }
+      if (socket) {
+        socket.close()
+      }
+    }
+  }, [])
+
   return (
     <div className="space-y-6 p-6">
-      {dashboardError ? (
+      {dashboardError && !data ? (
         <Card className="border-destructive/40 bg-card">
           <CardContent className="p-4 text-sm text-destructive">
             主脑总控数据加载失败：{dashboardError instanceof Error ? dashboardError.message : "未知错误"}
           </CardContent>
         </Card>
       ) : null}
+
+      <Card className="bg-card">
+        <CardContent className="flex flex-wrap items-center justify-between gap-3 p-4">
+          <div>
+            <div className="text-sm font-medium text-foreground">主脑总控实时状态</div>
+            <div className="mt-1 text-sm text-muted-foreground">
+              现在会跟随工作流事件即时刷新，空闲时自动用查询兜底。
+            </div>
+          </div>
+          <Badge variant="secondary" className={liveMeta.tone}>
+            <span className="mr-1">{liveMeta.icon}</span>
+            {liveMeta.label}
+          </Badge>
+        </CardContent>
+      </Card>
 
       <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
         <MetricCard
@@ -387,6 +514,54 @@ export default function DashboardPage() {
             </div>
           ) : (
             <SectionEmpty text="当前还没有可展示的外部触手运行记录。" />
+          )}
+        </CardContent>
+      </Card>
+
+      <Card className="bg-card">
+        <CardHeader className="pb-3">
+          <div className="flex items-center justify-between gap-3">
+            <div>
+              <CardTitle className="text-base font-medium">最近接入治理日志</CardTitle>
+              <div className="mt-1 text-sm text-muted-foreground">
+                把外接能力的注册、更新、回退、弃用等事件翻成运营能直接理解的话
+              </div>
+            </div>
+          </div>
+        </CardHeader>
+        <CardContent>
+          {recentAudits.length > 0 ? (
+            <div className="max-h-[420px] space-y-2 overflow-y-auto pr-1">
+              {recentAudits.slice(0, 6).map((item) => {
+                const meta = auditStatusMeta(item.status)
+                return (
+                  <div key={item.id} className="rounded-xl border border-border bg-secondary/20 p-4">
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="min-w-0">
+                        <div className="truncate font-medium text-foreground">
+                          {item.actionLabel ?? item.action}
+                        </div>
+                        <div className="mt-1 text-xs text-muted-foreground">
+                          {item.moduleLabel ?? "治理日志"} · {item.resourceLabel ?? item.resource}
+                        </div>
+                      </div>
+                      <Badge variant="secondary" className={meta.tone}>
+                        {meta.label}
+                      </Badge>
+                    </div>
+                    <div className="mt-2 whitespace-pre-wrap break-words text-sm text-foreground">
+                      {item.operatorSummary ?? item.details}
+                    </div>
+                    <div className="mt-3 flex flex-wrap gap-2 text-xs text-muted-foreground">
+                      <span>操作者：{item.user || "--"}</span>
+                      <span>时间：{formatTimestamp(item.timestamp)}</span>
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+          ) : (
+            <SectionEmpty text="当前没有可展示的接入治理日志。" />
           )}
         </CardContent>
       </Card>

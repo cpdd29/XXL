@@ -2,6 +2,8 @@ from fastapi import APIRouter
 
 from app.modules.agent_config.api.router import router as agent_config_router
 from app.modules.dispatch.api.router import router as dispatch_router
+from app.modules.executor_config.api.router import router as executor_config_router
+from app.modules.knowledge.api.router import router as knowledge_router
 from app.modules.organization.api.router import router as organization_router
 from app.modules.reception.api.router import router as reception_router
 from app.platform.approval.api.router import router as approval_router
@@ -17,6 +19,8 @@ api_router.include_router(approval_router, prefix="", tags=["approvals"])
 api_router.include_router(audit_router, prefix="", tags=["events"])
 api_router.include_router(dispatch_router, prefix="", tags=["tasks"])
 api_router.include_router(agent_config_router, prefix="", tags=["agent-config"])
+api_router.include_router(executor_config_router, prefix="", tags=["executor-config"])
+api_router.include_router(knowledge_router, prefix="", tags=["knowledge"])
 api_router.include_router(organization_router, prefix="", tags=["organization"])
 api_router.include_router(config_router, prefix="", tags=["settings"])
 api_router.include_router(reception_router, prefix="", tags=["reception"])

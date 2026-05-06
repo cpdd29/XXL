@@ -7,11 +7,53 @@ import httpx
 from pydantic import ValidationError
 
 from app.modules.reception.channel_ingress.base import ChannelAdapter
+from app.modules.reception.channel_ingress.json_text import build_attachment_placeholder
 from app.modules.reception.schemas.messages import ChannelType, TelegramWebhookUpdate, UnifiedMessage
 from app.platform.config.settings_service import get_channel_integration_runtime_settings
 
 
 class TelegramAdapter(ChannelAdapter):
+    @staticmethod
+    def _extract_attachments(message_payload: dict[str, Any]) -> list[dict[str, Any]]:
+        attachments: list[dict[str, Any]] = []
+        photos = message_payload.get("photo")
+        if isinstance(photos, list) and photos:
+            attachments.append({"kind": "image", "name": "Telegram 图片"})
+        document = message_payload.get("document")
+        if isinstance(document, dict):
+            attachments.append(
+                {
+                    "kind": "file",
+                    "name": str(document.get("file_name") or "Telegram 文件"),
+                    "mime_type": str(document.get("mime_type") or "").strip() or None,
+                }
+            )
+        voice = message_payload.get("voice")
+        if isinstance(voice, dict):
+            attachments.append({"kind": "voice", "name": "Telegram 语音"})
+        audio = message_payload.get("audio")
+        if isinstance(audio, dict):
+            attachments.append(
+                {
+                    "kind": "audio",
+                    "name": str(audio.get("file_name") or "Telegram 音频"),
+                    "mime_type": str(audio.get("mime_type") or "").strip() or None,
+                }
+            )
+        video = message_payload.get("video")
+        if isinstance(video, dict):
+            attachments.append(
+                {
+                    "kind": "video",
+                    "name": str(video.get("file_name") or "Telegram 视频"),
+                    "mime_type": str(video.get("mime_type") or "").strip() or None,
+                }
+            )
+        return [
+            {key: value for key, value in item.items() if value not in (None, "")}
+            for item in attachments
+        ]
+
     def receive_message(self, payload: dict[str, Any]) -> UnifiedMessage:
         try:
             update = TelegramWebhookUpdate.model_validate(payload)
@@ -20,28 +62,38 @@ class TelegramAdapter(ChannelAdapter):
 
         if update.message is None:
             raise ValueError("Telegram payload does not contain message")
-        if not update.message.text or not update.message.text.strip():
+        raw_message = payload.get("message") if isinstance(payload.get("message"), dict) else {}
+        attachments = self._extract_attachments(raw_message)
+        text = (update.message.text or update.message.caption or "").strip()
+        if not text and attachments:
+            text = str(build_attachment_placeholder(attachments) or "").strip()
+        if not text:
             raise ValueError("Telegram message text is required")
 
         received_at = datetime.now(UTC).isoformat()
         user = update.message.from_
         chat = update.message.chat
 
+        metadata = {
+            "update_id": update.update_id,
+            "chat_type": chat.type,
+            "username": user.username,
+            "language_code": user.language_code,
+            "is_bot": user.is_bot,
+        }
+        if attachments:
+            metadata["attachments"] = attachments
+            metadata["attachment_count"] = len(attachments)
+
         return UnifiedMessage(
             message_id=f"telegram:{update.update_id}:{update.message.message_id}",
             channel=ChannelType.TELEGRAM,
             platform_user_id=str(user.id),
             chat_id=str(chat.id),
-            text=update.message.text.strip(),
+            text=text,
             received_at=received_at,
             raw_payload=payload,
-            metadata={
-                "update_id": update.update_id,
-                "chat_type": chat.type,
-                "username": user.username,
-                "language_code": user.language_code,
-                "is_bot": user.is_bot,
-            },
+            metadata=metadata,
         )
 
     def send_message(self, *, chat_id: str, text: str) -> dict[str, Any]:
@@ -67,7 +119,7 @@ class TelegramAdapter(ChannelAdapter):
 
     def _request(self, method: str, payload: dict[str, Any]) -> dict[str, Any]:
         runtime_settings = get_channel_integration_runtime_settings()["telegram"]
-        if not runtime_settings.get("enabled", True):
+        if not runtime_settings.get("enabled", False):
             raise RuntimeError("Telegram channel integration is disabled")
         bot_token = str(runtime_settings.get("bot_token") or "").strip()
         if not bot_token:

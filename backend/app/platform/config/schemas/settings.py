@@ -1,4 +1,5 @@
 from app.platform.contracts.api_model import APIModel
+from app.modules.reception.channel_binding.schemas import WecomBindingStateResponse
 
 
 class GeneralSettings(APIModel):
@@ -18,15 +19,23 @@ class UpdateGeneralSettingsRequest(APIModel):
 
 
 class SecurityPolicySettings(APIModel):
+    input_monitor_enabled: bool
+    output_monitor_enabled: bool
     message_rate_limit_per_minute: int
     message_rate_limit_cooldown_seconds: int
     message_rate_limit_ban_threshold: int
     message_rate_limit_ban_seconds: int
     security_incident_window_seconds: int
+    dos_protection_enabled: bool
     prompt_rule_block_threshold: int
     prompt_classifier_block_threshold: int
     prompt_injection_enabled: bool
+    xss_enabled: bool
+    keyword_blocklist_enabled: bool
+    keyword_blocklist: list[str]
+    keyword_block_threshold: int
     content_redaction_enabled: bool
+    audit_enabled: bool
 
 
 class SecurityPolicySettingsResponse(APIModel):
@@ -36,15 +45,23 @@ class SecurityPolicySettingsResponse(APIModel):
 
 
 class UpdateSecurityPolicySettingsRequest(APIModel):
+    input_monitor_enabled: bool | None = None
+    output_monitor_enabled: bool | None = None
     message_rate_limit_per_minute: int | None = None
     message_rate_limit_cooldown_seconds: int | None = None
     message_rate_limit_ban_threshold: int | None = None
     message_rate_limit_ban_seconds: int | None = None
     security_incident_window_seconds: int | None = None
+    dos_protection_enabled: bool | None = None
     prompt_rule_block_threshold: int | None = None
     prompt_classifier_block_threshold: int | None = None
     prompt_injection_enabled: bool | None = None
+    xss_enabled: bool | None = None
+    keyword_blocklist_enabled: bool | None = None
+    keyword_blocklist: list[str] | None = None
+    keyword_block_threshold: int | None = None
     content_redaction_enabled: bool | None = None
+    audit_enabled: bool | None = None
     approval_id: str | None = None
     approval_reason: str | None = None
     approval_note: str | None = None
@@ -159,6 +176,7 @@ class ChannelIntegrationSettingsResponse(APIModel):
     key: str
     updated_at: str
     settings: ChannelIntegrationSettings
+    wecom_binding_state: WecomBindingStateResponse | None = None
 
 
 class UpdateTelegramChannelIntegrationSettingsRequest(APIModel):

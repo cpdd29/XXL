@@ -5,9 +5,12 @@ from app.platform.contracts.api_model import APIModel
 
 class ToolItem(APIModel):
     id: str
+    member_tool_ids: list[str] = []
     name: str
     type: str
     source: str
+    scope: str = "shared"
+    owner_tenant_id: str | None = None
     enabled: bool
     description: str
     tags: list[str] = []

@@ -107,8 +107,66 @@ export interface BrainDispatchSummary {
   stateLabel?: string | null
 }
 
+export interface TaskAgentGroupMember {
+  id?: string | null
+  name?: string | null
+  role?: string | null
+  branchId?: string | null
+  type?: string | null
+  status?: string | null
+  enabled?: boolean | null
+  providerKey?: string | null
+  providerLabel?: string | null
+  model?: string | null
+  boundSkillIds?: string[]
+  boundToolIds?: string[]
+  requestedSkillIds?: string[]
+  requestedToolIds?: string[]
+  natsSubject?: string | null
+  soul?: string | null
+  runtimeStatus?: string | null
+  currentStepId?: string | null
+  currentStepTitle?: string | null
+  currentStepMessage?: string | null
+  currentStepStartedAt?: string | null
+  currentStepFinishedAt?: string | null
+  selectedForDelivery?: boolean | null
+}
+
+export interface TaskAgentGroupTimelineEntry {
+  id?: string | null
+  kind?: string | null
+  title: string
+  detail?: string | null
+  timestamp?: string | null
+  actorAgentId?: string | null
+  actorAgentName?: string | null
+  metadata?: Record<string, unknown> | null
+}
+
+export interface TaskAgentGroup {
+  id?: string | null
+  name?: string | null
+  status?: string | null
+  topology?: string | null
+  coordinationMode?: string | null
+  dispatcherAgentId?: string | null
+  developmentAgents?: TaskAgentGroupMember[]
+  acceptanceAgent?: TaskAgentGroupMember | null
+  requestedSkillIds?: string[]
+  requestedToolIds?: string[]
+  appliedSkillIds?: string[]
+  appliedToolIds?: string[]
+  natsSubjects?: Record<string, unknown> | null
+  timeline?: TaskAgentGroupTimelineEntry[]
+  warnings?: string[]
+}
+
 export interface Task {
   id: string
+  tenantId?: string
+  projectId?: string
+  environment?: string
   title: string
   description: string
   status: TaskStatus
@@ -131,10 +189,21 @@ export interface Task {
   deliveryStatus?: string
   deliveryMessage?: string
   statusReason?: string
+  confirmationStatus?: string
+  approvalStatus?: string
+  approvalRequired?: boolean
+  auditId?: string
+  idempotencyKey?: string
+  executionScope?: string
+  schedulePlan?: Record<string, unknown> | null
   routeDecision?: TaskRouteDecision
   managerPacket?: ManagerPacket | null
   brainDispatchSummary?: BrainDispatchSummary | null
   brainFactSnapshot?: Record<string, unknown> | null
+  memoryInjectionSummary?: Record<string, unknown> | null
+  contextPatchAudit?: Array<Record<string, unknown>>
+  stateMachine?: Record<string, unknown> | null
+  taskAgentGroup?: TaskAgentGroup | null
   result?: TaskResult
 }
 
@@ -158,6 +227,16 @@ export interface TaskListResponse {
 export interface TaskStepsResponse {
   items: TaskStep[]
   total: number
+}
+
+export interface TaskRealtimeResponse {
+  type: string
+  messageType: string
+  taskId: string
+  workflowId?: string | null
+  timestamp?: string | null
+  task?: Task | null
+  steps?: TaskStepsResponse | null
 }
 
 export interface TaskActionResponse {

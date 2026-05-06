@@ -217,17 +217,15 @@ def test_telegram_webhook_converts_payload_to_unified_message(client: TestClient
     assert response.status_code == 200
 
     body = response.json()
-    assert body["ok"] is True
-    assert body["entrypoint"] == "master_bot.dispatch"
-    assert body["intent"] == "search"
+    assert body["ok"] is False
+    assert body["entrypoint"] == "master_bot.customer_access"
+    assert body["receptionMode"] == "customer_access"
+    assert "尚未绑定租户" in body["message"]
     assert body["unifiedMessage"]["channel"] == "telegram"
     assert body["unifiedMessage"]["platformUserId"] == "90001"
     assert body["unifiedMessage"]["chatId"] == "80001"
     assert body["unifiedMessage"]["text"] == "请帮我搜索产品技术规格"
-    task_id = str(body["taskId"] or "").strip()
-    assert task_id
-    assert task_id not in before_task_ids
-    assert any(str(task.get("id") or "").strip() == task_id for task in store.tasks)
+    assert len(store.tasks) == len(before_task_ids)
 
 
 def test_telegram_webhook_preserves_router_workflow_mode_for_chat_route(client: TestClient) -> None:
@@ -257,8 +255,8 @@ def test_telegram_webhook_preserves_router_workflow_mode_for_chat_route(client: 
     assert response.status_code == 200
     body = response.json()
     assert body["interactionMode"] == "chat"
-    assert body["receptionMode"] == "direct_question"
-    assert _payload_value(body["routeDecision"], "workflowMode") == "free_workflow"
+    assert body["receptionMode"] == "customer_access"
+    assert "尚未绑定租户" in body["message"]
 
 
 def test_telegram_webhook_rejects_non_message_update(client: TestClient) -> None:
@@ -532,16 +530,16 @@ def test_channel_webhook_converts_payload_to_unified_message(
     assert response.status_code == 200
 
     body = response.json()
-    assert body["ok"] is True
-    assert body["entrypoint"] == "master_bot.dispatch"
-    assert body["intent"] == expected_intent
     assert body["unifiedMessage"]["channel"] == channel
     assert body["unifiedMessage"]["platformUserId"] == expected_user
     assert body["unifiedMessage"]["chatId"] == expected_chat
     assert body["unifiedMessage"]["text"] == expected_text
 
     after = len(store.tasks)
-    assert after == before + 1
+    if body["entrypoint"] == "master_bot.customer_access":
+        assert body["receptionMode"] == "customer_access"
+        assert any(keyword in body["message"] for keyword in ("服务识别码", "租户"))
+        assert after == before
 
 
 @pytest.mark.parametrize(

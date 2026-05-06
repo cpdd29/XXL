@@ -3,6 +3,7 @@ from __future__ import annotations
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 import hashlib
+import logging
 from typing import Any
 from uuid import uuid4
 
@@ -18,6 +19,18 @@ DEFAULT_METHOD = "POST"
 DEFAULT_RELEASE_CHANNEL = "stable"
 DEFAULT_COMPATIBILITY = "brain-core-v1"
 ALLOWED_RELEASE_CHANNELS = {"stable", "canary", "beta", "alpha", "deprecated"}
+EXTERNAL_AGENT_REGISTRY_SETTING_KEY = "external_agent_registry"
+SENSITIVE_METADATA_KEYS = {
+    "api_key",
+    "apiKey",
+    "auth_token",
+    "authToken",
+    "bearer_token",
+    "bearerToken",
+    "authorization",
+    "Authorization",
+}
+logger = logging.getLogger(__name__)
 
 
 def _now() -> datetime:
@@ -116,17 +129,285 @@ def _coerce_percent(value: Any, *, default: int = 0) -> int:
     return percent
 
 
+def _redact_sensitive_mapping(value: Any) -> Any:
+    if isinstance(value, dict):
+        redacted: dict[str, Any] = {}
+        for key, item in value.items():
+            if key in SENSITIVE_METADATA_KEYS:
+                redacted[key] = "***"
+                continue
+            if str(key).strip().lower() == "auth" and isinstance(item, dict):
+                redacted[key] = _redact_sensitive_mapping(item)
+                continue
+            redacted[key] = _redact_sensitive_mapping(item)
+        return redacted
+    if isinstance(value, list):
+        return [_redact_sensitive_mapping(item) for item in value]
+    return value
+
+
+def redact_external_agent_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    cloned = deepcopy(payload)
+    config_snapshot = cloned.get("config_snapshot")
+    if isinstance(config_snapshot, dict):
+        metadata = config_snapshot.get("metadata")
+        if isinstance(metadata, dict):
+            config_snapshot["metadata"] = _redact_sensitive_mapping(metadata)
+
+    metadata = cloned.get("metadata")
+    if isinstance(metadata, dict):
+        cloned["metadata"] = _redact_sensitive_mapping(metadata)
+    return cloned
+
+
 class ExternalAgentRegistryService:
     def __init__(self) -> None:
         self._agents: dict[str, dict[str, Any]] = {}
+        self._bootstrapped = False
 
     def clear(self) -> None:
         self._agents.clear()
+        self._bootstrapped = False
+
+    def _ensure_bootstrapped(self) -> None:
+        if self._bootstrapped:
+            return
+        self.bootstrap()
+
+    def bootstrap(self, *, force: bool = False) -> int:
+        if self._bootstrapped and not force:
+            return len(self._agents)
+
+        self._agents.clear()
+        raw_items: list[dict[str, Any]] = []
+        persisted, authoritative = persistence_service.read_system_setting(EXTERNAL_AGENT_REGISTRY_SETTING_KEY)
+        if authoritative and isinstance(persisted, dict):
+            payload = persisted.get("payload")
+            if isinstance(payload, dict) and isinstance(payload.get("items"), list):
+                raw_items = [item for item in payload["items"] if isinstance(item, dict)]
+        elif isinstance(store.system_settings.get(EXTERNAL_AGENT_REGISTRY_SETTING_KEY), dict):
+            payload = store.system_settings.get(EXTERNAL_AGENT_REGISTRY_SETTING_KEY) or {}
+            if isinstance(payload.get("items"), list):
+                raw_items = [item for item in payload["items"] if isinstance(item, dict)]
+
+        for item in raw_items:
+            normalized = self._normalize_agent(item)
+            self._agents[normalized["id"]] = normalized
+
+        for agent_id in list(self._agents):
+            self._apply_version_governance(agent_id)
+        self.prune_expired()
+        self._bootstrapped = True
+        return len(self._agents)
+
+    def _persist_registry(self) -> None:
+        payload = {
+            "items": [
+                deepcopy(self._agents[agent_id])
+                for agent_id in sorted(self._agents)
+            ]
+        }
+        store.system_settings[EXTERNAL_AGENT_REGISTRY_SETTING_KEY] = deepcopy(payload)
+        persisted = persistence_service.persist_system_setting(
+            key=EXTERNAL_AGENT_REGISTRY_SETTING_KEY,
+            payload=payload,
+            updated_at=_now().isoformat(),
+        )
+        if not persisted:
+            logger.warning("Falling back to runtime external agent registry store because persistence write failed")
+
+    def _load_authoritative_item(self, agent_id: str) -> dict[str, Any] | None:
+        normalized_agent_id = _normalize_text(agent_id)
+        if not normalized_agent_id:
+            return None
+
+        persisted, authoritative = persistence_service.read_system_setting(EXTERNAL_AGENT_REGISTRY_SETTING_KEY)
+        if not authoritative or not isinstance(persisted, dict):
+            return None
+        payload = persisted.get("payload")
+        if not isinstance(payload, dict):
+            return None
+        raw_items = payload.get("items")
+        if not isinstance(raw_items, list):
+            return None
+
+        for item in raw_items:
+            if not isinstance(item, dict):
+                continue
+            if _normalize_text(item.get("id")) == normalized_agent_id:
+                return deepcopy(item)
+        return None
+
+    def _item_metadata(self, item: dict[str, Any] | None) -> dict[str, Any]:
+        if not isinstance(item, dict):
+            return {}
+        snapshot = item.get("config_snapshot")
+        if isinstance(snapshot, dict):
+            metadata = snapshot.get("metadata")
+            if isinstance(metadata, dict):
+                return deepcopy(metadata)
+        metadata = item.get("metadata")
+        if isinstance(metadata, dict):
+            return deepcopy(metadata)
+        return {}
+
+    def _item_invocation(self, item: dict[str, Any] | None) -> dict[str, Any]:
+        if not isinstance(item, dict):
+            return {}
+        summary = item.get("config_summary")
+        if isinstance(summary, dict):
+            invocation = summary.get("invocation")
+            if isinstance(invocation, dict):
+                return deepcopy(invocation)
+        snapshot = item.get("config_snapshot")
+        if isinstance(snapshot, dict):
+            runtime = snapshot.get("runtime")
+            if isinstance(runtime, dict):
+                invocation = runtime.get("invocation")
+                if isinstance(invocation, dict):
+                    return deepcopy(invocation)
+            metadata = snapshot.get("metadata")
+            if isinstance(metadata, dict):
+                invocation = metadata.get("invocation")
+                if isinstance(invocation, dict):
+                    return deepcopy(invocation)
+        invocation = item.get("invocation")
+        if isinstance(invocation, dict):
+            return deepcopy(invocation)
+        return {}
+
+    def _has_configured_base_url(self, item: dict[str, Any] | None) -> bool:
+        invocation = self._item_invocation(item)
+        return bool(_normalize_text(invocation.get("base_url") or invocation.get("baseUrl")))
+
+    def _merge_registration_payload(
+        self,
+        payload: dict[str, Any],
+        *,
+        existing: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        merged = deepcopy(payload)
+        existing_item = existing or self._load_authoritative_item(
+            payload.get("id") or payload.get("agent_id") or payload.get("name")
+        )
+        if not isinstance(existing_item, dict):
+            return merged
+
+        existing_invocation = self._item_invocation(existing_item)
+        for field_name, aliases in {
+            "protocol": ("protocol",),
+            "base_url": ("base_url", "baseUrl"),
+            "invoke_path": ("invoke_path", "invokePath"),
+            "health_path": ("health_path", "healthPath"),
+            "method": ("method",),
+        }.items():
+            current_value = ""
+            for alias in aliases:
+                current_value = _normalize_text(merged.get(alias))
+                if current_value:
+                    break
+            if current_value:
+                continue
+            fallback_value = _normalize_text(existing_invocation.get(field_name))
+            if fallback_value:
+                merged[field_name] = fallback_value
+
+        existing_metadata = self._item_metadata(existing_item)
+        incoming_metadata = deepcopy(merged.get("metadata") or {})
+        if existing_metadata or incoming_metadata:
+            merged["metadata"] = {
+                **existing_metadata,
+                **incoming_metadata,
+            }
+        return merged
+
+    def _registration_payload_from_item(self, item: dict[str, Any]) -> dict[str, Any]:
+        payload = {
+            "id": item.get("id"),
+            "name": item.get("name"),
+            "description": item.get("description"),
+            "type": item.get("type"),
+            "version": item.get("version"),
+            "agent_family": item.get("agent_family"),
+            "compatibility": list(item.get("compatibility") or []),
+            "release_channel": item.get("release_channel"),
+            "capabilities": list((item.get("config_summary") or {}).get("capabilities") or []),
+            "enabled": bool(item.get("enabled", True)),
+            "default_version": bool(item.get("default_version")),
+            "fallback_version_id": item.get("fallback_version_id"),
+            "deprecated": bool(item.get("deprecated")),
+            "rollout_policy": deepcopy(item.get("rollout_policy") or {}),
+            "rollback_policy": deepcopy(item.get("rollback_policy") or {}),
+            "metadata": self._item_metadata(item),
+        }
+        invocation = self._item_invocation(item)
+        payload["protocol"] = invocation.get("protocol") or "http"
+        payload["base_url"] = invocation.get("base_url") or invocation.get("baseUrl")
+        payload["invoke_path"] = invocation.get("invoke_path") or invocation.get("invokePath")
+        payload["health_path"] = invocation.get("health_path") or invocation.get("healthPath")
+        payload["method"] = invocation.get("method") or "POST"
+        if item.get("heartbeat_interval_seconds") is not None:
+            payload["heartbeat_interval_seconds"] = item.get("heartbeat_interval_seconds")
+        if item.get("heartbeat_timeout_seconds") is not None:
+            payload["heartbeat_timeout_seconds"] = item.get("heartbeat_timeout_seconds")
+        return payload
+
+    def _preserve_runtime_state(self, target: dict[str, Any], source: dict[str, Any]) -> dict[str, Any]:
+        for key in (
+            "status",
+            "last_active",
+            "runtime_status",
+            "runtime_status_reason",
+            "routable",
+            "runtime_priority",
+            "last_heartbeat_at",
+            "heartbeat_interval_seconds",
+            "heartbeat_timeout_seconds",
+            "runtime_metrics",
+            "consecutive_failures",
+            "last_failure_at",
+            "last_error",
+            "next_retry_at",
+            "circuit_state",
+            "circuit_open_until",
+            "lease_expires_at",
+        ):
+            if key in source:
+                target[key] = deepcopy(source.get(key))
+        return target
+
+    def _reconcile_missing_invocation(self, agent_id: str) -> dict[str, Any] | None:
+        normalized_agent_id = _normalize_text(agent_id)
+        item = self._agents.get(normalized_agent_id)
+        if item is None or self._has_configured_base_url(item):
+            return item
+
+        authoritative = self._load_authoritative_item(normalized_agent_id)
+        if not isinstance(authoritative, dict):
+            return item
+
+        refreshed = self._normalize_agent(self._registration_payload_from_item(authoritative))
+        if not self._has_configured_base_url(refreshed):
+            return item
+
+        self._agents[normalized_agent_id] = self._preserve_runtime_state(refreshed, item)
+        logger.warning(
+            "Reconciled external agent invocation from authoritative registry: agent_id=%s base_url=%s",
+            normalized_agent_id,
+            self._item_invocation(self._agents[normalized_agent_id]).get("base_url"),
+        )
+        return self._agents[normalized_agent_id]
 
     def register_agent(self, payload: dict[str, Any]) -> dict[str, Any]:
-        normalized = self._normalize_agent(payload)
+        self._ensure_bootstrapped()
+        agent_id = _normalize_text(payload.get("id") or payload.get("agent_id") or payload.get("name"))
+        existing = self._agents.get(agent_id) if agent_id else None
+        normalized = self._normalize_agent(
+            self._merge_registration_payload(payload, existing=existing)
+        )
         self._agents[normalized["id"]] = normalized
         self._apply_version_governance(normalized["id"])
+        self._persist_registry()
         self._append_registry_audit(
             action="external_agent_registry.registered",
             details=(
@@ -148,10 +429,12 @@ class ExternalAgentRegistryService:
         return deepcopy(self._agents[normalized["id"]])
 
     def delete_agent(self, agent_id: str) -> dict[str, Any]:
+        self._ensure_bootstrapped()
         normalized_agent_id = _normalize_text(agent_id)
         item = self._agents.pop(normalized_agent_id, None)
         if item is None:
             raise KeyError(f"External agent '{agent_id}' not found")
+        self._persist_registry()
         self._append_registry_audit(
             action="external_agent_registry.deleted",
             details=f"id={item['id']}; version={item['version']}; family={item['agent_family']}",
@@ -165,9 +448,13 @@ class ExternalAgentRegistryService:
         return deepcopy(item)
 
     def list_agents(self, *, include_offline: bool = True) -> list[dict[str, Any]]:
+        self._ensure_bootstrapped()
         self.prune_expired()
         items: list[dict[str, Any]] = []
-        for item in self._agents.values():
+        for agent_id in list(self._agents):
+            item = self._reconcile_missing_invocation(agent_id) or self._agents.get(agent_id)
+            if item is None:
+                continue
             if not include_offline and not bool(item.get("routable", False)):
                 continue
             items.append(deepcopy(item))
@@ -175,8 +462,9 @@ class ExternalAgentRegistryService:
         return items
 
     def get_agent(self, agent_id: str) -> dict[str, Any] | None:
+        self._ensure_bootstrapped()
         self.prune_expired()
-        item = self._agents.get(_normalize_text(agent_id))
+        item = self._reconcile_missing_invocation(agent_id) or self._agents.get(_normalize_text(agent_id))
         return deepcopy(item) if item is not None else None
 
     def select_agent(
@@ -188,6 +476,7 @@ class ExternalAgentRegistryService:
         include_deprecated: bool = False,
         route_seed: str | None = None,
     ) -> dict[str, Any] | None:
+        self._ensure_bootstrapped()
         self.prune_expired()
         normalized_type = _normalize_text(agent_type).lower()
         normalized_compatibility = _normalize_text(compatibility or DEFAULT_COMPATIBILITY)
@@ -227,6 +516,7 @@ class ExternalAgentRegistryService:
         return deepcopy(candidates[0])
 
     def list_versions(self, family: str) -> list[dict[str, Any]]:
+        self._ensure_bootstrapped()
         normalized_family = _normalize_text(family).lower()
         items = [
             deepcopy(item)
@@ -237,6 +527,7 @@ class ExternalAgentRegistryService:
         return items
 
     def promote_version(self, agent_id: str) -> dict[str, Any]:
+        self._ensure_bootstrapped()
         item = self._agents.get(_normalize_text(agent_id))
         if item is None:
             raise KeyError(f"External agent '{agent_id}' not found")
@@ -246,17 +537,21 @@ class ExternalAgentRegistryService:
                 continue
             candidate["default_version"] = str(candidate.get("id") or "") == item["id"]
         self._apply_version_governance(item["id"])
+        self._persist_registry()
         return deepcopy(self._agents[item["id"]])
 
     def set_fallback_version(self, agent_id: str, fallback_version_id: str | None) -> dict[str, Any]:
+        self._ensure_bootstrapped()
         item = self._agents.get(_normalize_text(agent_id))
         if item is None:
             raise KeyError(f"External agent '{agent_id}' not found")
         item["fallback_version_id"] = _normalize_text(fallback_version_id) or None
         self._apply_version_governance(item["id"])
+        self._persist_registry()
         return deepcopy(self._agents[item["id"]])
 
     def set_deprecated(self, agent_id: str, *, deprecated: bool) -> dict[str, Any]:
+        self._ensure_bootstrapped()
         item = self._agents.get(_normalize_text(agent_id))
         if item is None:
             raise KeyError(f"External agent '{agent_id}' not found")
@@ -267,9 +562,11 @@ class ExternalAgentRegistryService:
         if deprecated:
             item["default_version"] = False
         self._apply_version_governance(item["id"])
+        self._persist_registry()
         return deepcopy(self._agents[item["id"]])
 
     def set_rollout_policy(self, agent_id: str, rollout_policy: dict[str, Any] | None) -> dict[str, Any]:
+        self._ensure_bootstrapped()
         item = self._agents.get(_normalize_text(agent_id))
         if item is None:
             raise KeyError(f"External agent '{agent_id}' not found")
@@ -283,9 +580,11 @@ class ExternalAgentRegistryService:
         config_summary["rollout_policy"] = deepcopy(item.get("rollout_policy") or {})
         item["config_summary"] = config_summary
         self._apply_version_governance(item["id"])
+        self._persist_registry()
         return deepcopy(self._agents[item["id"]])
 
     def set_rollback_policy(self, agent_id: str, rollback_policy: dict[str, Any] | None) -> dict[str, Any]:
+        self._ensure_bootstrapped()
         item = self._agents.get(_normalize_text(agent_id))
         if item is None:
             raise KeyError(f"External agent '{agent_id}' not found")
@@ -299,9 +598,11 @@ class ExternalAgentRegistryService:
         config_summary["rollback_policy"] = deepcopy(item.get("rollback_policy") or {})
         item["config_summary"] = config_summary
         self._apply_version_governance(item["id"])
+        self._persist_registry()
         return deepcopy(self._agents[item["id"]])
 
     def resolve_fallback_version(self, agent_id_or_family: str) -> dict[str, Any] | None:
+        self._ensure_bootstrapped()
         normalized = _normalize_text(agent_id_or_family).lower()
         if not normalized:
             return None
@@ -467,9 +768,11 @@ class ExternalAgentRegistryService:
         queue_depth: int | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        self._ensure_bootstrapped()
         item = self._agents.get(_normalize_text(agent_id))
         if item is None:
             raise KeyError(f"External agent '{agent_id}' not found")
+        item = self._reconcile_missing_invocation(agent_id) or item
         now = _now()
         runtime_status = _normalize_text(status).lower() or "online"
         if runtime_status not in {"online", "degraded", "offline", "error", "maintenance"}:
@@ -499,9 +802,11 @@ class ExternalAgentRegistryService:
         item["lease_expires_at"] = (
             now + timedelta(seconds=int(item["heartbeat_timeout_seconds"]))
         ).isoformat()
+        self._persist_registry()
         return deepcopy(item)
 
     def report_failure(self, agent_id: str, *, error: str | None = None) -> dict[str, Any]:
+        self._ensure_bootstrapped()
         item = self._agents.get(_normalize_text(agent_id))
         if item is None:
             raise KeyError(f"External agent '{agent_id}' not found")
@@ -526,9 +831,11 @@ class ExternalAgentRegistryService:
             else None
         )
         item["routable"] = bool(item.get("enabled", True)) and item["circuit_state"] != "open"
+        self._persist_registry()
         return deepcopy(item)
 
     def set_enabled(self, agent_id: str, *, enabled: bool) -> dict[str, Any]:
+        self._ensure_bootstrapped()
         item = self._agents.get(_normalize_text(agent_id))
         if item is None:
             raise KeyError(f"External agent '{agent_id}' not found")
@@ -538,6 +845,7 @@ class ExternalAgentRegistryService:
             item["runtime_status_reason"] = "agent_disabled"
             item["status"] = "offline"
             item["routable"] = False
+            self._persist_registry()
             return deepcopy(item)
 
         runtime_status = _normalize_text(item.get("runtime_status")).lower() or "online"
@@ -547,9 +855,11 @@ class ExternalAgentRegistryService:
         item["runtime_status_reason"] = "agent_enabled"
         item["status"] = "idle" if runtime_status == "online" else runtime_status
         item["routable"] = runtime_status in {"online", "degraded"}
+        self._persist_registry()
         return deepcopy(item)
 
     def recover_agent(self, agent_id: str) -> dict[str, Any]:
+        self._ensure_bootstrapped()
         item = self._agents.get(_normalize_text(agent_id))
         if item is None:
             raise KeyError(f"External agent '{agent_id}' not found")
@@ -562,6 +872,7 @@ class ExternalAgentRegistryService:
         item["runtime_status_reason"] = "recovered"
         item["status"] = "idle"
         item["routable"] = bool(item.get("enabled", True))
+        self._persist_registry()
         return deepcopy(item)
 
     def prune_expired(self, *, now: datetime | None = None) -> int:
@@ -589,6 +900,8 @@ class ExternalAgentRegistryService:
             item["routable"] = False
             item["status"] = "offline"
             changed += 1
+        if changed > 0:
+            self._persist_registry()
         return changed
 
     def _normalize_agent(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -609,6 +922,7 @@ class ExternalAgentRegistryService:
         now = _now()
         last_heartbeat_at = _parse_datetime(payload.get("last_heartbeat_at")) or now
         runtime_status = _normalize_text(payload.get("runtime_status") or "online").lower() or "online"
+        runtime_status_reason = _normalize_text(payload.get("runtime_status_reason") or "registered") or "registered"
         enabled = bool(payload.get("enabled", True))
         routable = enabled and runtime_status in {"online", "degraded"}
         version = _normalize_text(payload.get("version") or "0.0.0")
@@ -650,6 +964,16 @@ class ExternalAgentRegistryService:
         metadata.setdefault("deprecated", deprecated)
         metadata.setdefault("rollout_policy", deepcopy(rollout_policy))
         metadata.setdefault("rollback_policy", deepcopy(rollback_policy))
+        metadata["invocation"] = {
+            "protocol": _normalize_text(payload.get("protocol") or "http").lower() or "http",
+            "base_url": base_url,
+            "invoke_path": invoke_path,
+            "health_path": health_path,
+            "method": method,
+        }
+        runtime_metrics = deepcopy(payload.get("runtime_metrics") or {})
+        if not isinstance(runtime_metrics, dict):
+            runtime_metrics = {}
         return {
             "id": agent_id,
             "agent_family": agent_family,
@@ -678,23 +1002,27 @@ class ExternalAgentRegistryService:
             "rollback_target_version_id": rollback_policy.get("target_version_id"),
             "rollback_policy": rollback_policy,
             "runtime_status": runtime_status,
-            "runtime_status_reason": "registered",
+            "runtime_status_reason": runtime_status_reason,
             "routable": routable,
             "runtime_priority": 3 if runtime_status == "online" else 1 if runtime_status == "degraded" else 0,
             "last_heartbeat_at": last_heartbeat_at.isoformat(),
             "heartbeat_interval_seconds": interval,
             "heartbeat_timeout_seconds": timeout,
             "runtime_metrics": {
+                **runtime_metrics,
                 "source": "external_agent_registry",
-                "load": payload.get("load"),
-                "queue_depth": payload.get("queue_depth") or payload.get("queueDepth"),
-                "capabilities": capabilities,
-                "version": version,
-                "compatibility": compatibility,
-                "release_channel": release_channel,
-                "deprecated": deprecated,
-                "rollout_policy": deepcopy(rollout_policy),
-                "rollback_policy": deepcopy(rollback_policy),
+                "load": runtime_metrics.get("load", payload.get("load")),
+                "queue_depth": runtime_metrics.get(
+                    "queue_depth",
+                    payload.get("queue_depth") or payload.get("queueDepth"),
+                ),
+                "capabilities": runtime_metrics.get("capabilities", capabilities),
+                "version": runtime_metrics.get("version", version),
+                "compatibility": runtime_metrics.get("compatibility", compatibility),
+                "release_channel": runtime_metrics.get("release_channel", release_channel),
+                "deprecated": runtime_metrics.get("deprecated", deprecated),
+                "rollout_policy": deepcopy(runtime_metrics.get("rollout_policy") or rollout_policy),
+                "rollback_policy": deepcopy(runtime_metrics.get("rollback_policy") or rollback_policy),
             },
             "consecutive_failures": int(payload.get("consecutive_failures") or 0),
             "last_failure_at": _normalize_text(payload.get("last_failure_at")) or None,
@@ -746,6 +1074,13 @@ class ExternalAgentRegistryService:
                     "last_heartbeat_at": last_heartbeat_at.isoformat(),
                     "heartbeat_interval_seconds": interval,
                     "heartbeat_timeout_seconds": timeout,
+                    "invocation": {
+                        "protocol": _normalize_text(payload.get("protocol") or "http").lower() or "http",
+                        "base_url": base_url,
+                        "invoke_path": invoke_path,
+                        "health_path": health_path,
+                        "method": method,
+                    },
                 },
                 "metadata": metadata,
             },

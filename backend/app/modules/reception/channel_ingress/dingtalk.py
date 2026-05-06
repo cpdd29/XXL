@@ -7,7 +7,7 @@ from urllib.parse import quote
 
 import httpx
 
-from app.modules.reception.channel_ingress.json_text import JSONTextChannelAdapter
+from app.modules.reception.channel_ingress.json_text import JSONTextChannelAdapter, normalize_attachment
 from app.modules.reception.schemas.messages import ChannelType
 from app.platform.config.settings_service import get_channel_integration_runtime_settings
 
@@ -73,6 +73,19 @@ class DingTalkAdapter(JSONTextChannelAdapter):
         ),
     }
 
+    def extract_attachments(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
+        msgtype = str(payload.get("msgtype") or "").strip().lower()
+        if msgtype not in {"image", "audio", "voice", "video", "file"}:
+            return []
+
+        raw_payload = payload.get(msgtype)
+        attachment = normalize_attachment(
+            raw_payload,
+            fallback_kind=msgtype,
+            fallback_name=f"DingTalk {msgtype}",
+        )
+        return [attachment] if attachment is not None else [{"kind": msgtype, "name": f"DingTalk {msgtype}"}]
+
     def __init__(self) -> None:
         self._cached_access_token: str | None = None
         self._cached_access_token_expires_at: float = 0.0
@@ -86,7 +99,7 @@ class DingTalkAdapter(JSONTextChannelAdapter):
 
     def _send_via_delivery_target(self, target_spec: dict[str, Any], *, text: str) -> dict[str, Any]:
         runtime_settings = get_channel_integration_runtime_settings()["dingtalk"]
-        if not runtime_settings.get("enabled", True):
+        if not runtime_settings.get("enabled", False):
             raise RuntimeError("DingTalk channel integration is disabled")
 
         session_webhook = str(target_spec.get("session_webhook") or "").strip() or None
@@ -214,7 +227,7 @@ class DingTalkAdapter(JSONTextChannelAdapter):
     def _resolve_outbound_url(self, target: str) -> str:
         normalized_target = str(target or "").strip()
         runtime_settings = get_channel_integration_runtime_settings()["dingtalk"]
-        if not runtime_settings.get("enabled", True):
+        if not runtime_settings.get("enabled", False):
             raise RuntimeError("DingTalk channel integration is disabled")
         if not normalized_target:
             raise RuntimeError("DingTalk outbound target is missing")

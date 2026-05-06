@@ -14,6 +14,15 @@ from fastapi import HTTPException, status
 import yaml
 
 from app.modules.agent_config.registries.agent_reach_adapter import AgentReachAdapter
+from app.modules.agent_config.registries.capability_scope import (
+    CAPABILITY_SCOPE_SHARED,
+    apply_scope_fields,
+    capability_visible,
+    extract_scope_fields,
+    matches_scope_filter,
+    normalize_scope_fields,
+    scope_priority,
+)
 from app.modules.agent_config.registries.external_skill_registry_service import external_skill_registry_service
 from app.modules.agent_config.registries.skill_registry_service import skill_registry_service
 
@@ -297,7 +306,15 @@ class ToolSourceService:
             "governance_summary": self._build_governance_summary(self._sources_cache),
         }
 
-    def get_source(self, source_id: str, *, refresh: bool = False) -> dict[str, Any]:
+    def get_source(
+        self,
+        source_id: str,
+        *,
+        refresh: bool = False,
+        tenant_id: str | None = None,
+        include_all_tenants: bool = False,
+        scope: str | None = None,
+    ) -> dict[str, Any]:
         normalized_source_id = str(source_id or "").strip()
         if refresh or not self._sources_cache:
             self.scan_sources()
@@ -305,13 +322,51 @@ class ToolSourceService:
         if detail is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tool source not found")
         payload = deepcopy(detail)
+        tools = [
+            apply_scope_fields(tool)
+            for tool in payload.get("tools") or []
+            if isinstance(tool, dict)
+            and capability_visible(tool, tenant_id=tenant_id, include_all_tenants=include_all_tenants)
+            and matches_scope_filter(tool, scope)
+        ]
+        tools.sort(
+            key=lambda item: (
+                scope_priority(item, tenant_id=tenant_id),
+                str(item.get("name") or "").lower(),
+                str(item.get("id") or "").lower(),
+            )
+        )
+        payload["tools"] = tools
+        payload["tool_total"] = len(tools)
         payload["governance_summary"] = self._build_governance_summary(self._sources_cache)
         return payload
 
-    def list_tools(self, *, refresh: bool = False) -> list[dict[str, Any]]:
+    def list_tools(
+        self,
+        *,
+        refresh: bool = False,
+        tenant_id: str | None = None,
+        include_all_tenants: bool = False,
+        scope: str | None = None,
+    ) -> list[dict[str, Any]]:
         if refresh or not self._sources_cache:
             self.scan_sources()
-        return deepcopy(self._tools_cache)
+        items = [
+            apply_scope_fields(tool)
+            for tool in self._tools_cache
+            if capability_visible(tool, tenant_id=tenant_id, include_all_tenants=include_all_tenants)
+            and matches_scope_filter(tool, scope)
+        ]
+        items.sort(
+            key=lambda item: (
+                str(item.get("source") or "").lower(),
+                scope_priority(item, tenant_id=tenant_id),
+                str(item.get("type") or "").lower(),
+                str(item.get("name") or "").lower(),
+                str(item.get("id") or "").lower(),
+            )
+        )
+        return deepcopy(items)
 
     def scan_sources(self) -> dict[str, Any]:
         sources: list[dict[str, Any]] = []
@@ -386,6 +441,11 @@ class ToolSourceService:
         }
 
     def register_external_skill_tool(self, payload: dict[str, Any]) -> dict[str, Any]:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Skill 仅支持内置管理（Brain Skill 上传），不支持外接注册。",
+        )
+
         document, registry_path = self._load_external_registry_document_for_write()
         source_id = str(payload.get("source_id") or CONTROL_PLANE_SKILL_SOURCE_ID).strip() or CONTROL_PLANE_SKILL_SOURCE_ID
         source_name = (
@@ -411,6 +471,11 @@ class ToolSourceService:
         skill_family = str(payload.get("skill_family") or name).strip() or name
         capabilities = _as_tags(payload.get("capabilities"))
         tags = self._merge_registry_tags(payload.get("tags"), defaults=["skill", "externalized", "runtime"])
+        capability_scope, owner_tenant_id = normalize_scope_fields(
+            scope=payload.get("scope"),
+            owner_tenant_id=payload.get("owner_tenant_id") or payload.get("ownerTenantId"),
+            default_scope=CAPABILITY_SCOPE_SHARED,
+        )
 
         self._ensure_registry_source(
             document,
@@ -440,6 +505,8 @@ class ToolSourceService:
                 "capabilities": capabilities,
                 "provider": provider,
                 "bridge_mode": "runtime_bridge",
+                "scope": capability_scope,
+                "owner_tenant_id": owner_tenant_id,
                 "permissions": _default_permissions(),
                 "config_summary": {
                     "base_url": base_url,
@@ -486,6 +553,11 @@ class ToolSourceService:
         tags = self._merge_registry_tags(payload.get("tags"), defaults=["mcp", "externalized", "runtime"])
         scopes = _as_tags(payload.get("scopes")) or ["agents:read"]
         roles = _as_tags(payload.get("roles")) or ["admin", "operator", "power_user", "viewer"]
+        capability_scope, owner_tenant_id = normalize_scope_fields(
+            scope=payload.get("scope"),
+            owner_tenant_id=payload.get("owner_tenant_id") or payload.get("ownerTenantId"),
+            default_scope=CAPABILITY_SCOPE_SHARED,
+        )
 
         self._ensure_registry_source(
             document,
@@ -514,6 +586,8 @@ class ToolSourceService:
                 "tags": tags,
                 "provider": provider,
                 "bridge_mode": "runtime_bridge",
+                "scope": capability_scope,
+                "owner_tenant_id": owner_tenant_id,
                 "permissions": {
                     "requires_permission": requires_permission,
                     "scopes": scopes,
@@ -538,6 +612,11 @@ class ToolSourceService:
         )
 
     def update_external_skill_tool(self, tool_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Skill 仅支持内置管理（Brain Skill 上传），不支持外接更新。",
+        )
+
         document, registry_path = self._load_external_registry_document_for_write()
         existing, _, _, _ = self._find_registry_tool(document, tool_id)
         if existing is None:
@@ -682,6 +761,17 @@ class ToolSourceService:
         scopes = _as_tags(payload.get("scopes") if "scopes" in payload else ((existing.get("permissions") or {}).get("scopes"))) or ["agents:read"]
         roles = _as_tags(payload.get("roles") if "roles" in payload else ((existing.get("permissions") or {}).get("roles"))) or ["admin", "operator", "power_user", "viewer"]
         enabled = _as_bool(payload.get("enabled") if "enabled" in payload else existing.get("enabled"), default=True)
+        capability_scope, owner_tenant_id = normalize_scope_fields(
+            scope=payload.get("scope") if "scope" in payload else existing.get("scope"),
+            owner_tenant_id=(
+                payload.get("owner_tenant_id")
+                if "owner_tenant_id" in payload
+                else payload.get("ownerTenantId")
+                if "ownerTenantId" in payload
+                else existing.get("owner_tenant_id")
+            ),
+            default_scope=CAPABILITY_SCOPE_SHARED,
+        )
 
         self._ensure_registry_source(
             document,
@@ -706,6 +796,8 @@ class ToolSourceService:
         existing["tags"] = tags
         existing["provider"] = provider
         existing["bridge_mode"] = "runtime_bridge"
+        existing["scope"] = capability_scope
+        existing["owner_tenant_id"] = owner_tenant_id
         existing["permissions"] = {
             "requires_permission": requires_permission,
             "scopes": scopes,
@@ -1525,6 +1617,7 @@ class ToolSourceService:
         health_status = str(item.get("health_status") or ("healthy" if base_url else ("disabled" if not enabled else "unknown")))
         input_schema = item.get("input_schema") if isinstance(item.get("input_schema"), dict) else None
         output_schema = item.get("output_schema") if isinstance(item.get("output_schema"), dict) else None
+        capability_scope, owner_tenant_id = extract_scope_fields(item)
         merged_config_summary = {
             **deepcopy(config_summary_payload),
             "baseUrl": base_url or None,
@@ -1534,6 +1627,8 @@ class ToolSourceService:
             "httpMethod": method,
             "http_method": method,
             "registration_kind": effective_registration_kind,
+            "scope": capability_scope,
+            "owner_tenant_id": owner_tenant_id,
         }
         return {
             "id": resolved_tool_id,
@@ -1548,6 +1643,8 @@ class ToolSourceService:
             "tags": _as_tags(item.get("tags")) or ["mcp", "external", "runtime"],
             "provider": provider,
             "bridge_mode": bridge_mode,
+            "scope": capability_scope,
+            "owner_tenant_id": owner_tenant_id,
             "health_status": health_status,
             "agent_ids": [],
             "permissions": {
@@ -1661,6 +1758,8 @@ class ToolSourceService:
                 if ability.get("routable", False)
                 else str(ability.get("health_status") or "offline")
             )
+            metadata = deepcopy(ability.get("metadata") or {})
+            capability_scope, owner_tenant_id = extract_scope_fields(metadata)
             tools.append(
                 {
                     "id": str(ability.get("id") or ability.get("name") or ""),
@@ -1674,6 +1773,8 @@ class ToolSourceService:
                     "tags": list(ability.get("tags") or []),
                     "provider": str(invocation.get("protocol") or "external-http"),
                     "bridge_mode": "external_skill_registry",
+                    "scope": capability_scope,
+                    "owner_tenant_id": owner_tenant_id,
                     "health_status": health_status,
                     "agent_ids": [],
                     "permissions": {
@@ -1691,6 +1792,7 @@ class ToolSourceService:
                         "capabilities": list(ability.get("capabilities") or []),
                         "invocation": invocation,
                     },
+                    "metadata": metadata,
                 }
             )
 
@@ -1770,9 +1872,12 @@ class ToolSourceService:
         source_kind = str(normalized.get("source_kind") or "").strip() or self._infer_source_kind(normalized)
         bridge_mode = str(normalized.get("bridge_mode") or "").strip() or self._infer_bridge_mode(normalized)
         health_status = str(normalized.get("health_status") or ("healthy" if enabled else "disabled"))
+        capability_scope, owner_tenant_id = extract_scope_fields(normalized)
 
         normalized["source_kind"] = source_kind
         normalized["bridge_mode"] = bridge_mode
+        normalized["scope"] = capability_scope
+        normalized["owner_tenant_id"] = owner_tenant_id
         normalized["permissions"] = deepcopy(normalized.get("permissions") or _default_permissions())
         normalized["input_schema"] = deepcopy(
             normalized.get("input_schema") or {"type": "object", "properties": {}}
@@ -1794,6 +1899,10 @@ class ToolSourceService:
         normalized["traffic_policy"] = deepcopy(
             normalized.get("traffic_policy") or self._default_tool_traffic_policy(normalized)
         )
+        config_summary = normalized.get("config_summary") if isinstance(normalized.get("config_summary"), dict) else {}
+        config_summary["scope"] = capability_scope
+        config_summary["owner_tenant_id"] = owner_tenant_id
+        normalized["config_summary"] = config_summary
         normalized.setdefault("agent_ids", [])
         normalized.setdefault("tags", [])
         return normalized

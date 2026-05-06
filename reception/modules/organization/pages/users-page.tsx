@@ -56,15 +56,37 @@ function summarizeNotes(notes: string, maxLength = 28) {
   return normalized.length > maxLength ? `${normalized.slice(0, maxLength)}...` : normalized
 }
 
+function formatDisplayTime(value?: string | null) {
+  const normalized = String(value ?? "").trim()
+  if (!normalized) return "未记录"
+  const parsed = new Date(normalized)
+  if (Number.isNaN(parsed.getTime())) return normalized
+  return parsed.toLocaleString("zh-CN", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  })
+}
+
+function serviceStatusLabel(value?: string) {
+  const normalized = String(value ?? "").trim().toLowerCase()
+  if (normalized === "active") return "服务中"
+  if (normalized === "inactive") return "未激活"
+  if (normalized === "archived") return "已归档"
+  return normalized || "未标记"
+}
+
 function LoadingTable() {
   return (
     <div className="space-y-3">
       {Array.from({ length: 5 }).map((_, index) => (
         <div
           key={`user-portrait-loading-${index}`}
-          className="grid gap-3 rounded-xl border border-border px-4 py-3 md:grid-cols-[1.2fr_1fr_1fr_1fr_120px_140px_120px_1fr]"
+          className="grid gap-3 rounded-xl border border-border px-4 py-3 md:grid-cols-[1.2fr_1fr_1fr_1fr_120px_160px_160px_120px_1fr]"
         >
-          {Array.from({ length: 8 }).map((__, cellIndex) => (
+          {Array.from({ length: 9 }).map((__, cellIndex) => (
             <Skeleton key={`user-portrait-loading-cell-${index}-${cellIndex}`} className="h-5 w-full" />
           ))}
         </div>
@@ -400,6 +422,8 @@ export default function UsersPage() {
                     <TableHead>平台账号</TableHead>
                     <TableHead>标签</TableHead>
                     <TableHead>语言偏好</TableHead>
+                    <TableHead>服务状态</TableHead>
+                    <TableHead>首次接入</TableHead>
                     <TableHead>最近活跃</TableHead>
                     <TableHead>累计交互次数</TableHead>
                     <TableHead>备注</TableHead>
@@ -433,7 +457,13 @@ export default function UsersPage() {
                           {languageLabel(portrait.preferredLanguage)}
                         </div>
                       </TableCell>
-                      <TableCell className="text-sm text-foreground">{portrait.lastActiveAt}</TableCell>
+                      <TableCell>
+                        <Badge variant="secondary" className="w-fit bg-secondary/70">
+                          {serviceStatusLabel(portrait.serviceStatus)}
+                        </Badge>
+                      </TableCell>
+                      <TableCell className="text-sm text-foreground">{formatDisplayTime(portrait.firstSeenAt)}</TableCell>
+                      <TableCell className="text-sm text-foreground">{formatDisplayTime(portrait.lastActiveAt)}</TableCell>
                       <TableCell>
                         <div className="flex items-center gap-2 text-sm font-medium text-foreground">
                           <MessageSquareText className="size-4 text-primary" />

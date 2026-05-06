@@ -9,6 +9,7 @@ import type {
   AgentBindableTool,
   AgentConfigRequest,
   AgentDeleteResponse,
+  ExternalAgentCreateRequest,
   AgentListResponse,
   AgentRuntimeStatus,
 } from '@/shared/types'
@@ -159,6 +160,43 @@ export function useUpdateAgentConfig() {
     onSuccess: (_, variables) => {
       queryClient.invalidateQueries({ queryKey: queryKeys.agents.list })
       queryClient.invalidateQueries({ queryKey: queryKeys.agents.status(variables.agentId) })
+    },
+  })
+}
+
+export function useRegisterExternalAgent() {
+  const queryClient = useQueryClient()
+
+  return useMutation({
+    mutationFn: (payload: ExternalAgentCreateRequest) =>
+      apiRequest<AgentActionResponse>('/api/agents/external', {
+        method: 'POST',
+        body: {
+          ...payload,
+          id: payload.id.trim(),
+          name: payload.name.trim(),
+          description: payload.description?.trim() || undefined,
+          type: payload.type?.trim() || 'write',
+          agentFamily: payload.agentFamily?.trim() || undefined,
+          version: payload.version?.trim() || '1.0.0',
+          protocol: payload.protocol?.trim() || 'http',
+          baseUrl: payload.baseUrl.trim(),
+          invokePath: payload.invokePath?.trim() || '/v1/chat/completions',
+          healthPath: payload.healthPath?.trim() || '/health',
+          method: payload.method?.trim() || 'POST',
+          releaseChannel: payload.releaseChannel?.trim() || 'stable',
+          remoteModel: payload.remoteModel?.trim() || undefined,
+          apiKey: payload.apiKey?.trim() || undefined,
+          heartbeatIntervalSeconds: payload.heartbeatIntervalSeconds ?? undefined,
+          heartbeatTimeoutSeconds: payload.heartbeatTimeoutSeconds ?? undefined,
+          capabilities: payload.capabilities ?? [],
+          compatibility: payload.compatibility ?? [],
+          tags: payload.tags ?? [],
+        },
+      }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.agents.list })
+      queryClient.invalidateQueries({ queryKey: ['external'] })
     },
   })
 }

@@ -2,7 +2,18 @@
 
 import type { ReactNode } from "react"
 import { useEffect, useMemo, useState } from "react"
-import { RadioTower, Send, ShieldCheck, Webhook } from "lucide-react"
+import { Copy, QrCode, RadioTower, Send, ShieldCheck, Smartphone, Webhook } from "lucide-react"
+import ReactQrCode from "react-qr-code"
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/shared/ui/alert-dialog"
 import { Badge } from "@/shared/ui/badge"
 import { Button } from "@/shared/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/shared/ui/card"
@@ -14,12 +25,15 @@ import { Tabs, TabsList, TabsTrigger } from "@/shared/ui/tabs"
 import { useAuth } from "@/modules/auth/hooks/use-auth"
 import {
   useChannelIntegrationSettings,
+  useCreateWecomBindSession,
+  useDeleteWecomBinding,
   useUpdateChannelIntegrationSettings,
 } from "@/modules/settings/hooks/use-settings"
 import { useManagedUserTenants } from "@/modules/organization/hooks/use-users"
 import { toast } from "@/shared/hooks/use-toast"
 import type {
   ChannelIntegrationSettings,
+  WecomBindingStateResponse,
   UpdateChannelIntegrationSettingsRequest,
   UpdateDingTalkChannelIntegrationSettingsRequest,
   UpdateFeishuChannelIntegrationSettingsRequest,
@@ -31,6 +45,7 @@ import type {
 type ChannelKey = keyof ChannelIntegrationSettings
 
 const UNBOUND_TENANT_VALUE = "__channel-unbound__"
+const ACTIVE_CHANNEL_STORAGE_KEY = "workbot.settings.channel-integration.active-channel"
 
 type TenantBindingDraft = {
   tenantId: string
@@ -171,9 +186,9 @@ const channelMeta: Array<{
   },
   {
     key: "wecom",
-    label: "WeCom",
+    label: "微信接入（个人微信）",
     route: "/api/webhooks/wecom",
-    modeLabel: "Webhook 机器人模式",
+    modeLabel: "个人微信接入",
     icon: Webhook,
     supportsBotToken: false,
     supportsBotWebhookKey: true,
@@ -190,6 +205,23 @@ const channelMeta: Array<{
     supportsBotWebhookBaseUrl: true,
   },
 ]
+
+function isChannelKey(value: string): value is ChannelKey {
+  return channelMeta.some((channel) => channel.key === value)
+}
+
+function getInitialActiveChannel(): ChannelKey {
+  const fallbackChannel = channelMeta[0]?.key ?? "telegram"
+  if (typeof window === "undefined") {
+    return fallbackChannel
+  }
+  try {
+    const storedValue = window.localStorage.getItem(ACTIVE_CHANNEL_STORAGE_KEY)?.trim() ?? ""
+    return isChannelKey(storedValue) ? storedValue : fallbackChannel
+  } catch {
+    return fallbackChannel
+  }
+}
 
 function toDraft(settings?: ChannelIntegrationSettings): ChannelDraft {
   const source = settings ?? defaultSettings
@@ -442,24 +474,99 @@ function buildCredentialSummary(channel: ChannelKey, settings: ChannelIntegratio
   return savedCredentialCount > 0 ? `${savedCredentialCount} 项密钥已保存` : "待录入凭据"
 }
 
+function formatDateTime(value: string | null | undefined) {
+  if (!value) {
+    return "--"
+  }
+  const parsed = new Date(value)
+  if (Number.isNaN(parsed.getTime())) {
+    return value
+  }
+  return parsed.toLocaleString("zh-CN", { hour12: false })
+}
+
+function resolveBindValue(value: string) {
+  const normalized = value.trim()
+  if (!normalized) {
+    return ""
+  }
+  if (/^https?:\/\//i.test(normalized)) {
+    return normalized
+  }
+  if (typeof window === "undefined") {
+    return normalized
+  }
+  return new URL(normalized, window.location.origin).toString()
+}
+
+function buildWecomBindingSummary(state: WecomBindingStateResponse | undefined) {
+  if (state?.binding && state?.activeSession?.status === "pending") {
+    return `已绑定，等待重绑：${state.binding.displayName}`
+  }
+  if (state?.activeSession?.status === "pending") {
+    return "等待扫码绑定"
+  }
+  if (state?.binding) {
+    return `已绑定：${state.binding.displayName}`
+  }
+  return "未绑定接入身份"
+}
+
+function WecomQrPreview({ value }: { value: string }) {
+  return (
+    <div className="flex min-h-[272px] items-center justify-center rounded-2xl border border-dashed border-border bg-background/80 p-4">
+      {value.trim() ? (
+        <div className="rounded-xl border border-border bg-white p-3">
+          <ReactQrCode value={value} size={256} />
+        </div>
+      ) : (
+        <div className="flex flex-col items-center gap-3 text-center text-sm text-muted-foreground">
+          <QrCode className="size-8" />
+          <span>二维码暂不可用</span>
+        </div>
+      )}
+    </div>
+  )
+}
+
 export default function ChannelIntegrationSettingsPage() {
-  const { hasPermission } = useAuth()
+  const { hasPermission, isAuthenticated, isSessionLoading } = useAuth()
   const { data, isFetching, error, refetch } = useChannelIntegrationSettings()
+  const shouldLoadTenants = isAuthenticated && !isSessionLoading
   const {
     data: tenantOptionsData,
     isLoading: isTenantsLoading,
     error: tenantOptionsError,
-  } = useManagedUserTenants()
+  } = useManagedUserTenants(shouldLoadTenants)
   const updateChannelIntegrationSettings = useUpdateChannelIntegrationSettings()
+  const createWecomBindSession = useCreateWecomBindSession()
+  const deleteWecomBinding = useDeleteWecomBinding()
   const savedSettings = data?.settings ?? defaultSettings
   const managedTenants = tenantOptionsData?.items ?? []
+  const isTenantListLoading =
+    !isAuthenticated || isSessionLoading || (shouldLoadTenants && isTenantsLoading)
   const savedDraft = useMemo(() => toDraft(savedSettings), [savedSettings])
+  const savedWecomBindingSnapshot = data?.wecomBindingState ?? null
   const [draft, setDraft] = useState<ChannelDraft>(savedDraft)
-  const [activeChannel, setActiveChannel] = useState<ChannelKey>(channelMeta[0]?.key ?? "telegram")
+  const [activeChannel, setActiveChannel] = useState<ChannelKey>(() => getInitialActiveChannel())
+  const [unbindDialogOpen, setUnbindDialogOpen] = useState(false)
+  const [hasLocalEdits, setHasLocalEdits] = useState(false)
+  const [wecomBindingSnapshot, setWecomBindingSnapshot] = useState<WecomBindingStateResponse | null>(null)
 
   useEffect(() => {
+    if (hasLocalEdits) {
+      return
+    }
     setDraft(savedDraft)
-  }, [savedDraft])
+  }, [hasLocalEdits, savedDraft])
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(ACTIVE_CHANNEL_STORAGE_KEY, activeChannel)
+    } catch {
+      return
+    }
+  }, [activeChannel])
 
   const hasLoadedSettings = Boolean(data?.settings)
   const isSaving = updateChannelIntegrationSettings.isPending
@@ -471,13 +578,60 @@ export default function ChannelIntegrationSettingsPage() {
   const currentChannelMeta = channelMeta.find((channel) => channel.key === activeChannel) ?? channelMeta[0]!
   const currentSettings = draft[currentChannelMeta.key]
   const currentSavedProvider = savedSettings[currentChannelMeta.key]
+  const currentWecomTenantId = currentChannelMeta.key === "wecom" ? currentSettings.tenantId.trim() : ""
+  const currentWecomTenantName = currentChannelMeta.key === "wecom" ? currentSettings.tenantName.trim() : ""
   const currentTenantSummary =
     currentSettings.tenantName.trim() || currentSettings.tenantId.trim() || "未绑定租户"
-  const currentCredentialSummary = buildCredentialSummary(currentChannelMeta.key, currentSavedProvider)
+  const currentCredentialSummary =
+    currentChannelMeta.key === "wecom"
+      ? buildWecomBindingSummary(wecomBindingSnapshot ?? undefined)
+      : buildCredentialSummary(currentChannelMeta.key, currentSavedProvider)
   const currentChannelDirty = isChannelDirty(currentChannelMeta.key, draft, savedDraft)
   const CurrentIcon = currentChannelMeta.icon
 
+  useEffect(() => {
+    if (activeChannel !== "wecom") {
+      setWecomBindingSnapshot(null)
+      return
+    }
+    if (!currentWecomTenantId) {
+      setWecomBindingSnapshot(null)
+      return
+    }
+    setWecomBindingSnapshot(savedWecomBindingSnapshot)
+  }, [activeChannel, currentWecomTenantId, currentWecomTenantName, savedWecomBindingSnapshot])
+
+  useEffect(() => {
+    if (activeChannel !== "wecom") {
+      return
+    }
+    if (!currentWecomTenantId) {
+      return
+    }
+    if (wecomBindingSnapshot?.activeSession?.status !== "pending") {
+      return
+    }
+
+    const timer = window.setInterval(() => {
+      void refetch()
+        .then((result) => {
+          setWecomBindingSnapshot(result.data?.wecomBindingState ?? null)
+        })
+        .catch(() => undefined)
+    }, 3000)
+
+    return () => window.clearInterval(timer)
+  }, [
+    activeChannel,
+    currentWecomTenantId,
+    currentWecomTenantName,
+    refetch,
+    wecomBindingSnapshot?.activeSession?.sessionId,
+    wecomBindingSnapshot?.activeSession?.status,
+  ])
+
   const updateChannel = <K extends ChannelKey>(channel: K, patch: Partial<ChannelDraft[K]>) => {
+    setHasLocalEdits(true)
     setDraft((current) => ({
       ...current,
       [channel]: {
@@ -500,6 +654,7 @@ export default function ChannelIntegrationSettingsPage() {
             tenantName: selectedTenant?.name ?? "",
           }
 
+    setHasLocalEdits(true)
     setDraft((current) => ({
       ...current,
       [channel]: {
@@ -509,14 +664,22 @@ export default function ChannelIntegrationSettingsPage() {
     }))
   }
 
-  const handleSave = async () => {
-    try {
-      const response = await updateChannelIntegrationSettings.mutateAsync(buildUpdatePayload(draft))
-      setDraft(toDraft(response.settings))
+  const persistDraft = async (options?: { silent?: boolean }) => {
+    const response = await updateChannelIntegrationSettings.mutateAsync(buildUpdatePayload(draft))
+    setDraft(toDraft(response.settings))
+    setHasLocalEdits(false)
+    if (!options?.silent) {
       toast({
         title: "渠道接入配置已保存",
         description: "新的渠道接入项已经写入后端配置中心。",
       })
+    }
+    return response
+  }
+
+  const handleSave = async () => {
+    try {
+      await persistDraft()
     } catch (saveError) {
       toast({
         title: "保存失败",
@@ -525,8 +688,23 @@ export default function ChannelIntegrationSettingsPage() {
     }
   }
 
-  const resetToSaved = () => {
-    setDraft(savedDraft)
+  const copyToClipboard = async (value: string, title: string) => {
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(value)
+      } else {
+        throw new Error("当前浏览器不支持剪贴板")
+      }
+      toast({
+        title,
+        description: "内容已复制到剪贴板。",
+      })
+    } catch (copyError) {
+      toast({
+        title: "复制失败",
+        description: copyError instanceof Error ? copyError.message : "未知错误",
+      })
+    }
   }
 
   const renderSecretFieldHeader = (config: {
@@ -550,196 +728,398 @@ export default function ChannelIntegrationSettingsPage() {
     const tenantOptions = buildTenantOptions(managedTenants, settings)
     const tenantSelectValue = settings.tenantId.trim() || UNBOUND_TENANT_VALUE
     const selectedTenantLabel = settings.tenantName.trim() || settings.tenantId.trim() || "未绑定租户"
-    const showTenantLoadingState = isTenantsLoading && tenantOptions.length === 0
+    const showTenantLoadingState = isTenantListLoading && tenantOptions.length === 0
+
+    if (channel.key === "wecom") {
+      const bindingState = wecomBindingSnapshot
+      const activeSession = bindingState?.activeSession ?? null
+      const activeBindUrl = activeSession
+        ? resolveBindValue(activeSession.qrCodeUrl?.trim() || activeSession.bindPath)
+        : ""
+      const boundIdentity = bindingState?.binding ?? null
+
+      const handleCreateBindSession = async () => {
+        let tenantId = settings.tenantId.trim()
+        let tenantName = settings.tenantName.trim()
+        if (!tenantId) {
+          toast({
+            title: "请先绑定租户",
+            description: "生成二维码前，需要先为当前微信接入选择一个租户。",
+          })
+          return
+        }
+        try {
+          if (hasLocalEdits || currentChannelDirty) {
+            const savedResponse = await persistDraft({ silent: true })
+            tenantId = savedResponse.settings.wecom.tenantId ?? tenantId
+            tenantName = savedResponse.settings.wecom.tenantName ?? tenantName
+          }
+          const response = await createWecomBindSession.mutateAsync({
+            tenantId,
+            tenantName,
+          })
+          setWecomBindingSnapshot(response.state)
+          void refetch()
+          toast({
+            title: "绑定二维码已生成",
+            description: "请使用待接入账号扫码并完成确认。",
+          })
+        } catch (sessionError) {
+          toast({
+            title: "二维码生成失败",
+            description: sessionError instanceof Error ? sessionError.message : "未知错误",
+          })
+        }
+      }
+
+      const handleDeleteBinding = async () => {
+        const tenantId = settings.tenantId.trim()
+        const tenantName = settings.tenantName.trim()
+        if (!tenantId) {
+          return
+        }
+        try {
+          const response = await deleteWecomBinding.mutateAsync({
+            tenantId,
+            tenantName,
+          })
+          setWecomBindingSnapshot(response.state)
+          void refetch()
+          setUnbindDialogOpen(false)
+          toast({
+            title: "绑定已解除",
+            description: "当前租户下的微信接入身份与待确认会话已清空。",
+          })
+        } catch (deleteError) {
+          toast({
+            title: "解除绑定失败",
+            description: deleteError instanceof Error ? deleteError.message : "未知错误",
+          })
+        }
+      }
+
+      return (
+        <>
+          <section className="space-y-4 rounded-xl border border-border/60 bg-background/60 p-4">
+            <h2 className="text-sm font-semibold text-foreground">租户绑定</h2>
+
+            <div className="grid gap-4 xl:grid-cols-[minmax(0,320px)_minmax(0,1fr)]">
+              <div className="space-y-2">
+                <Label htmlFor={`${channel.key}-tenant-binding`}>绑定租户</Label>
+                <Select
+                  value={tenantSelectValue}
+                  onValueChange={(value) => handleTenantBindingChange(channel.key, value)}
+                  disabled={!canEditSettings || !hasLoadedSettings || isSaving || showTenantLoadingState}
+                >
+                  <SelectTrigger id={`${channel.key}-tenant-binding`} className="bg-background">
+                    <SelectValue placeholder="选择已创建租户" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value={UNBOUND_TENANT_VALUE}>不绑定租户</SelectItem>
+                    {tenantOptions.map((tenant) => (
+                      <SelectItem key={tenant.id} value={tenant.id}>
+                        {tenant.name}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                <p className="text-xs text-muted-foreground">
+                  {showTenantLoadingState
+                    ? "正在加载可绑定租户..."
+                    : tenantOptions.length > 0
+                      ? `当前绑定：${selectedTenantLabel}`
+                      : "暂无可绑定租户，可先在租户设置中创建。"}
+                </p>
+                {tenantOptionsError ? (
+                  <p className="text-xs text-destructive">
+                    租户列表加载失败：{tenantOptionsError instanceof Error ? tenantOptionsError.message : "未知错误"}
+                  </p>
+                ) : null}
+              </div>
+
+              <div className="grid gap-3 md:grid-cols-2">
+                <div className="rounded-2xl border border-border bg-card/70 p-4">
+                  <div className="text-xs text-muted-foreground">当前状态</div>
+                  <div className="mt-3 flex flex-wrap gap-2">
+                    <Badge
+                      variant={boundIdentity ? "secondary" : "outline"}
+                      className="rounded-full px-2.5"
+                    >
+                      {boundIdentity ? "已绑定" : "未绑定"}
+                    </Badge>
+                    {activeSession?.status === "pending" ? (
+                      <Badge variant="outline" className="rounded-full px-2.5">
+                        等待扫码
+                      </Badge>
+                    ) : null}
+                  </div>
+                  <div className="mt-4 text-sm text-foreground">
+                    {boundIdentity ? boundIdentity.displayName : "当前还没有完成扫码绑定。"}
+                  </div>
+                  {boundIdentity?.externalAccount ? (
+                    <div className="mt-2 text-xs text-muted-foreground">
+                      标识：{boundIdentity.externalAccount}
+                    </div>
+                  ) : null}
+                </div>
+
+                <div className="rounded-2xl border border-border bg-card/70 p-4">
+                  <div className="text-xs text-muted-foreground">最近绑定时间</div>
+                  <div className="mt-3 text-sm text-foreground">
+                    {boundIdentity ? formatDateTime(boundIdentity.boundAt) : "--"}
+                  </div>
+                  <div className="mt-4 text-xs text-muted-foreground">
+                    {boundIdentity
+                      ? "如需更换账号，建议直接点“重新绑定”，旧绑定会在新绑定确认前保留。"
+                      : "绑定完成后，会在这里展示接入备注与补充标识。"}
+                  </div>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <section className="space-y-4 rounded-xl border border-border/60 bg-background/60 p-4">
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <h2 className="text-sm font-semibold text-foreground">扫码绑定</h2>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  平台生成二维码，使用待接入账号扫码后完成身份确认。
+                </p>
+              </div>
+              <div className="flex flex-wrap gap-2">
+                {boundIdentity ? (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    disabled={deleteWecomBinding.isPending}
+                    onClick={() => setUnbindDialogOpen(true)}
+                  >
+                    {deleteWecomBinding.isPending ? "解除中..." : "解除绑定"}
+                  </Button>
+                ) : null}
+                {activeBindUrl ? (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => void copyToClipboard(activeBindUrl, "扫码地址已复制")}
+                  >
+                    <Copy className="size-4" />
+                    复制扫码地址
+                  </Button>
+                ) : null}
+                <Button
+                  size="sm"
+                  disabled={!canEditSettings || !hasLoadedSettings || isSaving || createWecomBindSession.isPending}
+                  onClick={() => void handleCreateBindSession()}
+                >
+                  {createWecomBindSession.isPending
+                    ? "生成中..."
+                    : boundIdentity
+                      ? "重新绑定"
+                      : activeSession
+                        ? "重新生成二维码"
+                        : "生成绑定二维码"}
+                </Button>
+              </div>
+            </div>
+
+            {!settings.tenantId.trim() ? (
+              <div className="rounded-2xl border border-dashed border-border bg-card/60 p-6 text-sm text-muted-foreground">
+                请先选择租户，再生成二维码。
+              </div>
+            ) : activeSession ? (
+              <div className="grid gap-4 xl:grid-cols-[288px_minmax(0,1fr)]">
+                <WecomQrPreview value={activeBindUrl} />
+
+                <div className="space-y-4 rounded-2xl border border-border bg-card/70 p-4">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Badge variant="secondary" className="rounded-full px-2.5">
+                      {activeSession.status === "pending" ? "等待扫码" : activeSession.status}
+                    </Badge>
+                    {activeSession.scanStatus === "scaned" || activeSession.scanStatus === "scaned_but_redirect" ? (
+                      <Badge variant="outline" className="rounded-full px-2.5">
+                        已扫码待确认
+                      </Badge>
+                    ) : null}
+                    <Badge variant="outline" className="rounded-full px-2.5">
+                      {settings.tenantName.trim() || settings.tenantId.trim()}
+                    </Badge>
+                  </div>
+
+                  <div className="grid gap-3 md:grid-cols-2">
+                    <div className="rounded-xl border border-border/80 bg-background/80 p-3">
+                      <div className="text-xs text-muted-foreground">过期时间</div>
+                      <div className="mt-2 text-sm text-foreground">{formatDateTime(activeSession.expiresAt)}</div>
+                    </div>
+                    <div className="rounded-xl border border-border/80 bg-background/80 p-3">
+                      <div className="text-xs text-muted-foreground">创建时间</div>
+                      <div className="mt-2 text-sm text-foreground">{formatDateTime(activeSession.createdAt)}</div>
+                    </div>
+                  </div>
+
+                  <div className="rounded-xl border border-border/80 bg-background/80 p-3">
+                    <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                      <Smartphone className="size-4" />
+                      微信扫码地址
+                    </div>
+                    <div className="mt-2 break-all text-sm text-foreground">{activeBindUrl}</div>
+                  </div>
+
+                  <div className="rounded-xl border border-dashed border-border/80 bg-background/50 p-3 text-xs text-muted-foreground">
+                    请直接使用微信扫描这张二维码，并在微信客户端里完成确认。当前页面不再使用本地确认链接做绑定。
+                  </div>
+                </div>
+              </div>
+            ) : (
+              <div className="rounded-2xl border border-dashed border-border bg-card/60 p-6 text-sm text-muted-foreground">
+                当前没有待扫码会话。点击右上角“生成绑定二维码”即可开始绑定。
+              </div>
+            )}
+          </section>
+
+          <AlertDialog
+            open={unbindDialogOpen}
+            onOpenChange={(open) => !deleteWecomBinding.isPending && setUnbindDialogOpen(open)}
+          >
+            <AlertDialogContent>
+              <AlertDialogHeader>
+                <AlertDialogTitle>确认解除当前绑定？</AlertDialogTitle>
+                <AlertDialogDescription>
+                  这会清空当前租户下的微信接入身份，并取消待确认的扫码会话。解除后需要重新扫码绑定。
+                </AlertDialogDescription>
+              </AlertDialogHeader>
+              <AlertDialogFooter>
+                <AlertDialogCancel disabled={deleteWecomBinding.isPending}>取消</AlertDialogCancel>
+                <AlertDialogAction
+                  disabled={deleteWecomBinding.isPending}
+                  onClick={(event) => {
+                    event.preventDefault()
+                    void handleDeleteBinding()
+                  }}
+                >
+                  {deleteWecomBinding.isPending ? "解除中..." : "确认解除"}
+                </AlertDialogAction>
+              </AlertDialogFooter>
+            </AlertDialogContent>
+          </AlertDialog>
+        </>
+      )
+    }
 
     return (
       <>
-        <section className="space-y-4 rounded-xl border border-border/60 bg-background/60 p-4">
-          <h2 className="text-sm font-semibold text-foreground">基础接入</h2>
+        {channel.key === "dingtalk" && "appId" in settings && "hasClientSecret" in savedProvider ? (
+          <section className="space-y-4 rounded-xl border border-border/60 bg-background/60 p-4">
+            <h2 className="text-sm font-semibold text-foreground">钉钉应用参数</h2>
 
-          <div className="space-y-2">
-            <Label htmlFor={`${channel.key}-route`}>Webhook 路径</Label>
-            <Input id={`${channel.key}-route`} readOnly value={channel.route} />
-          </div>
-
-          <div className="space-y-2">
-            <Label htmlFor={`${channel.key}-tenant-binding`}>绑定租户</Label>
-            <Select
-              value={tenantSelectValue}
-              onValueChange={(value) => handleTenantBindingChange(channel.key, value)}
-              disabled={!canEditSettings || !hasLoadedSettings || isSaving || showTenantLoadingState}
-            >
-              <SelectTrigger id={`${channel.key}-tenant-binding`} className="bg-background">
-                <SelectValue placeholder="选择已创建租户" />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value={UNBOUND_TENANT_VALUE}>不绑定租户</SelectItem>
-                {tenantOptions.map((tenant) => (
-                  <SelectItem key={tenant.id} value={tenant.id}>
-                    {tenant.name}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-            <p className="text-xs text-muted-foreground">
-              {showTenantLoadingState
-                ? "正在加载可绑定租户..."
-                : tenantOptions.length > 0
-                  ? `当前绑定：${selectedTenantLabel}`
-                  : "暂无可绑定租户，可先在租户设置中创建。"}
-            </p>
-            {tenantOptionsError ? (
-              <p className="text-xs text-destructive">
-                租户列表加载失败：{tenantOptionsError instanceof Error ? tenantOptionsError.message : "未知错误"}
+            <div className="grid gap-4 md:grid-cols-3">
+              <div className="space-y-2">
+                <Label htmlFor={`${channel.key}-tenant-binding`}>绑定租户</Label>
+                <Select
+                  value={tenantSelectValue}
+                  onValueChange={(value) => handleTenantBindingChange(channel.key, value)}
+                  disabled={!canEditSettings || !hasLoadedSettings || isSaving || showTenantLoadingState}
+                >
+                  <SelectTrigger id={`${channel.key}-tenant-binding`} className="bg-background">
+                    <SelectValue placeholder="选择已创建租户" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value={UNBOUND_TENANT_VALUE}>不绑定租户</SelectItem>
+                    {tenantOptions.map((tenant) => (
+                      <SelectItem key={tenant.id} value={tenant.id}>
+                        {tenant.name}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor={`${channel.key}-app-id`}>App ID</Label>
+                <Input
+                  id={`${channel.key}-app-id`}
+                  value={settings.appId}
+                  disabled={!canEditSettings || !hasLoadedSettings || isSaving}
+                  placeholder="钉钉应用 App ID"
+                  onChange={(event) =>
+                    updateChannel(channel.key, { appId: event.target.value })
+                  }
+                />
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor={`${channel.key}-client-id`}>Client ID</Label>
+                <Input
+                  id={`${channel.key}-client-id`}
+                  value={settings.clientId}
+                  disabled={!canEditSettings || !hasLoadedSettings || isSaving}
+                  placeholder="应用 clientId"
+                  onChange={(event) =>
+                    updateChannel(channel.key, { clientId: event.target.value })
+                  }
+                />
+              </div>
+              <p className="text-xs text-muted-foreground md:col-span-3">
+                {showTenantLoadingState
+                  ? "正在加载可绑定租户..."
+                  : tenantOptions.length > 0
+                    ? `当前绑定：${selectedTenantLabel}`
+                    : "暂无可绑定租户，可先在租户设置中创建。"}
               </p>
-            ) : null}
-          </div>
-
-          {"apiBaseUrl" in settings ? (
-            <div className="grid gap-4 md:grid-cols-2">
-              <div className="space-y-2">
-                <Label htmlFor={`${channel.key}-api-base-url`}>API Base URL</Label>
-                <Input
-                  id={`${channel.key}-api-base-url`}
-                  value={settings.apiBaseUrl}
-                  disabled={!canEditSettings || !hasLoadedSettings || isSaving}
-                  onChange={(event) =>
-                    updateChannel(channel.key, { apiBaseUrl: event.target.value })
-                  }
-                />
-              </div>
-              <div className="space-y-2">
-                <Label htmlFor={`${channel.key}-http-timeout`}>HTTP Timeout</Label>
-                <Input
-                  id={`${channel.key}-http-timeout`}
-                  type="number"
-                  min={1}
-                  step={1}
-                  value={settings.httpTimeoutSeconds}
-                  disabled={!canEditSettings || !hasLoadedSettings || isSaving}
-                  onChange={(event) =>
-                    updateChannel(channel.key, {
-                      httpTimeoutSeconds: Number(event.target.value) || 1,
-                    })
-                  }
-                />
-              </div>
+              {tenantOptionsError ? (
+                <p className="text-xs text-destructive md:col-span-3">
+                  租户列表加载失败：{tenantOptionsError instanceof Error ? tenantOptionsError.message : "未知错误"}
+                </p>
+              ) : null}
             </div>
-          ) : null}
 
-          {channel.supportsBotWebhookBaseUrl && "botWebhookBaseUrl" in settings ? (
-            <div className="grid gap-4 md:grid-cols-2">
-              <div className="space-y-2">
-                <Label htmlFor={`${channel.key}-bot-webhook-base-url`}>Bot Webhook Base URL</Label>
-                <Input
-                  id={`${channel.key}-bot-webhook-base-url`}
-                  value={settings.botWebhookBaseUrl}
-                  disabled={!canEditSettings || !hasLoadedSettings || isSaving}
-                  onChange={(event) =>
-                    updateChannel(channel.key, { botWebhookBaseUrl: event.target.value })
-                  }
-                />
-              </div>
-              <div className="space-y-2">
-                <Label htmlFor={`${channel.key}-bot-http-timeout`}>HTTP Timeout</Label>
-                <Input
-                  id={`${channel.key}-bot-http-timeout`}
-                  type="number"
-                  min={1}
-                  step={1}
-                  value={settings.httpTimeoutSeconds}
-                  disabled={!canEditSettings || !hasLoadedSettings || isSaving}
-                  onChange={(event) =>
-                    updateChannel(channel.key, {
-                      httpTimeoutSeconds: Number(event.target.value) || 1,
-                    })
-                  }
-                />
-              </div>
+            <div className="space-y-2">
+              {renderSecretFieldHeader({
+                id: `${channel.key}-client-secret`,
+                label: "Client Secret",
+                hint: buildSecretHint({
+                  value: settings.clientSecret,
+                  clear: settings.clearClientSecret,
+                  hasSaved: savedProvider.hasClientSecret,
+                  masked: savedProvider.clientSecretMasked,
+                  emptyText: "当前未保存 client secret。",
+                  savingText: "已录入新的 client secret，保存后会替换当前配置。",
+                  clearingText: "当前保存的 client secret 将在下次保存时清空。",
+                }),
+                action: savedProvider.hasClientSecret ? (
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    disabled={!canEditSettings || !hasLoadedSettings || isSaving}
+                    onClick={() =>
+                      updateChannel(channel.key, {
+                        clientSecret: "",
+                        clearClientSecret: !settings.clearClientSecret,
+                      })
+                    }
+                  >
+                    {settings.clearClientSecret ? "保留现有 Secret" : "清空已保存 Secret"}
+                  </Button>
+                ) : undefined,
+              })}
+              <Input
+                id={`${channel.key}-client-secret`}
+                type="password"
+                autoComplete="off"
+                value={settings.clientSecret}
+                disabled={!canEditSettings || !hasLoadedSettings || isSaving}
+                placeholder="留空表示保留当前 Secret，输入则替换"
+                onChange={(event) =>
+                  updateChannel(channel.key, {
+                    clientSecret: event.target.value,
+                    clearClientSecret: false,
+                  })
+                }
+              />
             </div>
-          ) : null}
-        </section>
+          </section>
+        ) : null}
 
-          {channel.key === "dingtalk" && "appId" in settings && "hasClientSecret" in savedProvider ? (
-            <section className="space-y-4 rounded-xl border border-border/60 bg-background/60 p-4">
-              <h2 className="text-sm font-semibold text-foreground">钉钉应用参数</h2>
-
-              <div className="grid gap-4 md:grid-cols-2">
-                <div className="space-y-2">
-                  <Label htmlFor={`${channel.key}-app-id`}>App ID</Label>
-                  <Input
-                    id={`${channel.key}-app-id`}
-                    value={settings.appId}
-                    disabled={!canEditSettings || !hasLoadedSettings || isSaving}
-                    placeholder="钉钉应用 App ID"
-                    onChange={(event) =>
-                      updateChannel(channel.key, { appId: event.target.value })
-                    }
-                  />
-                </div>
-                <div className="space-y-2">
-                  <Label htmlFor={`${channel.key}-client-id`}>Client ID</Label>
-                  <Input
-                    id={`${channel.key}-client-id`}
-                    value={settings.clientId}
-                    disabled={!canEditSettings || !hasLoadedSettings || isSaving}
-                    placeholder="应用 clientId"
-                    onChange={(event) =>
-                      updateChannel(channel.key, { clientId: event.target.value })
-                    }
-                  />
-                </div>
-              </div>
-
-              <div className="space-y-2">
-                {renderSecretFieldHeader({
-                  id: `${channel.key}-client-secret`,
-                  label: "Client Secret",
-                  hint: buildSecretHint({
-                    value: settings.clientSecret,
-                    clear: settings.clearClientSecret,
-                    hasSaved: savedProvider.hasClientSecret,
-                    masked: savedProvider.clientSecretMasked,
-                    emptyText: "当前未保存 client secret。",
-                    savingText: "已录入新的 client secret，保存后会替换当前配置。",
-                    clearingText: "当前保存的 client secret 将在下次保存时清空。",
-                  }),
-                  action: savedProvider.hasClientSecret ? (
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="sm"
-                      disabled={!canEditSettings || !hasLoadedSettings || isSaving}
-                      onClick={() =>
-                        updateChannel(channel.key, {
-                          clientSecret: "",
-                          clearClientSecret: !settings.clearClientSecret,
-                        })
-                      }
-                    >
-                      {settings.clearClientSecret ? "保留现有 Secret" : "清空已保存 Secret"}
-                    </Button>
-                  ) : undefined,
-                })}
-                <Input
-                  id={`${channel.key}-client-secret`}
-                  type="password"
-                  autoComplete="off"
-                  value={settings.clientSecret}
-                  disabled={!canEditSettings || !hasLoadedSettings || isSaving}
-                  placeholder="留空表示保留当前 Secret，输入则替换"
-                  onChange={(event) =>
-                    updateChannel(channel.key, {
-                      clientSecret: event.target.value,
-                      clearClientSecret: false,
-                    })
-                  }
-                />
-              </div>
-            </section>
-          ) : null}
-
-          {channel.key !== "dingtalk" ? (
+        {channel.key !== "dingtalk" ? (
           <section className="space-y-4 rounded-xl border border-border/60 bg-background/60 p-4">
             <h2 className="text-sm font-semibold text-foreground">安全与鉴权</h2>
 
@@ -914,13 +1294,13 @@ export default function ChannelIntegrationSettingsPage() {
               </div>
             ) : null}
           </section>
-          ) : null}
+        ) : null}
       </>
     )
   }
 
   return (
-    <div className="space-y-4 p-6">
+    <div className="flex h-full min-h-0 flex-col gap-4 p-6">
       {error ? (
         <div className="rounded-lg border border-destructive/30 bg-destructive/5 p-3 text-sm text-destructive">
           配置加载失败：{error instanceof Error ? error.message : "未知错误"}
@@ -933,7 +1313,7 @@ export default function ChannelIntegrationSettingsPage() {
         </div>
       ) : null}
 
-      <Card className="bg-card">
+      <Card className="flex min-h-0 flex-1 flex-col bg-card">
         <CardHeader className="space-y-4 pb-4">
           <div className="flex flex-wrap items-start justify-between gap-3">
             <div className="flex items-center gap-3">
@@ -944,7 +1324,7 @@ export default function ChannelIntegrationSettingsPage() {
                 <CardTitle className="text-base">{currentChannelMeta.label}</CardTitle>
               </div>
             </div>
-            <div className="flex items-center gap-2">
+            <div className="flex flex-wrap items-center justify-end gap-2">
               {currentChannelDirty ? (
                 <Badge
                   variant="outline"
@@ -963,6 +1343,16 @@ export default function ChannelIntegrationSettingsPage() {
                   updateChannel(currentChannelMeta.key, { enabled: checked })
                 }
               />
+              <Button variant="outline" size="sm" onClick={() => void refetch()} disabled={isSaving || isFetching}>
+                {isFetching ? "刷新中..." : "重新加载"}
+              </Button>
+              <Button
+                size="sm"
+                onClick={() => void handleSave()}
+                disabled={!canEditSettings || !hasLoadedSettings || !isDirty || isSaving}
+              >
+                {isSaving ? "保存中..." : "保存设置"}
+              </Button>
             </div>
           </div>
 
@@ -976,7 +1366,6 @@ export default function ChannelIntegrationSettingsPage() {
             <span className="rounded-full border border-border bg-background px-2.5 py-1">
               {currentChannelMeta.modeLabel}
             </span>
-            <span className="font-mono">{currentChannelMeta.route}</span>
           </div>
 
           <Tabs value={activeChannel} onValueChange={(value) => setActiveChannel(value as ChannelKey)}>
@@ -999,29 +1388,10 @@ export default function ChannelIntegrationSettingsPage() {
           </Tabs>
         </CardHeader>
 
-        <CardContent className="space-y-5 pt-0">
+        <CardContent className="min-h-0 flex-1 space-y-5 overflow-y-auto pt-0">
           {renderChannelSections(currentChannelMeta)}
         </CardContent>
       </Card>
-
-      <div className="flex flex-wrap justify-end gap-2">
-        <Button variant="outline" onClick={() => void refetch()} disabled={isSaving || isFetching}>
-          {isFetching ? "刷新中..." : "重新加载"}
-        </Button>
-        <Button
-          variant="outline"
-          onClick={resetToSaved}
-          disabled={!canEditSettings || !hasLoadedSettings || !isDirty || isSaving}
-        >
-          撤销修改
-        </Button>
-        <Button
-          onClick={() => void handleSave()}
-          disabled={!canEditSettings || !hasLoadedSettings || !isDirty || isSaving}
-        >
-          {isSaving ? "保存中..." : "保存设置"}
-        </Button>
-      </div>
     </div>
   )
 }

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Body
+from fastapi import APIRouter, Body, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi import HTTPException
 from pydantic import ValidationError
@@ -15,11 +15,17 @@ router = APIRouter()
 
 
 @router.post("/ingest", response_model=IngestMessageResponse)
-def ingest_message_route(payload: dict[str, Any] = Body(...)) -> IngestMessageResponse:
+def ingest_message_route(request: Request, payload: dict[str, Any] = Body(...)) -> IngestMessageResponse:
     try:
         request_payload = IngestUnifiedMessageRequest.model_validate(payload)
     except ValidationError as exc:
         raise RequestValidationError(exc.errors()) from exc
+
+    metadata = dict(request_payload.metadata or {})
+    base_url = str(request.base_url or "").strip().rstrip("/")
+    if base_url:
+        metadata["request_base_url"] = base_url
+        metadata["requestBaseUrl"] = base_url
 
     unified_message = UnifiedMessage(
         message_id=f"manual:{request_payload.channel.value}:{store.now_string()}",
@@ -29,7 +35,7 @@ def ingest_message_route(payload: dict[str, Any] = Body(...)) -> IngestMessageRe
         text=request_payload.text,
         received_at=request_payload.received_at or store.now_string(),
         raw_payload=request_payload.raw_payload or request_payload.model_dump(mode="json"),
-        metadata=request_payload.metadata,
+        metadata=metadata,
         session_id=request_payload.session_id,
     )
     result = ingest_unified_message(

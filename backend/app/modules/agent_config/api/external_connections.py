@@ -22,7 +22,10 @@ from app.modules.agent_config.schemas.external_connections import (
     ExternalSkillRegistrationRequest,
 )
 from app.modules.organization.application.tenancy_service import resolve_scope
-from app.modules.agent_config.registries.external_agent_registry_service import external_agent_registry_service
+from app.modules.agent_config.registries.external_agent_registry_service import (
+    external_agent_registry_service,
+    redact_external_agent_payload,
+)
 from app.modules.agent_config.registries.external_skill_registry_service import external_skill_registry_service
 from app.platform.audit.control_plane_audit_service import append_control_plane_audit_log
 from app.platform.auth.authz import require_authenticated_user, require_permission
@@ -294,7 +297,7 @@ def _skill_version_items(family: str) -> list[ExternalCapabilityVersionItem]:
     dependencies=[Depends(require_authenticated_user), Depends(require_permission("external:read"))],
 )
 def list_external_agents_route() -> ExternalAgentListResponse:
-    items = [Agent(**item) for item in external_agent_registry_service.list_agents(include_offline=True)]
+    items = [Agent(**redact_external_agent_payload(item)) for item in external_agent_registry_service.list_agents(include_offline=True)]
     return ExternalAgentListResponse(items=items, total=len(items))
 
 

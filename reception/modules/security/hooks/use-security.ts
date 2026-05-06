@@ -17,6 +17,7 @@ import type {
   CreateSecurityPenaltyRequest,
   CreateSecurityRuleRequest,
   RollbackSecurityRuleRequest,
+  ApprovalActionResponseLite,
   SecurityAlertSubscriptionActionResponse,
   SecurityAlertSubscriptionsResponse,
   SecurityAlertCenterQuery,
@@ -363,7 +364,7 @@ export function useUpdateSecurityPolicy() {
 
   return useMutation({
     mutationFn: (payload: UpdateSecurityPolicySettingsRequest) =>
-      apiRequest<SecurityPolicySettingsResponse, UpdateSecurityPolicySettingsRequest>(
+      apiRequest<SecurityPolicySettingsResponse | ApprovalActionResponseLite, UpdateSecurityPolicySettingsRequest>(
         '/api/settings/security-policy',
         {
           method: 'PUT',
@@ -371,7 +372,9 @@ export function useUpdateSecurityPolicy() {
         },
       ),
     onSuccess: (response) => {
-      queryClient.setQueryData(queryKeys.security.policy, response)
+      if ('settings' in response) {
+        queryClient.setQueryData(queryKeys.security.policy, response)
+      }
     },
   })
 }

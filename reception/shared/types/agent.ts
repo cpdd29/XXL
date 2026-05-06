@@ -131,9 +131,16 @@ export interface Agent {
     source?: string | null
     load?: number | null
     queueDepth?: number | null
+    capabilities?: string[] | null
+    compatibility?: string[] | null
+    version?: string | null
+    releaseChannel?: string | null
+    deprecated?: boolean | null
   } | null
   configSummary?: AgentConfigSummary | null
   configSnapshot?: Record<string, unknown> | null
+  soul?: string | null
+  metadata?: Record<string, unknown> | null
   modelBinding?: AgentModelBinding | null
   boundSkillIds?: string[] | null
   boundSkills?: AgentBoundSkill[] | null
@@ -185,6 +192,7 @@ export interface AgentConfigRequest {
   description: string
   type: string
   enabled: boolean
+  soul?: string | null
   providerKey?: string | null
   model?: string | null
   skillIds?: string[]
@@ -193,4 +201,28 @@ export interface AgentConfigRequest {
   inputContract?: AgentWorkflowContract | null
   outputContract?: AgentWorkflowContract | null
   contractVersion?: string | null
+  metadata?: Record<string, unknown> | null
+}
+
+export interface ExternalAgentCreateRequest {
+  id: string
+  name: string
+  description?: string
+  type?: string
+  agentFamily?: string
+  version?: string
+  protocol?: string
+  baseUrl: string
+  invokePath?: string
+  healthPath?: string
+  method?: string
+  releaseChannel?: string
+  remoteModel?: string
+  apiKey?: string
+  heartbeatIntervalSeconds?: number | null
+  heartbeatTimeoutSeconds?: number | null
+  enabled: boolean
+  capabilities?: string[]
+  compatibility?: string[]
+  tags?: string[]
 }

@@ -1,7 +1,7 @@
 "use client"
 
 import type { ReactNode } from "react"
-import { startTransition, useDeferredValue, useEffect, useState } from "react"
+import { startTransition, useDeferredValue, useState } from "react"
 import Link from "next/link"
 import { Card, CardContent, CardHeader, CardTitle } from "@/shared/ui/card"
 import { Badge } from "@/shared/ui/badge"
@@ -50,7 +50,6 @@ import {
   useSecurityTrends,
   useSecurityUserProfiles,
   useSubmitSecurityIncidentReview,
-  useUpdateSecurityPolicy,
   useUpdateSecurityAlertSubscription,
   useUpdateSecurityRule,
 } from "@/modules/security/hooks/use-security"
@@ -64,7 +63,6 @@ import type {
   SecurityAlertSubscription,
   SecurityIncidentReviewAction,
   SecurityPenalty,
-  SecurityPolicySettings,
   SecurityReportIncident,
   SecurityRule,
 } from "@/shared/types"
@@ -126,15 +124,6 @@ const reportWindowOptions = [
   { value: "168", label: "最近 7 天" },
 ] as const
 const pageSizeOptions = ["10", "20", "50"] as const
-type SecurityPolicyNumericKey =
-  | "messageRateLimitPerMinute"
-  | "messageRateLimitCooldownSeconds"
-  | "messageRateLimitBanThreshold"
-  | "messageRateLimitBanSeconds"
-  | "securityIncidentWindowSeconds"
-  | "promptRuleBlockThreshold"
-  | "promptClassifierBlockThreshold"
-type SecurityPolicyBooleanKey = "promptInjectionEnabled" | "contentRedactionEnabled"
 
 export default function SecurityPage() {
   const { hasPermission } = useAuth()
@@ -145,7 +134,6 @@ export default function SecurityPage() {
   const [reportWindowHours, setReportWindowHours] = useState<(typeof reportWindowOptions)[number]["value"]>("24")
   const [offset, setOffset] = useState(0)
   const [isExporting, setIsExporting] = useState(false)
-  const [policyDraft, setPolicyDraft] = useState<SecurityPolicySettings | null>(null)
   const [releasingUserKey, setReleasingUserKey] = useState<string | null>(null)
   const [selectedLog, setSelectedLog] = useState<AuditLog | null>(null)
   const [reviewingIncident, setReviewingIncident] = useState<SecurityReportIncident | null>(null)
@@ -185,7 +173,7 @@ export default function SecurityPage() {
   const { data: rulesData, isLoading: rulesLoading, error: rulesError } = useSecurityRules()
   const { data: penaltiesData, isLoading: penaltiesLoading, error: penaltiesError } = useSecurityPenalties()
   const { data: penaltyHistoryData, isLoading: penaltyHistoryLoading } = useSecurityPenaltyHistory()
-  const { data: policyData, isLoading: policyLoading, error: policyError } = useSecurityPolicy()
+  const { data: policyData, error: policyError } = useSecurityPolicy()
   const { data: securityAgentData } = useSecurityGuardian()
   const {
     data: reportData,
@@ -207,7 +195,6 @@ export default function SecurityPage() {
   const updateRuleMutation = useUpdateSecurityRule()
   const createRuleMutation = useCreateSecurityRule()
   const rollbackRuleMutation = useRollbackSecurityRule()
-  const updatePolicyMutation = useUpdateSecurityPolicy()
   const createPenaltyMutation = useCreateSecurityPenalty()
   const releasePenaltyMutation = useReleaseSecurityPenalty()
   const submitIncidentReviewMutation = useSubmitSecurityIncidentReview()
@@ -240,7 +227,6 @@ export default function SecurityPage() {
   const trendPoints = trendData?.points ?? []
   const canExportAudit = hasPermission("logs:read")
   const canManageRules = hasPermission("security:rules:write")
-  const canManagePolicy = hasPermission("settings:security-policy:write")
   const canReleasePenalty = hasPermission("security:penalties:release")
   const canCreatePenalty = hasPermission("security:penalties:manual:create")
   const canReviewIncident = hasPermission("security:incidents:review")
@@ -254,12 +240,6 @@ export default function SecurityPage() {
       : securityAgentConfigStatus === "partial"
         ? "bg-warning/20 text-warning-foreground"
         : "bg-destructive/15 text-destructive"
-
-  useEffect(() => {
-    if (policyData?.settings) {
-      setPolicyDraft(policyData.settings)
-    }
-  }, [policyData])
 
   const handleRuleToggle = async (rule: SecurityRule, enabled: boolean) => {
     try {
@@ -328,37 +308,6 @@ export default function SecurityPage() {
       })
     } finally {
       setIsExporting(false)
-    }
-  }
-
-  const handlePolicyNumberChange = (key: SecurityPolicyNumericKey, value: string) => {
-    setPolicyDraft((current) => {
-      if (!current) return current
-      const normalized = Number(value)
-      return {
-        ...current,
-        [key]: Number.isFinite(normalized) ? normalized : 0,
-      }
-    })
-  }
-
-  const handlePolicyToggle = (key: SecurityPolicyBooleanKey, value: boolean) => {
-    setPolicyDraft((current) => (current ? { ...current, [key]: value } : current))
-  }
-
-  const handleSavePolicy = async () => {
-    if (!policyDraft) return
-    try {
-      await updatePolicyMutation.mutateAsync(policyDraft)
-      toast({
-        title: "安全策略已保存",
-        description: "安全网关阈值与策略开关已更新。",
-      })
-    } catch (mutationError) {
-      toast({
-        title: "保存安全策略失败",
-        description: mutationError instanceof Error ? mutationError.message : "未知错误",
-      })
     }
   }
 
@@ -755,19 +704,26 @@ export default function SecurityPage() {
                       </div>
                       <div className="flex-1 space-y-1">
                         <div className="flex items-center justify-between">
-                          <span className="font-medium text-foreground">
-                            {log.action}
-                          </span>
+                          <div className="flex min-w-0 items-center gap-2">
+                            {log.moduleLabel ? (
+                              <Badge variant="outline" className="text-[11px] text-muted-foreground">
+                                {log.moduleLabel}
+                              </Badge>
+                            ) : null}
+                            <span className="truncate font-medium text-foreground">
+                              {log.actionLabel ?? log.action}
+                            </span>
+                          </div>
                           <span className="text-xs text-muted-foreground">
                             {log.timestamp}
                           </span>
                         </div>
                         <p className="text-sm text-muted-foreground">
-                          {log.details}
+                          {log.operatorSummary ?? log.details}
                         </p>
                         <div className="flex items-center gap-3 text-xs text-muted-foreground">
                           <span>用户: {log.user}</span>
-                          <span>资源: {log.resource}</span>
+                          <span>对象: {log.resourceLabel ?? log.resource}</span>
                           <span>IP: {log.ip}</span>
                         </div>
                         <div className="pt-1">
@@ -1048,19 +1004,15 @@ export default function SecurityPage() {
                   <div>
                     <CardTitle className="text-base">安全策略配置</CardTitle>
                     <p className="text-sm text-muted-foreground">
-                      调整安全网关的限流、封禁与 Prompt Injection 判定阈值。
+                      安全监听配置已统一收口到接入层配置页，这里只看当前生效状态。
                     </p>
                   </div>
                   <div className="flex items-center gap-2">
                     <div className="rounded-md border border-border bg-secondary px-3 py-2 text-xs text-muted-foreground">
                       更新时间 {policyData?.updatedAt?.replace("T", " ").replace("Z", "").slice(0, 19) ?? "--"}
                     </div>
-                    <Button
-                      size="sm"
-                      onClick={() => void handleSavePolicy()}
-                      disabled={!canManagePolicy || !policyDraft || policyLoading || updatePolicyMutation.isPending}
-                    >
-                      {updatePolicyMutation.isPending ? "保存中..." : "保存策略"}
+                    <Button asChild size="sm">
+                      <Link href="/settings/intake-security">前往配置页</Link>
                     </Button>
                   </div>
                 </div>
@@ -1074,108 +1026,87 @@ export default function SecurityPage() {
                 <div className="grid gap-4 xl:grid-cols-2">
                   <Card className="bg-secondary/20">
                     <CardHeader className="pb-3">
-                      <CardTitle className="text-sm">限流与封禁</CardTitle>
+                      <CardTitle className="text-sm">监听与拦截</CardTitle>
                     </CardHeader>
-                    <CardContent className="grid gap-4 md:grid-cols-2">
-                      <div className="space-y-2">
-                        <div className="text-xs text-muted-foreground">每分钟消息上限</div>
-                        <Input
-                          type="number"
-                          min={1}
-                          value={policyDraft?.messageRateLimitPerMinute ?? ""}
-                          onChange={(event) => handlePolicyNumberChange("messageRateLimitPerMinute", event.target.value)}
-                          className="bg-secondary"
-                        />
+                    <CardContent className="space-y-3">
+                      <div className="flex items-center justify-between rounded-lg border border-border bg-card/70 px-4 py-3">
+                        <div>
+                          <div className="font-medium text-foreground">输入安全监听</div>
+                          <div className="text-xs text-muted-foreground">渠道消息进入平台后检测</div>
+                        </div>
+                        <Badge variant="secondary" className={policyData?.settings.inputMonitorEnabled ? "bg-success/15 text-success" : "bg-secondary text-muted-foreground"}>
+                          {policyData?.settings.inputMonitorEnabled ? "开启" : "关闭"}
+                        </Badge>
                       </div>
-                      <div className="space-y-2">
-                        <div className="text-xs text-muted-foreground">冷却时长（秒）</div>
-                        <Input
-                          type="number"
-                          min={1}
-                          value={policyDraft?.messageRateLimitCooldownSeconds ?? ""}
-                          onChange={(event) => handlePolicyNumberChange("messageRateLimitCooldownSeconds", event.target.value)}
-                          className="bg-secondary"
-                        />
+                      <div className="flex items-center justify-between rounded-lg border border-border bg-card/70 px-4 py-3">
+                        <div>
+                          <div className="font-medium text-foreground">Hermes 输出监听</div>
+                          <div className="text-xs text-muted-foreground">Hermes 回传平台后检测</div>
+                        </div>
+                        <Badge variant="secondary" className={policyData?.settings.outputMonitorEnabled ? "bg-success/15 text-success" : "bg-secondary text-muted-foreground"}>
+                          {policyData?.settings.outputMonitorEnabled ? "开启" : "关闭"}
+                        </Badge>
                       </div>
-                      <div className="space-y-2">
-                        <div className="text-xs text-muted-foreground">升级封禁阈值</div>
-                        <Input
-                          type="number"
-                          min={1}
-                          value={policyDraft?.messageRateLimitBanThreshold ?? ""}
-                          onChange={(event) => handlePolicyNumberChange("messageRateLimitBanThreshold", event.target.value)}
-                          className="bg-secondary"
-                        />
-                      </div>
-                      <div className="space-y-2">
-                        <div className="text-xs text-muted-foreground">封禁时长（秒）</div>
-                        <Input
-                          type="number"
-                          min={1}
-                          value={policyDraft?.messageRateLimitBanSeconds ?? ""}
-                          onChange={(event) => handlePolicyNumberChange("messageRateLimitBanSeconds", event.target.value)}
-                          className="bg-secondary"
-                        />
-                      </div>
-                      <div className="space-y-2 md:col-span-2">
-                        <div className="text-xs text-muted-foreground">事件窗口（秒）</div>
-                        <Input
-                          type="number"
-                          min={1}
-                          value={policyDraft?.securityIncidentWindowSeconds ?? ""}
-                          onChange={(event) => handlePolicyNumberChange("securityIncidentWindowSeconds", event.target.value)}
-                          className="bg-secondary"
-                        />
+                      <div className="flex items-center justify-between rounded-lg border border-border bg-card/70 px-4 py-3">
+                        <div>
+                          <div className="font-medium text-foreground">高频防护</div>
+                          <div className="text-xs text-muted-foreground">
+                            每分钟 {policyData?.settings.messageRateLimitPerMinute ?? "--"} 条 / 冷却 {policyData?.settings.messageRateLimitCooldownSeconds ?? "--"} 秒 / 封禁 {policyData?.settings.messageRateLimitBanSeconds ?? "--"} 秒
+                          </div>
+                        </div>
+                        <Badge variant="secondary" className={policyData?.settings.dosProtectionEnabled ? "bg-success/15 text-success" : "bg-secondary text-muted-foreground"}>
+                          {policyData?.settings.dosProtectionEnabled ? "开启" : "关闭"}
+                        </Badge>
                       </div>
                     </CardContent>
                   </Card>
 
                   <Card className="bg-secondary/20">
                     <CardHeader className="pb-3">
-                      <CardTitle className="text-sm">检测与内容策略</CardTitle>
+                      <CardTitle className="text-sm">检测与处置</CardTitle>
                     </CardHeader>
                     <CardContent className="space-y-4">
-                      <div className="grid gap-4 md:grid-cols-2">
-                        <div className="space-y-2">
-                          <div className="text-xs text-muted-foreground">规则层阻断阈值</div>
-                          <Input
-                            type="number"
-                            min={1}
-                            value={policyDraft?.promptRuleBlockThreshold ?? ""}
-                            onChange={(event) => handlePolicyNumberChange("promptRuleBlockThreshold", event.target.value)}
-                            className="bg-secondary"
-                          />
+                      <div className="flex items-center justify-between rounded-lg border border-border bg-card/70 px-4 py-3">
+                        <div>
+                          <div className="font-medium text-foreground">Prompt 注入检测</div>
+                          <div className="text-xs text-muted-foreground">系统内置双层判定阈值</div>
                         </div>
-                        <div className="space-y-2">
-                          <div className="text-xs text-muted-foreground">分类层阻断阈值</div>
-                          <Input
-                            type="number"
-                            min={1}
-                            value={policyDraft?.promptClassifierBlockThreshold ?? ""}
-                            onChange={(event) => handlePolicyNumberChange("promptClassifierBlockThreshold", event.target.value)}
-                            className="bg-secondary"
-                          />
-                        </div>
+                        <Badge variant="secondary" className={policyData?.settings.promptInjectionEnabled ? "bg-success/15 text-success" : "bg-secondary text-muted-foreground"}>
+                          {policyData?.settings.promptInjectionEnabled ? "开启" : "关闭"}
+                        </Badge>
                       </div>
                       <div className="flex items-center justify-between rounded-lg border border-border bg-card/70 px-4 py-3">
                         <div>
-                          <div className="font-medium text-foreground">启用 Prompt Injection 检测</div>
-                          <div className="text-xs text-muted-foreground">关闭后将跳过提示注入双层判定。</div>
+                          <div className="font-medium text-foreground">XSS 检测</div>
+                          <div className="text-xs text-muted-foreground">拦截脚本与注入片段</div>
                         </div>
-                        <Switch
-                          checked={policyDraft?.promptInjectionEnabled ?? false}
-                          onCheckedChange={(checked) => handlePolicyToggle("promptInjectionEnabled", checked)}
-                        />
+                        <Badge variant="secondary" className={policyData?.settings.xssEnabled ? "bg-success/15 text-success" : "bg-secondary text-muted-foreground"}>
+                          {policyData?.settings.xssEnabled ? "开启" : "关闭"}
+                        </Badge>
                       </div>
                       <div className="flex items-center justify-between rounded-lg border border-border bg-card/70 px-4 py-3">
                         <div>
-                          <div className="font-medium text-foreground">启用敏感信息改写</div>
-                          <div className="text-xs text-muted-foreground">关闭后将不再对 PII / 凭证进行改写放行。</div>
+                          <div className="font-medium text-foreground">关键词阻断</div>
+                          <div className="text-xs text-muted-foreground">
+                            {policyData?.settings.keywordBlocklistEnabled
+                              ? `已配置 ${policyData?.settings.keywordBlocklist.length} 条，命中阈值 ${policyData?.settings.keywordBlockThreshold}`
+                              : "当前关闭"}
+                          </div>
                         </div>
-                        <Switch
-                          checked={policyDraft?.contentRedactionEnabled ?? false}
-                          onCheckedChange={(checked) => handlePolicyToggle("contentRedactionEnabled", checked)}
-                        />
+                        <Badge variant="secondary" className={policyData?.settings.keywordBlocklistEnabled ? "bg-success/15 text-success" : "bg-secondary text-muted-foreground"}>
+                          {policyData?.settings.keywordBlocklistEnabled ? "开启" : "关闭"}
+                        </Badge>
+                      </div>
+                      <div className="flex items-center justify-between rounded-lg border border-border bg-card/70 px-4 py-3">
+                        <div>
+                          <div className="font-medium text-foreground">内容处置</div>
+                          <div className="text-xs text-muted-foreground">
+                            脱敏 {policyData?.settings.contentRedactionEnabled ? "开启" : "关闭"} / 审计由平台默认开启并统一托管
+                          </div>
+                        </div>
+                        <Badge variant="secondary" className="bg-success/15 text-success">
+                          系统托管
+                        </Badge>
                       </div>
                     </CardContent>
                   </Card>
@@ -1632,11 +1563,16 @@ export default function SecurityPage() {
                           <Badge className={cn("text-xs", statusConfig[log.status].color)}>
                             {log.status}
                           </Badge>
-                          <span className="font-medium text-foreground">{log.action}</span>
+                          {log.moduleLabel ? (
+                            <Badge variant="outline" className="border-border text-[11px] text-muted-foreground">
+                              {log.moduleLabel}
+                            </Badge>
+                          ) : null}
+                          <span className="font-medium text-foreground">{log.actionLabel ?? log.action}</span>
                         </div>
                         <span className="text-xs text-muted-foreground">{log.timestamp}</span>
                       </div>
-                      <div className="mt-2 text-sm text-muted-foreground">{log.details}</div>
+                      <div className="mt-2 text-sm text-muted-foreground">{log.operatorSummary ?? log.details}</div>
                       <div className="mt-2 flex flex-wrap gap-2">
                         {log.layer ? (
                           <Badge variant="outline" className="border-border text-[11px] text-muted-foreground">
@@ -1656,7 +1592,7 @@ export default function SecurityPage() {
                       </div>
                       <div className="mt-2 flex flex-wrap gap-3 text-xs text-muted-foreground">
                         <span>用户: {log.user}</span>
-                        <span>资源: {log.resource}</span>
+                        <span>对象: {log.resourceLabel ?? log.resource}</span>
                         <span>IP: {log.ip}</span>
                       </div>
                       <div className="mt-3 flex flex-wrap gap-2">
@@ -1769,8 +1705,8 @@ export default function SecurityPage() {
           <div className="space-y-4 px-4 pb-6">
             <div className="grid gap-3 md:grid-cols-2">
               <div className="rounded-lg bg-secondary/30 p-3">
-                <div className="text-xs text-muted-foreground">动作</div>
-                <div className="mt-1 font-medium text-foreground">{selectedLog?.action ?? "--"}</div>
+                <div className="text-xs text-muted-foreground">事件类型</div>
+                <div className="mt-1 font-medium text-foreground">{selectedLog?.actionLabel ?? selectedLog?.action ?? "--"}</div>
               </div>
               <div className="rounded-lg bg-secondary/30 p-3">
                 <div className="text-xs text-muted-foreground">状态</div>
@@ -1781,8 +1717,8 @@ export default function SecurityPage() {
                 <div className="mt-1 font-medium text-foreground">{selectedLog?.user ?? "--"}</div>
               </div>
               <div className="rounded-lg bg-secondary/30 p-3">
-                <div className="text-xs text-muted-foreground">资源</div>
-                <div className="mt-1 font-medium text-foreground">{selectedLog?.resource ?? "--"}</div>
+                <div className="text-xs text-muted-foreground">业务对象</div>
+                <div className="mt-1 font-medium text-foreground">{selectedLog?.resourceLabel ?? selectedLog?.resource ?? "--"}</div>
               </div>
               <div className="rounded-lg bg-secondary/30 p-3">
                 <div className="text-xs text-muted-foreground">时间</div>
@@ -1795,7 +1731,28 @@ export default function SecurityPage() {
             </div>
 
             <div className="rounded-lg bg-secondary/30 p-3">
-              <div className="text-xs text-muted-foreground">详情</div>
+              <div className="text-xs text-muted-foreground">运营摘要</div>
+              <div className="mt-2 whitespace-pre-wrap text-sm leading-6 text-foreground">
+                {selectedLog?.operatorSummary ?? selectedLog?.details ?? "--"}
+              </div>
+            </div>
+
+            <div className="rounded-lg bg-secondary/30 p-3">
+              <div className="text-xs text-muted-foreground">系统内部标识</div>
+              <div className="mt-2 grid gap-3 md:grid-cols-2">
+                <div>
+                  <div className="text-[11px] text-muted-foreground">动作标识</div>
+                  <div className="mt-1 break-all text-sm text-foreground">{selectedLog?.action ?? "--"}</div>
+                </div>
+                <div>
+                  <div className="text-[11px] text-muted-foreground">资源标识</div>
+                  <div className="mt-1 break-all text-sm text-foreground">{selectedLog?.resource ?? "--"}</div>
+                </div>
+              </div>
+            </div>
+
+            <div className="rounded-lg bg-secondary/30 p-3">
+              <div className="text-xs text-muted-foreground">原始详情</div>
               <div className="mt-2 whitespace-pre-wrap text-sm leading-6 text-foreground">
                 {selectedLog?.details ?? "--"}
               </div>

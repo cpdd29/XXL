@@ -9,6 +9,7 @@ from app.platform.persistence.runtime_store import store
 
 
 RUNTIME_OPERATIONAL_LOG_LIMIT = 20
+RUNTIME_OPERATIONAL_PAYLOAD_LIMIT = 200
 
 
 def append_realtime_event(
@@ -52,6 +53,9 @@ def append_realtime_event(
         },
     )
     del store.realtime_logs[RUNTIME_OPERATIONAL_LOG_LIMIT:]
+
+    store.operational_logs.insert(0, store.clone(payload))
+    del store.operational_logs[RUNTIME_OPERATIONAL_PAYLOAD_LIMIT:]
 
     persistence_service.append_operational_log(log=payload)
     return payload

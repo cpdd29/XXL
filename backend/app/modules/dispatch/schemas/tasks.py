@@ -87,6 +87,61 @@ class TaskResult(APIModel):
     output_snapshot: dict[str, Any] = Field(default_factory=dict)
 
 
+class TaskAgentGroupMember(APIModel):
+    id: str | None = None
+    name: str | None = None
+    role: str | None = None
+    branch_id: str | None = None
+    type: str | None = None
+    status: str | None = None
+    enabled: bool | None = None
+    provider_key: str | None = None
+    provider_label: str | None = None
+    model: str | None = None
+    bound_skill_ids: list[str] = Field(default_factory=list)
+    bound_tool_ids: list[str] = Field(default_factory=list)
+    requested_skill_ids: list[str] = Field(default_factory=list)
+    requested_tool_ids: list[str] = Field(default_factory=list)
+    nats_subject: str | None = None
+    soul: str | None = None
+    runtime_status: str | None = None
+    current_step_id: str | None = None
+    current_step_title: str | None = None
+    current_step_message: str | None = None
+    current_step_started_at: str | None = None
+    current_step_finished_at: str | None = None
+    selected_for_delivery: bool | None = None
+
+
+class TaskAgentGroupTimelineEntry(APIModel):
+    id: str | None = None
+    kind: str | None = None
+    title: str
+    detail: str | None = None
+    timestamp: str | None = None
+    actor_agent_id: str | None = None
+    actor_agent_name: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class TaskAgentGroup(APIModel):
+    id: str | None = None
+    name: str | None = None
+    status: str | None = None
+    topology: str | None = None
+    coordination_mode: str | None = None
+    dispatcher_agent_id: str | None = None
+    development_agents: list[TaskAgentGroupMember] = Field(default_factory=list)
+    acceptance_agent: TaskAgentGroupMember | None = None
+    requested_skill_ids: list[str] = Field(default_factory=list)
+    requested_tool_ids: list[str] = Field(default_factory=list)
+    applied_skill_ids: list[str] = Field(default_factory=list)
+    applied_tool_ids: list[str] = Field(default_factory=list)
+    nats_subjects: dict[str, Any] = Field(default_factory=dict)
+    timeline: list[TaskAgentGroupTimelineEntry] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+
+
 class Task(APIModel):
     id: str
     tenant_id: str | None = None
@@ -128,6 +183,7 @@ class Task(APIModel):
     memory_injection_summary: dict[str, Any] | None = None
     context_patch_audit: list[dict[str, Any]] = []
     state_machine: dict[str, Any] | None = None
+    task_agent_group: TaskAgentGroup | None = None
     result: TaskResult | None = None
 
 
@@ -151,6 +207,16 @@ class TaskStep(APIModel):
 class TaskStepsResponse(APIModel):
     items: list[TaskStep]
     total: int
+
+
+class TaskRealtimeResponse(APIModel):
+    type: str = "task.snapshot"
+    message_type: str = "snapshot"
+    task_id: str
+    workflow_id: str | None = None
+    timestamp: str | None = None
+    task: Task | None = None
+    steps: TaskStepsResponse | None = None
 
 
 class TaskActionResponse(APIModel):

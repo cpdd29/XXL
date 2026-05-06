@@ -157,6 +157,19 @@ function areTagsEqual(left: string[], right: string[]) {
   return left.every((value, index) => value === right[index])
 }
 
+function normalizeProfileMemoryItems(items?: string[] | null) {
+  return (items ?? []).map((item) => item.trim()).filter(Boolean)
+}
+
+function profileSummaryText(profile: UserProfile) {
+  return (
+    profile.profileSummary?.trim() ||
+    profile.interactionSummary?.trim() ||
+    profile.notes?.trim() ||
+    "暂无画像摘要。"
+  )
+}
+
 function LoadingView() {
   return (
     <div className="space-y-6 p-6">
@@ -215,6 +228,35 @@ function DetailItem({
         {label}
       </div>
       <div className="mt-3 text-sm font-medium text-foreground">{value}</div>
+    </div>
+  )
+}
+
+function MemoryListCard({
+  title,
+  items,
+  emptyLabel,
+}: {
+  title: string
+  items?: string[] | null
+  emptyLabel: string
+}) {
+  const normalizedItems = normalizeProfileMemoryItems(items)
+
+  return (
+    <div className="rounded-xl border border-border bg-secondary/20 p-4">
+      <div className="text-xs uppercase tracking-[0.12em] text-muted-foreground">{title}</div>
+      {normalizedItems.length > 0 ? (
+        <div className="mt-3 flex flex-wrap gap-2">
+          {normalizedItems.map((item) => (
+            <Badge key={`${title}-${item}`} variant="secondary" className="max-w-full whitespace-normal text-left">
+              {item}
+            </Badge>
+          ))}
+        </div>
+      ) : (
+        <div className="mt-3 text-sm text-muted-foreground">{emptyLabel}</div>
+      )}
     </div>
   )
 }
@@ -418,14 +460,27 @@ export default function UserDetailPage() {
                 <DetailItem label="语言偏好" value={languageLabel(profile.preferredLanguage)} icon={Languages} />
                 <DetailItem label="租户状态" value={tenantStatusLabel(profile.tenantStatus)} icon={Building2} />
                 <DetailItem label="画像编号" value={profile.id} icon={UserCircle2} />
+                <DetailItem label="最近接待时间" value={formatDateTime(profile.lastReceptionAt)} icon={Clock3} />
+                <DetailItem label="记忆更新来源" value={profile.lastUpdatedBy || "暂无记录"} icon={Fingerprint} />
               </div>
               <div className="rounded-xl border border-border bg-secondary/20 p-4">
                 <div className="flex items-center gap-2 text-xs uppercase tracking-[0.12em] text-muted-foreground">
                   <MessageSquareText className="size-4" />
-                  交互摘要
+                  长期记忆摘要
                 </div>
-                <p className="mt-3 text-sm leading-6 text-foreground">{profile.interactionSummary}</p>
+                <p className="mt-3 whitespace-pre-wrap text-sm leading-6 text-foreground">{profileSummaryText(profile)}</p>
               </div>
+            </CardContent>
+          </Card>
+
+          <Card className="bg-card">
+            <CardHeader className="pb-3">
+              <CardTitle className="text-base">长期记忆区</CardTitle>
+            </CardHeader>
+            <CardContent className="grid gap-4 lg:grid-cols-3">
+              <MemoryListCard title="业务偏好" items={profile.preferences} emptyLabel="暂无业务偏好。" />
+              <MemoryListCard title="长期需求背景" items={profile.businessBackground} emptyLabel="暂无长期需求背景。" />
+              <MemoryListCard title="历史明确决策" items={profile.decisionHistory} emptyLabel="暂无历史明确决策。" />
             </CardContent>
           </Card>
 

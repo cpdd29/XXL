@@ -1,21 +1,23 @@
 import asyncio
 from datetime import UTC, datetime
 import hmac
+from queue import Empty
 from urllib.parse import quote
 from typing import Any
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect, WebSocketException, status
 from fastapi.responses import Response
+from starlette.websockets import WebSocketState
 
 from app.config import get_settings
 from app.modules.organization.application.tenancy_service import resolve_scope
 from app.platform.auth.authz import authenticate_websocket, require_authenticated_user, require_permission
+from app.modules.dispatch.workflow_runtime.workflow_realtime_service import workflow_realtime_service
 from app.platform.observability.dashboard_service import (
     export_prometheus_metrics,
     export_audit_logs_csv,
     get_audit_logs,
     get_stats,
-    next_realtime_payload,
 )
 from app.platform.observability.schemas.dashboard import AuditLogsResponse, DashboardStatsResponse
 
@@ -199,11 +201,38 @@ def export_dashboard_logs(
 
 @router.websocket("/realtime")
 async def realtime_dashboard(websocket: WebSocket) -> None:
-    authenticate_websocket(websocket, permission="dashboard:read")
+    current_user = authenticate_websocket(websocket, permission="dashboard:read")
+    tenant_id = str(websocket.query_params.get("tenantId") or "").strip() or None
+    project_id = str(websocket.query_params.get("projectId") or "").strip() or None
+    environment = str(websocket.query_params.get("environment") or "").strip() or None
+
+    try:
+        scope = resolve_scope(
+            current_user=current_user,
+            tenant_id=tenant_id,
+            project_id=project_id,
+            environment=environment,
+        )
+    except HTTPException as exc:
+        raise WebSocketException(
+            code=status.WS_1008_POLICY_VIOLATION,
+            reason=str(exc.detail),
+        ) from exc
+
     await websocket.accept()
+    await websocket.send_json(DashboardStatsResponse(**get_stats(scope=scope)).model_dump(mode="json", by_alias=True))
+    subscriber = workflow_realtime_service._subscribe_all()
     try:
         while True:
-            await websocket.send_json(next_realtime_payload())
-            await asyncio.sleep(3)
+            try:
+                await asyncio.to_thread(subscriber.get, True, 3.0)
+            except Empty:
+                if websocket.client_state is WebSocketState.DISCONNECTED:
+                    break
+            await websocket.send_json(
+                DashboardStatsResponse(**get_stats(scope=scope)).model_dump(mode="json", by_alias=True)
+            )
     except WebSocketDisconnect:
         return
+    finally:
+        workflow_realtime_service._unsubscribe_all(subscriber)

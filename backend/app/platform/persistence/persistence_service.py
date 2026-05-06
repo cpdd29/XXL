@@ -138,6 +138,14 @@ class StatePersistenceService:
         self._session_factory = None
         self.enabled = False
 
+    def _ensure_initialized(self) -> bool:
+        if self.enabled and self._session_factory is not None:
+            return True
+        initialized = self.initialize()
+        if not initialized:
+            logger.warning("Lazy persistence initialization failed for database %s", self.database_url)
+        return initialized
+
     def initialize(self) -> bool:
         try:
             self._engine = create_engine_for_url(self.database_url)
@@ -409,7 +417,7 @@ class StatePersistenceService:
             session.commit()
 
     def get_system_setting(self, key: str) -> dict[str, Any] | None:
-        if not self.enabled or self._session_factory is None:
+        if not self._ensure_initialized():
             return None
 
         normalized_key = str(key or "").strip()
@@ -427,7 +435,7 @@ class StatePersistenceService:
             return None
 
     def read_system_setting(self, key: str) -> tuple[dict[str, Any] | None, bool]:
-        if not self.enabled or self._session_factory is None:
+        if not self._ensure_initialized():
             return None, False
 
         normalized_key = str(key or "").strip()
@@ -451,7 +459,7 @@ class StatePersistenceService:
         payload: dict[str, Any],
         updated_at: str | None = None,
     ) -> bool:
-        if not self.enabled or self._session_factory is None:
+        if not self._ensure_initialized():
             return False
 
         try:
@@ -2475,7 +2483,47 @@ class StatePersistenceService:
         }
 
     @staticmethod
+    def _task_persistence_meta(task: dict[str, Any]) -> dict[str, Any]:
+        metadata: dict[str, Any] = {}
+        for key in ("tenant_id", "tenant_name", "project_id", "environment"):
+            value = task.get(key)
+            if value not in {None, ""}:
+                metadata[key] = value
+        for key in (
+            "manager_packet",
+            "brain_dispatch_summary",
+            "memory_injection_summary",
+            "state_machine",
+            "security_context",
+            "context_patch_audit",
+            "requirement_payload",
+        ):
+            value = task.get(key)
+            if isinstance(value, (dict, list)) and value:
+                metadata[key] = deepcopy(value)
+        return metadata
+
+    @classmethod
+    def _task_route_decision_record(cls, task: dict[str, Any]) -> dict[str, Any] | None:
+        route_decision = deepcopy(task.get("route_decision")) if isinstance(task.get("route_decision"), dict) else {}
+        persistence_meta = cls._task_persistence_meta(task)
+        if persistence_meta:
+            route_decision["__task_persistence__"] = persistence_meta
+        return route_decision or None
+
+    @staticmethod
+    def _extract_task_persistence_meta(route_decision: dict[str, Any] | None) -> dict[str, Any]:
+        if not isinstance(route_decision, dict):
+            return {}
+        payload = route_decision.get("__task_persistence__")
+        return deepcopy(payload) if isinstance(payload, dict) else {}
+
+    @staticmethod
     def _task_record_to_payload(row: TaskRecord) -> dict[str, Any]:
+        route_decision = deepcopy(row.route_decision) if isinstance(row.route_decision, dict) else None
+        persistence_meta = StatePersistenceService._extract_task_persistence_meta(route_decision)
+        if isinstance(route_decision, dict):
+            route_decision.pop("__task_persistence__", None)
         return {
             "id": row.id,
             "title": row.title,
@@ -2495,7 +2543,32 @@ class StatePersistenceService:
             "user_key": row.user_key,
             "preferred_language": row.preferred_language,
             "detected_lang": row.detected_lang,
-            "route_decision": deepcopy(row.route_decision),
+            "tenant_id": persistence_meta.get("tenant_id"),
+            "tenant_name": persistence_meta.get("tenant_name"),
+            "project_id": persistence_meta.get("project_id"),
+            "environment": persistence_meta.get("environment"),
+            "manager_packet": deepcopy(persistence_meta.get("manager_packet"))
+            if isinstance(persistence_meta.get("manager_packet"), dict)
+            else {},
+            "brain_dispatch_summary": deepcopy(persistence_meta.get("brain_dispatch_summary"))
+            if isinstance(persistence_meta.get("brain_dispatch_summary"), dict)
+            else {},
+            "memory_injection_summary": deepcopy(persistence_meta.get("memory_injection_summary"))
+            if isinstance(persistence_meta.get("memory_injection_summary"), dict)
+            else {},
+            "state_machine": deepcopy(persistence_meta.get("state_machine"))
+            if isinstance(persistence_meta.get("state_machine"), dict)
+            else {},
+            "security_context": deepcopy(persistence_meta.get("security_context"))
+            if isinstance(persistence_meta.get("security_context"), dict)
+            else {},
+            "context_patch_audit": deepcopy(persistence_meta.get("context_patch_audit"))
+            if isinstance(persistence_meta.get("context_patch_audit"), list)
+            else [],
+            "requirement_payload": deepcopy(persistence_meta.get("requirement_payload"))
+            if isinstance(persistence_meta.get("requirement_payload"), dict)
+            else {},
+            "route_decision": route_decision,
             "result": StatePersistenceService._decrypt_json_payload(row.result),
         }
 
@@ -3552,18 +3625,16 @@ class StatePersistenceService:
         self._purge_legacy_runtime_store()
 
     def _replace_system_settings(self, session) -> None:
-        session.execute(delete(SystemSettingRecord))
         timestamp = datetime.now(UTC).isoformat()
         for key, payload in self.runtime_store.system_settings.items():
             normalized_key = str(key).strip()
             if not normalized_key:
                 raise ValueError("System setting requires a non-empty key")
-            session.add(
-                SystemSettingRecord(
-                    key=normalized_key,
-                    payload=deepcopy(payload),
-                    updated_at=timestamp,
-                )
+            self._upsert_system_setting(
+                session,
+                key=normalized_key,
+                payload=deepcopy(payload),
+                updated_at=timestamp,
             )
 
     def _replace_agents(self, session) -> None:
@@ -3816,7 +3887,7 @@ class StatePersistenceService:
                 user_key=task.get("user_key"),
                 preferred_language=task.get("preferred_language"),
                 detected_lang=task.get("detected_lang"),
-                route_decision=deepcopy(task.get("route_decision")),
+                route_decision=self._task_route_decision_record(task),
                 result=self._encrypt_json_payload(deepcopy(task.get("result"))),
             )
             session.add(row)
@@ -3840,7 +3911,7 @@ class StatePersistenceService:
         row.user_key = task.get("user_key")
         row.preferred_language = task.get("preferred_language")
         row.detected_lang = task.get("detected_lang")
-        row.route_decision = deepcopy(task.get("route_decision"))
+        row.route_decision = self._task_route_decision_record(task)
         row.result = self._encrypt_json_payload(deepcopy(task.get("result")))
 
     def _replace_task_steps_for_task(
